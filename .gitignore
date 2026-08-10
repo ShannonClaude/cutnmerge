@@ -1,0 +1,10 @@
+.env
+venv/
+__pycache__/
+*.pyc
+.idea/
+data/output/
+data/cache/
+data/debug/
+data/
+
