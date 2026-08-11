@@ -38,6 +38,13 @@ _REPEAT_LABEL_RE = re.compile(
     r"){2,}$"
     r"|^種類添加量$"
 )
+# 行标签粘连：比较例1 86 Bk-1 → 切成多段
+_ROW_LABEL_STICKY_RE = re.compile(
+    r"^(比较例|实施例|合成例)\s*(\d+)\s+(.+)$"
+)
+_ROW_LABEL_COMPACT_RE = re.compile(
+    r"^(比较例|实施例|合成例)\s*(\d+)(\d{1,3})([A-Za-z].*)$"
+)
 
 
 def _text_top_left(tb: Dict[str, Any]) -> Tuple[float, float]:
@@ -392,6 +399,133 @@ def _col_index_for_slot(slot: Tuple[float, float], col_seps: Sequence[float]) ->
     return -1
 
 
+def _split_sticky_row_label(
+    tb: Dict[str, Any],
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    将「比较例1 86 Bk-1」类粘连框按空白/紧凑模式切成多段，并按宽度比例切分 polygon。
+    """
+    text = str(tb.get("text") or "").strip()
+    if not text:
+        return None
+
+    parts: List[str] = []
+    m = _ROW_LABEL_STICKY_RE.match(text)
+    if m:
+        parts = [f"{m.group(1)}{m.group(2)}", m.group(3).strip()]
+        # 第二段可能仍含「86 Bk-1」
+        rest = parts[1]
+        rest_m = re.match(r"^(\d{1,4})\s+(.+)$", rest)
+        if rest_m:
+            parts = [parts[0], rest_m.group(1), rest_m.group(2).strip()]
+    else:
+        m2 = _ROW_LABEL_COMPACT_RE.match(re.sub(r"\s+", "", text))
+        if not m2:
+            return None
+        parts = [f"{m2.group(1)}{m2.group(2)}", m2.group(3), m2.group(4)]
+
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return None
+
+    x1, y1, x2, y2 = _text_bbox(tb)
+    width = max(x2 - x1, 1.0)
+    weights = [max(len(p), 1) for p in parts]
+    total_w = float(sum(weights))
+    pieces: List[Dict[str, Any]] = []
+    cursor = x1
+    for i, part in enumerate(parts):
+        seg_w = width * (weights[i] / total_w)
+        right = x2 if i == len(parts) - 1 else cursor + seg_w
+        piece = dict(tb)
+        piece["text"] = part
+        piece["polygon"] = np.array(
+            [[cursor, y1], [right, y1], [right, y2], [cursor, y2]],
+            dtype=np.float64,
+        )
+        piece["top_left"] = (cursor, y1)
+        pieces.append(piece)
+        cursor = right
+    return pieces
+
+
+def _geometric_multi_col_split(
+    tb: Dict[str, Any],
+    cells: List[Dict[str, Any]],
+    text_shape: Any,
+    ioa_threshold: float,
+) -> bool:
+    """
+    无 binary / col_seps 时的跨列切分：文本框与同一行多个原子列 IoA 分散则按列切。
+    """
+    text = str(tb.get("text") or "")
+    if len(text.strip()) < 2:
+        return False
+
+    tb_box = _text_bbox(tb)
+    text_w = max(tb_box[2] - tb_box[0], 1.0)
+    cy = (tb_box[1] + tb_box[3]) / 2.0
+
+    candidates: List[Tuple[int, float, Tuple[float, float, float, float]]] = []
+    for i, cell in enumerate(cells):
+        if max(int(cell.get("row_span") or 1), 1) > 1:
+            continue
+        if max(int(cell.get("col_span") or 1), 1) > 1:
+            continue
+        cb = _cell_bbox(cell)
+        cell_cy = (cb[1] + cb[3]) / 2.0
+        row_tol = max(12.0, (cb[3] - cb[1]) * 0.55)
+        if abs(cell_cy - cy) > row_tol:
+            continue
+        xo = _x_overlap(tb_box, cb)
+        if xo / text_w < 0.12:
+            continue
+        cell_w = max(cb[2] - cb[0], 1.0)
+        if xo / cell_w < 0.35:
+            continue
+        candidates.append((i, xo, cb))
+
+    if len(candidates) < 2:
+        return False
+
+    candidates.sort(key=lambda t: t[2][0])
+    # 文本须明显宽于单列均值
+    mean_cw = float(np.mean([c[2][2] - c[2][0] for c in candidates]))
+    if text_w < 1.35 * mean_cw:
+        return False
+
+    # 按列边界比例切字符
+    cuts = [0]
+    for j in range(len(candidates) - 1):
+        boundary = candidates[j][2][2]
+        frac = (boundary - tb_box[0]) / text_w
+        cuts.append(_x_to_char_index(text, frac))
+    cuts.append(len(text))
+    for i in range(1, len(cuts)):
+        if cuts[i] < cuts[i - 1]:
+            cuts[i] = cuts[i - 1]
+
+    assigned = False
+    for si, (ci, _, cb) in enumerate(candidates):
+        part = text[cuts[si] : cuts[si + 1]].strip()
+        if not part:
+            continue
+        piece = dict(tb)
+        piece["text"] = part
+        xa = max(tb_box[0], cb[0])
+        xb = min(tb_box[2], cb[2])
+        if xb <= xa:
+            xa, xb = cb[0], cb[2]
+        piece["polygon"] = np.array(
+            [[xa, tb_box[1]], [xb, tb_box[1]], [xb, tb_box[3]], [xa, tb_box[3]]],
+            dtype=np.float64,
+        )
+        piece["top_left"] = (xa, tb_box[1])
+        cells[ci]["texts"].append(piece)
+        assigned = True
+    return assigned
+
+
 def _try_split_across_cells(
     tb: Dict[str, Any],
     cells: List[Dict[str, Any]],
@@ -649,74 +783,98 @@ def assign_texts_to_cells(
     _rebuild_rects()
 
     for tb in text_boxes:
-        text_shape = polygon_to_shapely(tb["polygon"])
-        centroid = text_shape.centroid
-        center_pt = Point(centroid.x, centroid.y)
+        # ---- 行标签粘连预切分（比较例1 86 Bk-1）----
+        sticky = _split_sticky_row_label(tb)
+        pending = sticky if sticky else [tb]
 
-        n_before = len(cells)
-        # ---- 跨格切分 ----
-        if split_cross_cell and _try_split_across_cells(
-            tb,
-            cells,
-            cell_shapes,
-            text_shape,
-            ioa_threshold,
-            binary=binary,
-            col_seps=col_seps,
-            v_separators=v_separators,
-        ):
-            if len(cells) != n_before:
-                _rebuild_rects()
-            continue
+        for piece_tb in pending:
+            text_shape = polygon_to_shapely(piece_tb["polygon"])
+            centroid = text_shape.centroid
+            center_pt = Point(centroid.x, centroid.y)
 
-        # ---- 中心点落入 ----
-        assigned = False
-        for i, rect in enumerate(cell_rects):
-            if rect.contains(center_pt) or rect.covers(center_pt):
-                cells[i]["texts"].append(tb)
-                assigned = True
-                break
-        if assigned:
-            continue
-
-        # ---- IoA ----
-        best_idx = -1
-        best_ioa = 0.0
-        for i, cell_shape in enumerate(cell_shapes):
-            ioa = compute_ioa(text_shape, cell_shape)
-            if ioa > best_ioa:
-                best_ioa = ioa
-                best_idx = i
-
-        if best_idx >= 0 and best_ioa > ioa_threshold:
-            cells[best_idx]["texts"].append(tb)
-            continue
-
-        if best_idx >= 0 and best_ioa > 0:
-            cells[best_idx]["texts"].append(tb)
-            continue
-
-        # ---- 游离文本：仅表外 ----
-        if table_bboxes:
-            cx, cy = centroid.x, centroid.y
-            inside_any = False
-            for x1, y1, x2, y2 in table_bboxes:
-                if x1 <= cx <= x2 and y1 <= cy <= y2:
-                    inside_any = True
-                    break
-            if inside_any:
-                # 表内但没命中任何格：仍强制塞进最近格，避免表头泄漏
-                if cells:
-                    dists = []
-                    for cell in cells:
-                        x1, y1, x2, y2 = _cell_bbox(cell)
-                        dx = 0.0 if x1 <= cx <= x2 else min(abs(cx - x1), abs(cx - x2))
-                        dy = 0.0 if y1 <= cy <= y2 else min(abs(cy - y1), abs(cy - y2))
-                        dists.append(dx * dx + dy * dy)
-                    cells[int(np.argmin(dists))]["texts"].append(tb)
+            n_before = len(cells)
+            # ---- 跨格切分 ----
+            split_ok = False
+            if split_cross_cell:
+                split_ok = _try_split_across_cells(
+                    piece_tb,
+                    cells,
+                    cell_shapes,
+                    text_shape,
+                    ioa_threshold,
+                    binary=binary,
+                    col_seps=col_seps,
+                    v_separators=v_separators,
+                )
+                if not split_ok:
+                    split_ok = _geometric_multi_col_split(
+                        piece_tb, cells, text_shape, ioa_threshold
+                    )
+            if split_ok:
+                if len(cells) != n_before:
+                    _rebuild_rects()
                 continue
 
-        free_texts.append(tb)
+            # ---- 中心点落入：多格命中时取面积最小者（避免容器格吞并）----
+            hits: List[int] = []
+            for i, rect in enumerate(cell_rects):
+                if rect.contains(center_pt) or rect.covers(center_pt):
+                    hits.append(i)
+            if hits:
+                best_i = min(
+                    hits,
+                    key=lambda i: max(
+                        float(cell_rects[i].area)
+                        if hasattr(cell_rects[i], "area")
+                        else 1.0,
+                        1.0,
+                    ),
+                )
+                cells[best_i]["texts"].append(piece_tb)
+                continue
+
+            # ---- IoA：相等时取面积最小格 ----
+            best_idx = -1
+            best_ioa = 0.0
+            best_area = float("inf")
+            for i, cell_shape in enumerate(cell_shapes):
+                ioa = compute_ioa(text_shape, cell_shape)
+                area = float(getattr(cell_shape, "area", 0.0) or 0.0)
+                if ioa > best_ioa + 1e-9 or (
+                    abs(ioa - best_ioa) <= 1e-9 and ioa > 0 and area < best_area
+                ):
+                    best_ioa = ioa
+                    best_idx = i
+                    best_area = area
+
+            if best_idx >= 0 and best_ioa > ioa_threshold:
+                cells[best_idx]["texts"].append(piece_tb)
+                continue
+
+            if best_idx >= 0 and best_ioa > 0:
+                cells[best_idx]["texts"].append(piece_tb)
+                continue
+
+            # ---- 游离文本：仅表外 ----
+            if table_bboxes:
+                cx, cy = centroid.x, centroid.y
+                inside_any = False
+                for x1, y1, x2, y2 in table_bboxes:
+                    if x1 <= cx <= x2 and y1 <= cy <= y2:
+                        inside_any = True
+                        break
+                if inside_any:
+                    if cells:
+                        dists = []
+                        for cell in cells:
+                            x1, y1, x2, y2 = _cell_bbox(cell)
+                            dx = 0.0 if x1 <= cx <= x2 else min(abs(cx - x1), abs(cx - x2))
+                            dy = 0.0 if y1 <= cy <= y2 else min(abs(cy - y1), abs(cy - y2))
+                            dists.append(dx * dx + dy * dy)
+                        cells[int(np.argmin(dists))]["texts"].append(piece_tb)
+                    continue
+
+            free_texts.append(piece_tb)
 
     for cell in cells:
         cell["text"] = join_cell_texts(cell.get("texts") or [])

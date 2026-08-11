@@ -30,11 +30,42 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # 相邻逻辑行物理 Y 间距超过此阈值则切分为新子表
-_Y_GAP_THRESH_PX = 40.0
-# 专利表题特征，例如 [表 1-2]、表1-1
-_HEADER_CAPTION_RE = re.compile(r"\[?\s*表\s*[\d\-]+")
-# 中段换头：再次出现「聚合物」类列名（P97/P98 上下两段）
-_SECTION_HEADER_RE = re.compile(r"(聚合物|单体\s*[\[［]|单体\[)")
+_Y_GAP_THRESH_PX = 48.0
+# 通用表题：表 / Table / Tab. / 図 / Fig + 编号
+_HEADER_CAPTION_RE = re.compile(
+    r"(?:\[?\s*(?:表|図)\s*[\d\-ー－]+|\b(?:Table|Tab\.?|Fig\.?|Figure)\s*[\d\-]+)",
+    re.IGNORECASE,
+)
+# 游离散文不应当作 caption：过长则保持为独立块
+_MAX_CAPTION_CHARS = 80
+# 重复表头 Jaccard 阈值（略放宽以切开上下两段不同表头）
+_HEADER_JACCARD_THRESH = 0.32
+
+
+def _tokenize_row_text(joined: str) -> set:
+    """把行文本切成可比对的 token 集合（中文按字、拉丁按词）。"""
+    s = (joined or "").strip().lower()
+    if not s:
+        return set()
+    # 拉丁/数字词
+    latin = set(re.findall(r"[a-z0-9][a-z0-9\.\-/%]{0,24}", s))
+    # CJK 连续片段拆成 bigram / 单字（短词）
+    cjk_chunks = re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]+", s)
+    cjk: set = set()
+    for ch in cjk_chunks:
+        if len(ch) <= 2:
+            cjk.add(ch)
+        else:
+            cjk.update(ch[i : i + 2] for i in range(len(ch) - 1))
+    return latin | cjk
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
 
 
 def _cell_y_top(cell: Dict[str, Any]) -> float:
@@ -73,15 +104,26 @@ def _renormalize_subtable(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return copied
 
 def _row_has_header_caption(row_cells: List[Dict[str, Any]]) -> bool:
-    """该逻辑行文本是否呈现专利子表题特征（如 [表 1-2]）。"""
+    """该逻辑行文本是否呈现表题特征（表 N / Table N 等）。"""
     joined = " ".join(str(c.get("text") or "") for c in row_cells)
     return bool(_HEADER_CAPTION_RE.search(joined))
 
 
-def _row_has_section_header(row_cells: List[Dict[str, Any]]) -> bool:
-    """中段换头：再次出现聚合物/单体列名。"""
+def _row_tokens(row_cells: List[Dict[str, Any]]) -> set:
     joined = " ".join(str(c.get("text") or "") for c in row_cells)
-    return bool(_SECTION_HEADER_RE.search(joined))
+    return _tokenize_row_text(joined)
+
+
+def _row_looks_like_repeated_header(
+    row_cells: List[Dict[str, Any]], header_tokens: set
+) -> bool:
+    """与子表首行文本集合 Jaccard 高 → 视为中段换头。"""
+    if not header_tokens:
+        return False
+    toks = _row_tokens(row_cells)
+    if len(toks) < 2:
+        return False
+    return _jaccard(toks, header_tokens) >= _HEADER_JACCARD_THRESH
 
 
 def extract_caption_row(
@@ -119,6 +161,9 @@ def extract_caption_row(
         return "", cells
 
     caption = joined.strip()
+    # 过长「caption」实为结构失败后的散文粘连，勿提升为表题
+    if len(caption) > _MAX_CAPTION_CHARS:
+        return "", cells
     remaining = [c for c in cells if int(c["row_start"]) > 0]
     return caption, _renormalize_subtable(remaining)
 
@@ -131,9 +176,9 @@ def split_cells_into_subtables(
     将可能混杂的多子表单元格列表，拆成多个独立子表。
 
     切分条件（按 row_start 升序扫描相邻逻辑行）：
-    1. 物理 Y 间距：下一行顶部 Y - 上一行底部 Y > y_gap_thresh（默认 40px）；
+    1. 物理 Y 间距：下一行顶部 Y - 上一行底部 Y > y_gap_thresh；
     2. 表头特征：该行文本匹配「表 N」类标题，且不是当前子表首行；
-    3. 中段换头：非首行再次出现「聚合物 / 单体」类列名（框线路径单表两段）。
+    3. 重复表头：非首行与当前子表首行文本 Jaccard 高（换头切分）。
 
     每个子表内会重新将 row_* / col_* 归一到从 0 开始，便于独立 unroll。
     """
@@ -161,6 +206,7 @@ def split_cells_into_subtables(
     current: List[Dict[str, Any]] = []
     prev_y_bot: float | None = None
     is_first_row_of_subtable = True
+    header_tokens: set = set()
 
     for _, y_top, y_bot, row_cells in row_meta:
         should_split = False
@@ -171,14 +217,20 @@ def split_cells_into_subtables(
             # 条件 2：非首行再次出现表题特征
             elif (not is_first_row_of_subtable) and _row_has_header_caption(row_cells):
                 should_split = True
-            # 条件 3：中段再次出现聚合物/单体表头
-            elif (not is_first_row_of_subtable) and _row_has_section_header(row_cells):
+            # 条件 3：与子表首行文本高度重合 → 换头
+            elif (not is_first_row_of_subtable) and _row_looks_like_repeated_header(
+                row_cells, header_tokens
+            ):
                 should_split = True
 
         if should_split:
             subtables.append(_renormalize_subtable(current))
             current = []
             is_first_row_of_subtable = True
+            header_tokens = set()
+
+        if is_first_row_of_subtable:
+            header_tokens = _row_tokens(row_cells)
 
         current.extend(row_cells)
         prev_y_bot = y_bot
@@ -200,19 +252,18 @@ def unroll_cells_to_grid(cells: List[Dict[str, Any]]) -> List[List[str]]:
     - 【BugFix】仅在起始坐标 (row_start, col_start) 写入真实 text，
       其余被跨越的子格写入空字符串 ""，避免合并单元格语义膨胀破坏 RAG 词频；
     - 展开后矩阵仍严格 N x M，任意一行的列数都相同，消除列错位。
-
-    矩阵尺寸：
-    - 行数 = 所有单元格 row_end 的最大值 + 1；
-    - 列数 = 所有单元格 col_end 的最大值 + 1；
-    - （models.predict_cells / 子表归一化已把逻辑坐标归一化为从 0 开始）。
-
-    鲁棒性：
-    - 若单元格拓扑坐标越界（异常数据），跳过越界部分并记录警告，不中断整体流程；
-    - 若多个单元格的逻辑范围发生重叠（理论上 LORE 输出不应重叠），后写入的
-      单元格会覆盖先写入的文本；只在非空覆盖非空时记录警告，便于排查模型异常。
+    - 逻辑重叠时：后到的非空文本并入已有格，并 warning，避免静默丢字。
     """
     if not cells:
         return []
+
+    # 先做与 HTML 侧一致的冲突消解（延迟导入避免循环）
+    try:
+        from .html_formatter import _resolve_logic_overlaps
+
+        cells = _resolve_logic_overlaps([dict(c) for c in cells])
+    except Exception:  # noqa: BLE001
+        cells = list(cells)
 
     max_row = max(int(c["row_end"]) for c in cells)
     max_col = max(int(c["col_end"]) for c in cells)
@@ -221,6 +272,9 @@ def unroll_cells_to_grid(cells: List[Dict[str, Any]]) -> List[List[str]]:
 
     grid: List[List[str]] = [["" for _ in range(n_cols)] for _ in range(n_rows)]
     filled: List[List[bool]] = [[False for _ in range(n_cols)] for _ in range(n_rows)]
+    owner: List[List[Tuple[int, int] | None]] = [
+        [None for _ in range(n_cols)] for _ in range(n_rows)
+    ]
 
     for cell in cells:
         text = str(cell.get("text") or "").replace("\n", " ").strip()
@@ -237,15 +291,43 @@ def unroll_cells_to_grid(cells: List[Dict[str, Any]]) -> List[List[str]]:
                 if c < 0 or c >= n_cols:
                     logger.warning("单元格逻辑列坐标越界，已跳过: c=%s (0~%s)", c, n_cols - 1)
                     continue
-                # 【BugFix】合并单元格仅在起始坐标填入真实文本，其余子格留空，避免 RAG 词频膨胀
+                # 仅起始格写真实文本
                 cell_text = text if (r == row_start and c == col_start) else ""
                 if filled[r][c] and grid[r][c] and cell_text and grid[r][c] != cell_text:
+                    # 并入已有，不覆盖丢失
+                    if cell_text not in grid[r][c]:
+                        grid[r][c] = (grid[r][c] + " " + cell_text).strip()
                     logger.warning(
-                        "检测到单元格逻辑范围重叠覆盖: (%s, %s) 原值=%r 新值=%r",
-                        r, c, grid[r][c], cell_text,
+                        "检测到单元格逻辑范围重叠，文本已合并: (%s, %s) %r",
+                        r, c, cell_text[:40],
                     )
-                grid[r][c] = cell_text
-                filled[r][c] = True
+                    continue
+                if filled[r][c] and not cell_text:
+                    continue
+                # 起点被其它 span 覆盖：把文本并入 owner 起点
+                if (
+                    cell_text
+                    and filled[r][c]
+                    and owner[r][c] is not None
+                    and owner[r][c] != (row_start, col_start)
+                ):
+                    or_, oc_ = owner[r][c]  # type: ignore[misc]
+                    prev = grid[or_][oc_]
+                    if cell_text not in prev:
+                        grid[or_][oc_] = (prev + " " + cell_text).strip() if prev else cell_text
+                        logger.warning(
+                            "覆盖位文本并入起点 (%s,%s): %r",
+                            or_,
+                            oc_,
+                            cell_text[:40],
+                        )
+                    continue
+                if not filled[r][c]:
+                    grid[r][c] = cell_text
+                    filled[r][c] = True
+                    owner[r][c] = (row_start, col_start)
+                elif cell_text and not grid[r][c]:
+                    grid[r][c] = cell_text
 
     return grid
 
@@ -380,8 +462,13 @@ def build_markdown_output(
     将表格外部游离文本作为前缀，拼接在 Markdown 表格上方。
 
     若检测到多子表，cells_to_markdown_table 会输出多张用空行分隔的表格。
+    若无有效单元格文本（结构失败），将 free_texts 作为独立散文块，避免与空表粘连。
     """
     prefix = format_free_texts(free_texts)
+    has_cell_text = any(str(c.get("text") or "").strip() for c in cells)
+    if not has_cell_text:
+        return prefix or ""
+
     table = cells_to_markdown_table(
         cells,
         split_subtables=split_subtables,
