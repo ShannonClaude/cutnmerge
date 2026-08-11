@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from .formatter import build_markdown_output, format_free_texts
+from .grid_fusion import fuse_tsr_with_lines
 from .html_formatter import build_html_output
 from .lines import (
     DetectedTable,
@@ -27,6 +28,7 @@ from .matching import assign_texts_to_cells
 from .models import load_lore_model, load_ocr, predict_cells, predict_texts
 from .ocr_post import postprocess_text_boxes
 from .orient import apply_orientation_axis, ensure_upright_axis, maybe_flip_180_by_ocr
+from .reocr import apply_reocr_to_cells
 from .refine import refine_table
 from .tsr import cells_to_debug_table, predict_cells_tsr
 from .tsr_refine import coverage_score, refine_tsr_cells
@@ -167,6 +169,11 @@ def _extract_via_lines(
     *,
     ioa_threshold: float,
     compress_empty_cols: bool,
+    reocr: bool = True,
+    reocr_max_cells: int = 24,
+    ocr_engine=None,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
 ) -> tuple[Dict[str, str], List[DetectedTable], list, list]:
     """框线路径：检测多表 → refine 补列/拆合并 → 逐表归属 → 拼接输出。"""
     tables = detect_tables(image, confidence_thresh=_LINES_CONF_THRESH)
@@ -193,6 +200,16 @@ def _extract_via_lines(
             col_seps=table.col_seps,
             v_separators=table.v_separators,
         )
+        if reocr:
+            cells = apply_reocr_to_cells(
+                image,
+                cells,
+                binary=binary,
+                ocr_engine=ocr_engine,
+                use_cache=use_cache,
+                refresh_cache=refresh_cache,
+                max_cells=reocr_max_cells,
+            )
         table.cells = cells
         still: list = []
         for tb in free:
@@ -248,6 +265,11 @@ def _extract_via_lore(
     *,
     ioa_threshold: float,
     compress_empty_cols: bool,
+    reocr: bool = True,
+    reocr_max_cells: int = 24,
+    ocr_engine=None,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
     lore_pipe=None,
 ) -> Dict[str, str]:
     """LORE 兜底路径。"""
@@ -264,6 +286,16 @@ def _extract_via_lore(
         table_bboxes=None,
         binary=binarize_otsu(image),
     )
+    if reocr:
+        cells = apply_reocr_to_cells(
+            image,
+            cells,
+            binary=binarize_otsu(image),
+            ocr_engine=ocr_engine,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+            max_cells=reocr_max_cells,
+        )
     return _render_outputs(
         cells, free_texts, compress_empty_cols=compress_empty_cols
     )
@@ -276,11 +308,21 @@ def _extract_via_tsr(
     ioa_threshold: float,
     compress_empty_cols: bool,
     fallback_lines: bool = False,
+    reocr: bool = True,
+    reocr_max_cells: int = 24,
+    ocr_engine=None,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
 ) -> tuple[Dict[str, str], List[DetectedTable]]:
     """TableStructureRec 路径：结构 refine + 云端 OCR 填格。"""
     cells = predict_cells_tsr(image, text_boxes=text_boxes)
     if cells:
         cells = refine_tsr_cells(cells, text_boxes)
+        line_tables = detect_tables(image, confidence_thresh=0.0, text_boxes=text_boxes)
+        if line_tables:
+            cells = fuse_tsr_with_lines(cells, line_tables)
+    else:
+        line_tables = []
 
     cov = coverage_score(cells, text_boxes) if cells else 0.0
     # 覆盖率偏低或格子过少时回退（竖排表头等场景常出现「有格但几乎填不进」）
@@ -298,6 +340,11 @@ def _extract_via_tsr(
             text_boxes,
             ioa_threshold=ioa_threshold,
             compress_empty_cols=compress_empty_cols,
+            reocr=reocr,
+            reocr_max_cells=reocr_max_cells,
+            ocr_engine=ocr_engine,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
         )
         return outs, tables
 
@@ -305,14 +352,34 @@ def _extract_via_tsr(
         free = format_free_texts(text_boxes)
         return {"html": free, "md": free}, []
 
+    # 网格证据合并：在文本归属前修复潜在“错切行/列边界”
+    binary = binarize_otsu(image)
+    from .grid_evidence import apply_grid_evidence_merge
+
+    cells = apply_grid_evidence_merge(
+        cells,
+        text_boxes,
+        line_tables=line_tables,
+    )
+
     cells, free_texts = assign_texts_to_cells(
         cells,
         text_boxes,
         ioa_threshold=ioa_threshold,
         split_cross_cell=True,
         table_bboxes=None,
-        binary=binarize_otsu(image),
+        binary=binary,
     )
+    if reocr:
+        cells = apply_reocr_to_cells(
+            image,
+            cells,
+            binary=binary,
+            ocr_engine=ocr_engine,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+            max_cells=reocr_max_cells,
+        )
     outs = _render_outputs(
         cells, free_texts, compress_empty_cols=compress_empty_cols
     )
@@ -336,6 +403,8 @@ def extract_table_output(
     debug: bool = False,
     debug_dir: Optional[Union[str, Path]] = None,
     debug_stem: Optional[str] = None,
+    reocr: bool = True,
+    reocr_max_cells: int = 24,
 ) -> Dict[str, Any]:
     """
     复杂表格解耦提取 Pipeline。
@@ -421,6 +490,11 @@ def extract_table_output(
             text_boxes,
             ioa_threshold=ioa_threshold,
             compress_empty_cols=compress_empty_cols,
+            reocr=reocr,
+            reocr_max_cells=reocr_max_cells,
+            ocr_engine=ocr,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
         )
         avg_conf = (
             float(np.mean([t.confidence for t in tables])) if tables else 0.0
@@ -432,6 +506,11 @@ def extract_table_output(
             text_boxes,
             ioa_threshold=ioa_threshold,
             compress_empty_cols=compress_empty_cols,
+            reocr=reocr,
+            reocr_max_cells=reocr_max_cells,
+            ocr_engine=ocr,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
             lore_pipe=lore_pipe,
         )
     elif structure == "tsr":
@@ -441,6 +520,11 @@ def extract_table_output(
             ioa_threshold=ioa_threshold,
             compress_empty_cols=compress_empty_cols,
             fallback_lines=fallback_lines,
+            reocr=reocr,
+            reocr_max_cells=reocr_max_cells,
+            ocr_engine=ocr,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
         )
     else:
         raise ValueError(
@@ -451,7 +535,7 @@ def extract_table_output(
         out_dir = Path(debug_dir) if debug_dir else DEFAULT_DEBUG_DIR
         out_dir.mkdir(parents=True, exist_ok=True)
         if not tables and structure == "lines":
-            tables = detect_tables(image, confidence_thresh=0.0)
+            tables = detect_tables(image, confidence_thresh=0.0, text_boxes=text_boxes)
         overlay = render_debug_overlay(image, tables, text_boxes)
         out_path = out_dir / f"{stem}_grid.png"
         imwrite_unicode(str(out_path), overlay)
@@ -487,6 +571,8 @@ def extract_table_markdown(
     debug: bool = False,
     debug_dir: Optional[Union[str, Path]] = None,
     debug_stem: Optional[str] = None,
+    reocr: bool = True,
+    reocr_max_cells: int = 24,
 ) -> str:
     """兼容旧接口：返回 Markdown 字符串。"""
     out = extract_table_output(
@@ -505,5 +591,7 @@ def extract_table_markdown(
         debug=debug,
         debug_dir=debug_dir,
         debug_stem=debug_stem,
+        reocr=reocr,
+        reocr_max_cells=reocr_max_cells,
     )
     return out["md"] or out["html"]

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import html as html_lib
+import json
 import re
 import sys
 from pathlib import Path
@@ -35,6 +36,7 @@ from src.tsr_refine import coverage_score, refine_tsr_cells  # noqa: E402
 
 INPUT_DIR = ROOT / "data" / "input"
 DEBUG_DIR = ROOT / "data" / "debug"
+EXPECTED_PATH = ROOT / "data" / "expected.json"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 
@@ -52,12 +54,36 @@ def _count_lost(html: str, sample_texts: list[str]) -> tuple[int, list[str]]:
     return len(lost), lost[:8]
 
 
+def _load_expected(path: Path) -> dict[str, dict]:
+    if not path.is_file():
+        return {}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"expected 文件格式错误: {path}")
+    out: dict[str, dict] = {}
+    for name, spec in raw.items():
+        if isinstance(name, str) and isinstance(spec, dict):
+            out[name] = spec
+    return out
+
+
+def _count_expected_lost(html: str, expected_texts: list[str]) -> tuple[int, list[str]]:
+    body = _norm(html_lib.unescape(re.sub(r"<[^>]+>", "", html or "")))
+    lost = []
+    for t in expected_texts:
+        nt = _norm(t)
+        if nt and nt not in body:
+            lost.append(t)
+    return len(lost), lost[:8]
+
+
 def run_one(
     path: Path,
     *,
     use_cache: bool,
     refresh_cache: bool,
     orientation: str,
+    expected: dict | None = None,
 ) -> dict:
     result = extract_table_output(
         str(path),
@@ -106,35 +132,56 @@ def run_one(
         filled = []
     max_row = max((int(c["row_end"]) for c in filled), default=-1)
     max_col = max((int(c["col_end"]) for c in filled), default=-1)
+    rows = max_row + 1 if max_row >= 0 else 0
+    cols = max_col + 1 if max_col >= 0 else 0
     nonempty = sum(1 for c in filled if str(c.get("text") or "").strip())
     lost_n, lost_s = _count_lost(html, [str(t.get("text") or "") for t in tb])
+    expected = expected or {}
+    expected_rows = int(expected.get("rows", -1))
+    expected_cols = int(expected.get("cols", -1))
+    gt_lost, gt_lost_s = _count_expected_lost(
+        html,
+        [str(t) for t in expected.get("must_have", []) if str(t).strip()],
+    )
     return {
         "name": path.name,
         "orient": result.get("orientation", orient),
         "boxes": len(tb),
         "cells": len(filled),
         "nonempty": nonempty,
+        "rows": rows,
+        "cols": cols,
         "maxrow": max_row,
         "maxcol": max_col,
+        "expected_rows": expected_rows,
+        "expected_cols": expected_cols,
         "cov": round(cov, 3),
         "lost": lost_n,
         "lost_samples": [t[:20] for t in lost_s],
+        "gt_lost": gt_lost,
+        "gt_lost_samples": [t[:30] for t in gt_lost_s],
         "html_len": len(html),
     }
 
 
 def format_report(rows: list[dict]) -> str:
     lines = [
-        "name\torient\tboxes\tcells\tnonempty\tmaxrow\tmaxcol\tcov\tlost\thtml_len",
+        (
+            "name\torient\tboxes\tcells\tnonempty\trows\tcols\texpected_rows"
+            "\texpected_cols\tmaxrow\tmaxcol\tcov\tlost\tgt_lost\thtml_len"
+        ),
     ]
     for r in rows:
         lines.append(
             f"{r['name']}\t{r['orient']}\t{r['boxes']}\t{r['cells']}\t"
-            f"{r['nonempty']}\t{r['maxrow']}\t{r['maxcol']}\t{r['cov']}\t"
-            f"{r['lost']}\t{r['html_len']}"
+            f"{r['nonempty']}\t{r['rows']}\t{r['cols']}\t{r['expected_rows']}\t"
+            f"{r['expected_cols']}\t{r['maxrow']}\t{r['maxcol']}\t{r['cov']}\t"
+            f"{r['lost']}\t{r['gt_lost']}\t{r['html_len']}"
         )
         if r["lost_samples"]:
             lines.append(f"  lost_samples: {r['lost_samples']}")
+        if r["gt_lost_samples"]:
+            lines.append(f"  gt_lost_samples: {r['gt_lost_samples']}")
     return "\n".join(lines) + "\n"
 
 
@@ -149,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--out", default=str(DEBUG_DIR / "_regress_stats.txt"))
     parser.add_argument("--baseline", default=None)
+    parser.add_argument("--expected", default=str(EXPECTED_PATH))
     args = parser.parse_args(argv)
 
     images = sorted(
@@ -160,6 +208,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"无输入图片: {INPUT_DIR}", file=sys.stderr)
         return 1
 
+    expected = _load_expected(Path(args.expected))
+
     rows = []
     for i, path in enumerate(images, 1):
         print(f"[{i}/{len(images)}] {path.name}")
@@ -170,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
                     use_cache=not args.no_cache,
                     refresh_cache=args.refresh_cache,
                     orientation=args.orientation,
+                    expected=expected.get(path.name),
                 )
             )
         except Exception as exc:  # noqa: BLE001
@@ -183,11 +234,17 @@ def main(argv: list[str] | None = None) -> int:
                     "boxes": 0,
                     "cells": 0,
                     "nonempty": 0,
+                    "rows": 0,
+                    "cols": 0,
                     "maxrow": -1,
                     "maxcol": -1,
+                    "expected_rows": -1,
+                    "expected_cols": -1,
                     "cov": 0.0,
                     "lost": -1,
                     "lost_samples": [str(exc)[:40]],
+                    "gt_lost": -1,
+                    "gt_lost_samples": [],
                     "html_len": 0,
                 }
             )

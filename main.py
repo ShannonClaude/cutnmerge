@@ -126,6 +126,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="写出网格叠加图到 data/debug/<stem>_grid.png",
     )
+    parser.add_argument(
+        "--no-reocr",
+        action="store_true",
+        help="关闭可疑单元格二次 OCR（默认开启）",
+    )
+    parser.add_argument(
+        "--reocr-max-cells",
+        type=int,
+        default=24,
+        help="每张图最多对多少个可疑单元格做拼图二次 OCR，默认 24",
+    )
     return parser.parse_args(argv)
 
 
@@ -185,6 +196,8 @@ def process_one(
     fallback_lines: bool,
     orientation: str,
     debug: bool,
+    reocr: bool,
+    reocr_max_cells: int,
     lore_pipe=None,
     ocr_engine=None,
 ) -> None:
@@ -205,6 +218,8 @@ def process_one(
         orientation=orientation,
         debug=debug,
         debug_stem=image_path.stem,
+        reocr=reocr,
+        reocr_max_cells=reocr_max_cells,
     )
 
     for key, out_path in out_specs:
@@ -281,6 +296,8 @@ def main(argv: list[str] | None = None) -> int:
                 fallback_lines=args.fallback_lines,
                 orientation=args.orientation,
                 debug=args.debug,
+                reocr=not args.no_reocr,
+                reocr_max_cells=args.reocr_max_cells,
                 lore_pipe=lore,
                 ocr_engine=ocr,
             )

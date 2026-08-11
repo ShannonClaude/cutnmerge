@@ -10,6 +10,8 @@ import html
 import logging
 from typing import Any, Dict, List, Set, Tuple
 
+import numpy as np
+
 from .formatter import (
     extract_caption_row,
     format_free_texts,
@@ -209,6 +211,191 @@ def _resolve_logic_overlaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return out
 
 
+def _merge_leading_label_gaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge leading empty placeholders into the first label cell of a row."""
+    if not cells:
+        return cells
+    by_row: Dict[int, List[Dict[str, Any]]] = {}
+    for cell in cells:
+        if int(cell["row_start"]) != int(cell["row_end"]):
+            continue
+        by_row.setdefault(int(cell["row_start"]), []).append(cell)
+
+    for row_cells in by_row.values():
+        row_cells.sort(key=lambda c: int(c["col_start"]))
+        if len(row_cells) < 2:
+            continue
+        first = row_cells[0]
+        if int(first["col_span"]) != 1 or not str(first.get("text") or "").strip():
+            continue
+        merge_until = int(first["col_end"])
+        absorbed: List[Dict[str, Any]] = []
+        for cell in row_cells[1:]:
+            if int(cell["col_span"]) != 1:
+                break
+            if str(cell.get("text") or "").strip():
+                break
+            merge_until = int(cell["col_end"])
+            absorbed.append(cell)
+        if not absorbed:
+            continue
+        first["col_end"] = merge_until
+        first["col_span"] = int(first["col_end"]) - int(first["col_start"]) + 1
+        for cell in absorbed:
+            cell["_drop_render"] = True
+    return [c for c in cells if not c.get("_drop_render")]
+
+
+def _cell_physical_bbox_x_y(cell: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    poly = np.asarray(cell["polygon"], dtype=np.float64).reshape(-1, 2)
+    return float(poly[:, 0].min()), float(poly[:, 1].min()), float(poly[:, 0].max()), float(poly[:, 1].max())
+
+
+def drop_evidenceless_columns(cells: List[Dict[str, Any]], *, narrow_ratio: float = 0.35) -> List[Dict[str, Any]]:
+    """
+    丢弃“证据不足”的幽灵列（零文本、且几何上非常窄、且不参与跨列 colspan）。
+
+    注意：此实现无法直接判定“无框线/无墨迹”（html_formatter 不接收原图），
+    因此使用可观测代理：窄宽度 + 不存在跨列占用 + 覆盖该列的文本为空。
+    """
+    if not cells:
+        return cells
+
+    # 物理宽度统计：用所有 col_span==1 的 cell 估计“标准列宽”
+    atomic_widths: List[float] = []
+    for c in cells:
+        if int(c.get("col_span") or 1) == 1:
+            x1, _y1, x2, _y2 = _cell_physical_bbox_x_y(c)
+            atomic_widths.append(max(0.0, x2 - x1))
+    if not atomic_widths:
+        return cells
+    median_w = float(np.median(atomic_widths))
+    if median_w <= 1e-6:
+        return cells
+
+    max_col = max(int(c["col_end"]) for c in cells)
+    dropped: Set[int] = set()
+
+    # 先统计每列被哪些 cell 覆盖，以及这些 cell 是否带文本/跨列
+    col_to_cells: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(max_col + 1)}
+    for c in cells:
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        for col in range(cs, ce + 1):
+            col_to_cells[col].append(c)
+
+    for col, covered_cells in col_to_cells.items():
+        if not covered_cells:
+            continue
+        any_text = any(str(c.get("text") or "").strip() for c in covered_cells)
+        if any_text:
+            continue
+        any_span = any(int(c.get("col_span") or 1) > 1 for c in covered_cells)
+        if any_span:
+            continue
+
+        # 该列的窄宽度判断：取其原子 cell 的宽度中位数
+        widths: List[float] = []
+        for c in covered_cells:
+            if int(c.get("col_span") or 1) != 1:
+                continue
+            x1, _y1, x2, _y2 = _cell_physical_bbox_x_y(c)
+            widths.append(max(0.0, x2 - x1))
+        if not widths:
+            continue
+        if float(np.median(widths)) < narrow_ratio * median_w:
+            dropped.add(col)
+
+    if not dropped:
+        return cells
+
+    kept_cols = [i for i in range(max_col + 1) if i not in dropped]
+    if not kept_cols:
+        return cells
+
+    remap = {old: new for new, old in enumerate(kept_cols)}
+    out: List[Dict[str, Any]] = []
+    for c in cells:
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        # 如果 cell 只覆盖被丢弃列，则丢弃
+        new_idxs = [remap[i] for i in range(cs, ce + 1) if i in remap]
+        if not new_idxs:
+            continue
+        nc = dict(c)
+        nc["col_start"] = min(new_idxs)
+        nc["col_end"] = max(new_idxs)
+        nc["col_span"] = nc["col_end"] - nc["col_start"] + 1
+        out.append(nc)
+    return out
+
+
+def drop_evidenceless_rows(cells: List[Dict[str, Any]], *, short_ratio: float = 0.35) -> List[Dict[str, Any]]:
+    """与 `drop_evidenceless_columns` 对称：窄行/零文本/不参与跨行 rowspan。"""
+    if not cells:
+        return cells
+
+    atomic_heights: List[float] = []
+    for c in cells:
+        if int(c.get("row_span") or 1) == 1:
+            _x1, y1, _x2, y2 = _cell_physical_bbox_x_y(c)
+            atomic_heights.append(max(0.0, y2 - y1))
+    if not atomic_heights:
+        return cells
+    median_h = float(np.median(atomic_heights))
+    if median_h <= 1e-6:
+        return cells
+
+    max_row = max(int(c["row_end"]) for c in cells)
+    dropped: Set[int] = set()
+
+    row_to_cells: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(max_row + 1)}
+    for c in cells:
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        for row in range(rs, re + 1):
+            row_to_cells[row].append(c)
+
+    for row, covered_cells in row_to_cells.items():
+        if not covered_cells:
+            continue
+        any_text = any(str(c.get("text") or "").strip() for c in covered_cells)
+        if any_text:
+            continue
+        any_span = any(int(c.get("row_span") or 1) > 1 for c in covered_cells)
+        if any_span:
+            continue
+
+        heights: List[float] = []
+        for c in covered_cells:
+            if int(c.get("row_span") or 1) != 1:
+                continue
+            _x1, y1, _x2, y2 = _cell_physical_bbox_x_y(c)
+            heights.append(max(0.0, y2 - y1))
+        if not heights:
+            continue
+        if float(np.median(heights)) < short_ratio * median_h:
+            dropped.add(row)
+
+    if not dropped:
+        return cells
+
+    kept_rows = [i for i in range(max_row + 1) if i not in dropped]
+    if not kept_rows:
+        return cells
+
+    remap = {old: new for new, old in enumerate(kept_rows)}
+    out: List[Dict[str, Any]] = []
+    for c in cells:
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        new_idxs = [remap[i] for i in range(rs, re + 1) if i in remap]
+        if not new_idxs:
+            continue
+        nc = dict(c)
+        nc["row_start"] = min(new_idxs)
+        nc["row_end"] = max(new_idxs)
+        nc["row_span"] = nc["row_end"] - nc["row_start"] + 1
+        out.append(nc)
+    return out
+
+
 def _escape_cell_text(text: str) -> str:
     t = (text or "").strip()
     if not t:
@@ -233,6 +420,9 @@ def cells_to_html_table(
 
     work = [dict(c) for c in cells]
     work = _resolve_logic_overlaps(work)
+    # 去掉原先只处理“行首标签”的非对称美化；改为对称幽灵行/列清理
+    work = drop_evidenceless_columns(work)
+    work = drop_evidenceless_rows(work)
     if compress_empty:
         work = compress_empty_logic_columns(work)
         work = compress_empty_logic_rows(work)
