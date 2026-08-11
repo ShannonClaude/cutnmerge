@@ -1,7 +1,7 @@
 """解耦表格提取主流程：结构识别与 OCR 文本分离后再融合。
 
-优先用 OpenCV 框线重建网格（有框线专利表）；置信度不足时回退 LORE。
-OCR 结果可本地缓存，便于反复调结构参数而不重复烧云端额度。
+默认 TableStructureRec（tsr）+ 云端 OCR + IoA；输出 HTML（保留 rowspan/colspan），
+可选 Markdown。OCR 结果可本地缓存。
 """
 
 from __future__ import annotations
@@ -9,12 +9,13 @@ from __future__ import annotations
 import logging
 import math
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import cv2
 import numpy as np
 
 from .formatter import build_markdown_output, format_free_texts
+from .html_formatter import build_html_output
 from .lines import (
     DetectedTable,
     binarize_otsu,
@@ -24,14 +25,18 @@ from .lines import (
 )
 from .matching import assign_texts_to_cells
 from .models import load_lore_model, load_ocr, predict_cells, predict_texts
+from .ocr_post import postprocess_text_boxes
+from .orient import apply_orientation_axis, ensure_upright_axis, maybe_flip_180_by_ocr
 from .refine import refine_table
+from .tsr import cells_to_debug_table, predict_cells_tsr
+from .tsr_refine import coverage_score, refine_tsr_cells
 
 logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DEBUG_DIR = ROOT / "data" / "debug"
 
-# auto 模式下框线网格最低置信度
+# auto 模式下框线网格最低置信度（仅 --structure lines/auto 的旧路径）
 _LINES_CONF_THRESH = 0.35
 
 
@@ -134,25 +139,47 @@ def deskew_image(
     return rotated
 
 
+def _render_outputs(
+    cells: list,
+    free_texts: list,
+    *,
+    compress_empty_cols: bool,
+) -> Dict[str, str]:
+    """同时生成 html / md。"""
+    html = build_html_output(
+        cells,
+        free_texts,
+        split_subtables=True,
+        compress_empty=compress_empty_cols,
+    )
+    md = build_markdown_output(
+        cells,
+        free_texts,
+        split_subtables=True,
+        compress_empty_cols=compress_empty_cols,
+    )
+    return {"html": html or "", "md": md or ""}
+
+
 def _extract_via_lines(
     image: np.ndarray,
     text_boxes: list,
     *,
     ioa_threshold: float,
     compress_empty_cols: bool,
-) -> tuple[str, List[DetectedTable], list, list]:
-    """框线路径：检测多表 → refine 补列/拆合并 → 逐表归属 → 拼接 Markdown。"""
+) -> tuple[Dict[str, str], List[DetectedTable], list, list]:
+    """框线路径：检测多表 → refine 补列/拆合并 → 逐表归属 → 拼接输出。"""
     tables = detect_tables(image, confidence_thresh=_LINES_CONF_THRESH)
     if not tables:
-        return "", [], text_boxes, []
+        free = format_free_texts(text_boxes)
+        return {"html": free, "md": free}, [], text_boxes, []
 
     binary = binarize_otsu(image)
-    # detect → refine（文本聚类补列 + 拆错误纵向合并）
     tables = [refine_table(t, text_boxes) for t in tables]
 
     bboxes = [t.bbox for t in tables]
+    html_parts: List[str] = []
     md_parts: List[str] = []
-    # 游离文本只算一次：对所有表外文本
     remaining = list(text_boxes)
 
     for table in tables:
@@ -167,33 +194,26 @@ def _extract_via_lines(
             v_separators=table.v_separators,
         )
         table.cells = cells
-        # 已归属进本表的文本不再参与后续表；free 里可能含表外 + 其它表内
-        # 用「中心是否在本表 bbox」过滤：本表外的留下给下一张 / 最终 free
         still: list = []
         for tb in free:
             poly = np.asarray(tb["polygon"], dtype=np.float64).reshape(-1, 2)
             cx, cy = float(poly[:, 0].mean()), float(poly[:, 1].mean())
             x1, y1, x2, y2 = table.bbox
             if x1 <= cx <= x2 and y1 <= cy <= y2:
-                # 表内但未进格——assign 已尽量塞进最近格，这里不应再出现；丢弃防泄漏
                 continue
             still.append(tb)
         remaining = still
 
-        # 框线路径也启用子表切分：仅当中段再次出现表题/聚合物表头时才会切开
-        md = build_markdown_output(
-            cells,
-            [],
-            split_subtables=True,
-            compress_empty_cols=compress_empty_cols,
+        outs = _render_outputs(
+            cells, [], compress_empty_cols=compress_empty_cols
         )
-        if md:
-            md_parts.append(md)
+        if outs["html"]:
+            html_parts.append(outs["html"])
+        if outs["md"]:
+            md_parts.append(outs["md"])
 
-    all_free = remaining
-    # 再过滤：真正在所有表 bbox 之外的才做前缀
     outside = []
-    for tb in all_free:
+    for tb in remaining:
         poly = np.asarray(tb["polygon"], dtype=np.float64).reshape(-1, 2)
         cx, cy = float(poly[:, 0].mean()), float(poly[:, 1].mean())
         if any(x1 <= cx <= x2 and y1 <= cy <= y2 for x1, y1, x2, y2 in bboxes):
@@ -201,12 +221,25 @@ def _extract_via_lines(
         outside.append(tb)
 
     prefix = format_free_texts(outside)
-    body = "\n\n".join(md_parts)
-    if prefix and body:
-        markdown = prefix + "\n\n" + body
+    html_body = "\n\n".join(html_parts)
+    md_body = "\n\n".join(md_parts)
+    # lines 路径的游离前缀也包成 HTML 段落，避免裸文本与 <table> 混排
+    import html as html_lib
+
+    prefix_html = ""
+    if prefix:
+        paras = [html_lib.escape(line) for line in prefix.splitlines() if line.strip()]
+        prefix_html = "\n".join(f"<p>{p}</p>" for p in paras)
+
+    if prefix_html and html_body:
+        html = prefix_html + "\n\n" + html_body
     else:
-        markdown = prefix or body or ""
-    return markdown, tables, outside, text_boxes
+        html = prefix_html or html_body or ""
+    if prefix and md_body:
+        md = prefix + "\n\n" + md_body
+    else:
+        md = prefix or md_body or ""
+    return {"html": html, "md": md}, tables, outside, text_boxes
 
 
 def _extract_via_lore(
@@ -216,12 +249,13 @@ def _extract_via_lore(
     ioa_threshold: float,
     compress_empty_cols: bool,
     lore_pipe=None,
-) -> str:
+) -> Dict[str, str]:
     """LORE 兜底路径。"""
     lore = lore_pipe or load_lore_model()
     cells = predict_cells(image, lore_pipe=lore)
     if not cells:
-        return format_free_texts(text_boxes)
+        free = format_free_texts(text_boxes)
+        return {"html": free, "md": free}
     cells, free_texts = assign_texts_to_cells(
         cells,
         text_boxes,
@@ -230,12 +264,210 @@ def _extract_via_lore(
         table_bboxes=None,
         binary=binarize_otsu(image),
     )
-    return build_markdown_output(
-        cells,
-        free_texts,
-        split_subtables=True,
-        compress_empty_cols=compress_empty_cols,
+    return _render_outputs(
+        cells, free_texts, compress_empty_cols=compress_empty_cols
     )
+
+
+def _extract_via_tsr(
+    image: np.ndarray,
+    text_boxes: list,
+    *,
+    ioa_threshold: float,
+    compress_empty_cols: bool,
+    fallback_lines: bool = False,
+) -> tuple[Dict[str, str], List[DetectedTable]]:
+    """TableStructureRec 路径：结构 refine + 云端 OCR 填格。"""
+    cells = predict_cells_tsr(image, text_boxes=text_boxes)
+    if cells:
+        cells = refine_tsr_cells(cells, text_boxes)
+
+    cov = coverage_score(cells, text_boxes) if cells else 0.0
+    # 覆盖率偏低或格子过少时回退（竖排表头等场景常出现「有格但几乎填不进」）
+    n_boxes = max(len(text_boxes), 1)
+    too_few_cells = bool(cells) and len(cells) < max(8, n_boxes // 8)
+    if (not cells or cov < 0.55 or too_few_cells) and fallback_lines:
+        logger.info(
+            "TSR 质量不足(cov=%.3f cells=%d boxes=%d)，--fallback-lines 回退框线路径",
+            cov,
+            len(cells or []),
+            len(text_boxes),
+        )
+        outs, tables, _, _ = _extract_via_lines(
+            image,
+            text_boxes,
+            ioa_threshold=ioa_threshold,
+            compress_empty_cols=compress_empty_cols,
+        )
+        return outs, tables
+
+    if not cells:
+        free = format_free_texts(text_boxes)
+        return {"html": free, "md": free}, []
+
+    cells, free_texts = assign_texts_to_cells(
+        cells,
+        text_boxes,
+        ioa_threshold=ioa_threshold,
+        split_cross_cell=True,
+        table_bboxes=None,
+        binary=binarize_otsu(image),
+    )
+    outs = _render_outputs(
+        cells, free_texts, compress_empty_cols=compress_empty_cols
+    )
+    return outs, [cells_to_debug_table(cells)]
+
+
+def extract_table_output(
+    image_path: Union[str, np.ndarray],
+    ioa_threshold: float = 0.5,
+    deskew: bool = True,
+    max_skew_angle: float = 15.0,
+    lore_pipe=None,
+    ocr_engine=None,
+    *,
+    structure: str = "tsr",
+    use_cache: bool = True,
+    refresh_cache: bool = False,
+    compress_empty_cols: bool = True,
+    fallback_lines: bool = False,
+    orientation: Union[str, int] = "auto",
+    debug: bool = False,
+    debug_dir: Optional[Union[str, Path]] = None,
+    debug_stem: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    复杂表格解耦提取 Pipeline。
+
+    Returns:
+        {"html": str, "md": str, "structure": str, "orientation": int}
+    """
+    image = _load_image(image_path)
+    stem = debug_stem
+    if stem is None:
+        if isinstance(image_path, str):
+            stem = Path(image_path).stem
+        else:
+            stem = "image"
+
+    ocr = ocr_engine or load_ocr()
+    image, axis_angle, orient_kind = apply_orientation_axis(
+        image, mode=orientation
+    )
+
+    if deskew:
+        image = deskew_image(image, max_angle=max_skew_angle)
+
+    provisional_orient = int(axis_angle)
+    cache_extra = f"deskew={int(deskew)}|orient={provisional_orient}"
+    text_boxes = predict_texts(
+        image,
+        ocr_engine=ocr,
+        use_cache=use_cache,
+        refresh_cache=refresh_cache,
+        cache_extra=cache_extra,
+    )
+
+    orient_angle = provisional_orient
+    if orient_kind == "auto":
+        image, axis_delta, text_boxes = ensure_upright_axis(
+            image,
+            text_boxes,
+            ocr_engine=ocr,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+            cache_extra_base=cache_extra,
+        )
+        orient_angle = (provisional_orient + axis_delta) % 360
+        if axis_delta:
+            cache_extra = f"deskew={int(deskew)}|orient={orient_angle}"
+        image, flip, text_boxes = maybe_flip_180_by_ocr(
+            image,
+            text_boxes,
+            ocr_engine=ocr,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+            cache_extra_base=cache_extra,
+        )
+        orient_angle = (orient_angle + flip) % 360
+        if axis_delta or flip:
+            try:
+                from .ocr_cache import save_ocr_cache
+
+                save_ocr_cache(
+                    image,
+                    text_boxes,
+                    extra=f"deskew={int(deskew)}|orient={orient_angle}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("写入 OCR 缓存失败: %s", exc)
+
+    binary = binarize_otsu(image)
+    text_boxes = postprocess_text_boxes(text_boxes, binary=binary)
+
+    structure = (structure or "tsr").strip().lower()
+    # auto 已废弃：直接走 tsr，避免误导
+    if structure == "auto":
+        logger.info("structure=auto 已废弃，改走 tsr")
+        structure = "tsr"
+
+    tables: List[DetectedTable] = []
+    outputs: Dict[str, str] = {"html": "", "md": ""}
+
+    if structure == "lines":
+        outputs, tables, _, _ = _extract_via_lines(
+            image,
+            text_boxes,
+            ioa_threshold=ioa_threshold,
+            compress_empty_cols=compress_empty_cols,
+        )
+        avg_conf = (
+            float(np.mean([t.confidence for t in tables])) if tables else 0.0
+        )
+        logger.info("框线路径: tables=%d avg_conf=%.3f", len(tables), avg_conf)
+    elif structure == "lore":
+        outputs = _extract_via_lore(
+            image,
+            text_boxes,
+            ioa_threshold=ioa_threshold,
+            compress_empty_cols=compress_empty_cols,
+            lore_pipe=lore_pipe,
+        )
+    elif structure == "tsr":
+        outputs, tables = _extract_via_tsr(
+            image,
+            text_boxes,
+            ioa_threshold=ioa_threshold,
+            compress_empty_cols=compress_empty_cols,
+            fallback_lines=fallback_lines,
+        )
+    else:
+        raise ValueError(
+            f"未知 structure 模式: {structure!r}，可选 tsr/lines/lore/auto"
+        )
+
+    if debug:
+        out_dir = Path(debug_dir) if debug_dir else DEFAULT_DEBUG_DIR
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if not tables and structure == "lines":
+            tables = detect_tables(image, confidence_thresh=0.0)
+        overlay = render_debug_overlay(image, tables, text_boxes)
+        out_path = out_dir / f"{stem}_grid.png"
+        imwrite_unicode(str(out_path), overlay)
+        logger.info("debug 叠加图已写入: %s", out_path)
+        print(f"[info] debug 叠加图: {out_path}")
+
+    if not outputs.get("html") and not outputs.get("md"):
+        free = format_free_texts(text_boxes)
+        outputs = {"html": free, "md": free}
+
+    return {
+        "html": outputs.get("html") or "",
+        "md": outputs.get("md") or "",
+        "structure": structure,
+        "orientation": int(orient_angle),
+    }
 
 
 def extract_table_markdown(
@@ -246,106 +478,32 @@ def extract_table_markdown(
     lore_pipe=None,
     ocr_engine=None,
     *,
-    structure: str = "auto",
+    structure: str = "tsr",
     use_cache: bool = True,
     refresh_cache: bool = False,
     compress_empty_cols: bool = True,
+    fallback_lines: bool = False,
+    orientation: Union[str, int] = "auto",
     debug: bool = False,
     debug_dir: Optional[Union[str, Path]] = None,
     debug_stem: Optional[str] = None,
 ) -> str:
-    """
-    复杂表格解耦提取 Pipeline。
-
-    Args:
-        structure: "auto" | "lines" | "lore"
-            - auto：框线置信度足够走 lines，否则 lore
-            - lines：强制框线网格
-            - lore：强制 LORE
-        use_cache / refresh_cache: OCR 本地缓存控制
-        compress_empty_cols: 删除整列为空的幽灵列
-        debug: 写出网格叠加图到 data/debug/
-    """
-    image = _load_image(image_path)
-    stem = debug_stem
-    if stem is None:
-        if isinstance(image_path, str):
-            stem = Path(image_path).stem
-        else:
-            stem = "image"
-
-    # ---------- 1. Deskew ----------
-    if deskew:
-        image = deskew_image(image, max_angle=max_skew_angle)
-
-    # ---------- 2. OCR（可缓存）----------
-    ocr = ocr_engine or load_ocr()
-    # 缓存 key 基于 deskew 后的图，避免原图/校正图混用
-    text_boxes = predict_texts(
-        image,
-        ocr_engine=ocr,
+    """兼容旧接口：返回 Markdown 字符串。"""
+    out = extract_table_output(
+        image_path,
+        ioa_threshold=ioa_threshold,
+        deskew=deskew,
+        max_skew_angle=max_skew_angle,
+        lore_pipe=lore_pipe,
+        ocr_engine=ocr_engine,
+        structure=structure,
         use_cache=use_cache,
         refresh_cache=refresh_cache,
-        cache_extra=f"deskew={int(deskew)}",
+        compress_empty_cols=compress_empty_cols,
+        fallback_lines=fallback_lines,
+        orientation=orientation,
+        debug=debug,
+        debug_dir=debug_dir,
+        debug_stem=debug_stem,
     )
-
-    structure = (structure or "auto").strip().lower()
-    tables: List[DetectedTable] = []
-    markdown = ""
-
-    # ---------- 3. 结构 ----------
-    if structure in {"lines", "auto"}:
-        markdown, tables, _, _ = _extract_via_lines(
-            image,
-            text_boxes,
-            ioa_threshold=ioa_threshold,
-            compress_empty_cols=compress_empty_cols,
-        )
-        avg_conf = (
-            float(np.mean([t.confidence for t in tables])) if tables else 0.0
-        )
-        logger.info(
-            "框线路径: tables=%d avg_conf=%.3f",
-            len(tables),
-            avg_conf,
-        )
-        if structure == "lines":
-            pass
-        elif not tables or avg_conf < _LINES_CONF_THRESH:
-            logger.info("框线置信度不足，回退 LORE")
-            markdown = _extract_via_lore(
-                image,
-                text_boxes,
-                ioa_threshold=ioa_threshold,
-                compress_empty_cols=compress_empty_cols,
-                lore_pipe=lore_pipe,
-            )
-            tables = []
-
-    elif structure == "lore":
-        markdown = _extract_via_lore(
-            image,
-            text_boxes,
-            ioa_threshold=ioa_threshold,
-            compress_empty_cols=compress_empty_cols,
-            lore_pipe=lore_pipe,
-        )
-    else:
-        raise ValueError(f"未知 structure 模式: {structure!r}，可选 auto/lines/lore")
-
-    # ---------- 4. Debug 叠加图 ----------
-    if debug:
-        out_dir = Path(debug_dir) if debug_dir else DEFAULT_DEBUG_DIR
-        out_dir.mkdir(parents=True, exist_ok=True)
-        if not tables and structure != "lore":
-            # 再跑一次检测以便可视化（即使 conf 低）
-            tables = detect_tables(image, confidence_thresh=0.0)
-        overlay = render_debug_overlay(image, tables, text_boxes)
-        out_path = out_dir / f"{stem}_grid.png"
-        imwrite_unicode(str(out_path), overlay)
-        logger.info("debug 叠加图已写入: %s", out_path)
-        print(f"[info] debug 叠加图: {out_path}")
-
-    if not markdown:
-        return format_free_texts(text_boxes)
-    return markdown
+    return out["md"] or out["html"]

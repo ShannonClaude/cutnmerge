@@ -3,9 +3,10 @@
 
 用法:
     python main.py
-        # 默认：扫描 data/input/ 下全部图片，逐张生成 data/output/<同名>.md
+        # 默认：tsr 结构，写出 data/output/<同名>.html
     python main.py --image data/input/demo.png
     python main.py --structure lines --debug
+    python main.py --format both
     python main.py --no-cache
     python main.py --refresh-cache
 """
@@ -21,7 +22,7 @@ from src.config import load_env
 
 load_env()
 
-from src.pipeline import extract_table_markdown
+from src.pipeline import extract_table_output
 
 # 项目根目录
 ROOT = Path(__file__).resolve().parent
@@ -47,7 +48,7 @@ def list_input_images(input_dir: Path = DEFAULT_INPUT_DIR) -> List[Path]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="结构与文本解耦的复杂表格提取（框线网格 / LORE + 云端 OCR + IoA）",
+        description="结构与文本解耦的复杂表格提取（默认 TSR + 云端 OCR + IoA → HTML）",
     )
     parser.add_argument(
         "--image",
@@ -59,8 +60,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output",
         type=str,
         default=None,
-        help="Markdown 输出路径；仅在指定 --image 单图模式时生效。"
-             "批量模式默认写入 data/output/<图片名>.md",
+        help="输出路径（单图模式）；扩展名可省略，将按 --format 补全。"
+             "批量模式默认写入 data/output/<图片名>.html|.md",
+    )
+    parser.add_argument(
+        "--format",
+        type=str,
+        default="html",
+        choices=["html", "md", "both"],
+        help="输出格式：html（默认，保留 rowspan/colspan）/ md / both",
     )
     parser.add_argument(
         "--ioa-threshold",
@@ -71,9 +79,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--structure",
         type=str,
-        default="auto",
-        choices=["auto", "lines", "lore"],
-        help="结构来源：auto（默认，框线优先）/ lines（强制框线）/ lore（强制 LORE）",
+        default="tsr",
+        choices=["tsr", "lines", "lore", "auto"],
+        help="结构来源：tsr（默认）/ lines / lore；auto 已废弃，等价于 tsr",
+    )
+    parser.add_argument(
+        "--fallback-lines",
+        action="store_true",
+        help="仅 tsr：覆盖率过低时回退框线路径（默认关闭）",
     )
     parser.add_argument(
         "--no-deskew",
@@ -85,6 +98,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=15.0,
         help="Deskew 允许校正的最大倾斜角（度），默认 15",
+    )
+    parser.add_argument(
+        "--orientation",
+        type=str,
+        default="auto",
+        choices=["auto", "none", "0", "90", "180", "270"],
+        help="方向归正：auto（默认，投影定轴+OCR 消歧180）/ none / 强制角度",
     )
     parser.add_argument(
         "--no-cache",
@@ -109,9 +129,51 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_out_paths(
+    image_path: Path,
+    output_arg: str | None,
+    fmt: str,
+    *,
+    single: bool,
+) -> list[tuple[str, Path]]:
+    """返回 [(format_key, path), ...]。"""
+    stem = image_path.stem
+    if single and output_arg:
+        out = Path(output_arg)
+        if out.suffix.lower() in {".html", ".htm", ".md", ".markdown"}:
+            # 用户指定了明确扩展名
+            key = "html" if out.suffix.lower() in {".html", ".htm"} else "md"
+            if fmt == "both":
+                other = "md" if key == "html" else "html"
+                other_path = out.with_suffix(".md" if other == "md" else ".html")
+                return [(key, out), (other, other_path)]
+            return [(key if fmt == key else fmt, out if fmt == key else out.with_suffix(
+                ".html" if fmt == "html" else ".md"
+            ))]
+        # 无扩展名：按 format 生成
+        base = out
+        if fmt == "html":
+            return [("html", base.with_suffix(".html") if base.suffix == "" else Path(str(base) + ".html"))]
+        if fmt == "md":
+            return [("md", base.with_suffix(".md") if base.suffix == "" else Path(str(base) + ".md"))]
+        return [
+            ("html", Path(str(base) + ".html") if base.suffix == "" else base.with_suffix(".html")),
+            ("md", Path(str(base) + ".md") if base.suffix == "" else base.with_suffix(".md")),
+        ]
+
+    if fmt == "html":
+        return [("html", DEFAULT_OUTPUT_DIR / f"{stem}.html")]
+    if fmt == "md":
+        return [("md", DEFAULT_OUTPUT_DIR / f"{stem}.md")]
+    return [
+        ("html", DEFAULT_OUTPUT_DIR / f"{stem}.html"),
+        ("md", DEFAULT_OUTPUT_DIR / f"{stem}.md"),
+    ]
+
+
 def process_one(
     image_path: Path,
-    out_path: Path,
+    out_specs: list[tuple[str, Path]],
     *,
     ioa_threshold: float,
     deskew: bool,
@@ -120,13 +182,15 @@ def process_one(
     use_cache: bool,
     refresh_cache: bool,
     compress_empty_cols: bool,
+    fallback_lines: bool,
+    orientation: str,
     debug: bool,
     lore_pipe=None,
     ocr_engine=None,
 ) -> None:
-    """处理单张图片并写入对应 Markdown。"""
+    """处理单张图片并按 format 写入。"""
     print(f"[info] 处理图像: {image_path}")
-    markdown = extract_table_markdown(
+    result = extract_table_output(
         str(image_path),
         ioa_threshold=ioa_threshold,
         deskew=deskew,
@@ -137,25 +201,28 @@ def process_one(
         use_cache=use_cache,
         refresh_cache=refresh_cache,
         compress_empty_cols=compress_empty_cols,
+        fallback_lines=fallback_lines,
+        orientation=orientation,
         debug=debug,
         debug_stem=image_path.stem,
     )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(markdown, encoding="utf-8")
-    try:
-        print(markdown)
-    except UnicodeEncodeError:
-        # Windows 控制台常见 GBK，无法打印部分 OCR 字符；文件已写 UTF-8
-        print(markdown.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(
-            sys.stdout.encoding or "utf-8", errors="replace"
-        ))
-    print(f"[info] 已写入: {out_path}\n")
+
+    for key, out_path in out_specs:
+        content = result.get(key) or ""
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(content, encoding="utf-8")
+        try:
+            print(content)
+        except UnicodeEncodeError:
+            print(content.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(
+                sys.stdout.encoding or "utf-8", errors="replace"
+            ))
+        print(f"[info] 已写入: {out_path}\n")
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    # ---------- 解析待处理图片列表 ----------
     if args.image:
         image_path = Path(args.image)
         if not image_path.is_file():
@@ -166,43 +233,44 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"错误: 找不到图片 {args.image}", file=sys.stderr)
                 return 1
         images = [image_path]
+        single = True
     else:
         try:
             images = list_input_images()
         except FileNotFoundError as exc:
             print(f"错误: {exc}", file=sys.stderr)
             return 1
+        single = False
 
-    print(f"[info] 共 {len(images)} 张图片待处理 (structure={args.structure})")
+    print(
+        f"[info] 共 {len(images)} 张图片待处理 "
+        f"(structure={args.structure}, format={args.format})"
+    )
 
-    # ---------- OCR 客户端预加载；LORE 仅在需要时加载 ----------
-    from src.models import load_lore_model, load_ocr
+    from src.models import load_ocr
 
     ocr = load_ocr()
     lore = None
-    if args.structure in {"lore", "auto"}:
-        # auto 可能回退；预先加载避免中途失败难排查。lines 强制时跳过。
-        if args.structure == "lore":
-            lore = load_lore_model()
+    if args.structure == "lore":
+        from src.models import load_lore_model
+
+        lore = load_lore_model()
+    if args.structure in {"tsr", "auto"}:
+        from src.tsr import load_tsr_models
+
+        print("[info] 预加载 TableStructureRec…")
+        load_tsr_models()
 
     ok, fail = 0, 0
     for i, image_path in enumerate(images, start=1):
-        if args.output and len(images) == 1:
-            out_path = Path(args.output)
-        else:
-            out_path = DEFAULT_OUTPUT_DIR / f"{image_path.stem}.md"
-
+        out_specs = _resolve_out_paths(
+            image_path, args.output, args.format, single=single and len(images) == 1
+        )
         print(f"[info] ({i}/{len(images)}) {image_path.name}")
         try:
-            # auto 且框线失败时再懒加载 LORE
-            lore_pipe = lore
-            if args.structure == "auto" and lore_pipe is None:
-                # 不预加载；pipeline 内部需要时再 load
-                lore_pipe = None
-
             process_one(
                 image_path,
-                out_path,
+                out_specs,
                 ioa_threshold=args.ioa_threshold,
                 deskew=not args.no_deskew,
                 max_skew_angle=args.max_skew_angle,
@@ -210,12 +278,14 @@ def main(argv: list[str] | None = None) -> int:
                 use_cache=not args.no_cache,
                 refresh_cache=args.refresh_cache,
                 compress_empty_cols=not args.keep_empty_cols,
+                fallback_lines=args.fallback_lines,
+                orientation=args.orientation,
                 debug=args.debug,
-                lore_pipe=lore_pipe,
+                lore_pipe=lore,
                 ocr_engine=ocr,
             )
             ok += 1
-        except Exception as exc:  # noqa: BLE001 — 单张失败不阻断整批
+        except Exception as exc:  # noqa: BLE001
             fail += 1
             print(f"[error] 处理失败 {image_path.name}: {exc}", file=sys.stderr)
             import traceback
