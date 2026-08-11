@@ -31,20 +31,79 @@ _EDGE_ALIGN_FRAC = 0.30
 _GAP_ABSORB_FRAC = 0.60  # 宽间隙吸附容差（相对字距）
 _MIN_CELL_COVER_FRAC = 0.55
 # 无空格重复标签：允许窄间隙 + 列宽比例校验
-_REPEAT_LABEL_RE = re.compile(
-    r"^(?:"
-    r"比较例\s*\d+|实施例\s*\d+|合成例\s*\d+|"
-    r"種類添加量|種類|添加量"
-    r"){2,}$"
-    r"|^種類添加量$"
-)
+def _looks_like_repeated_header_units(text: str) -> bool:
+    """
+    通用“重复单元”检测：不依赖领域关键词。
+
+    提取形如「(字母/中文段)+数字」的片段；若至少两段且前缀骨架一致，则认为是重复标签拼接。
+    """
+    if not text:
+        return False
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return False
+    ms = list(re.finditer(r"([A-Za-z\u3400-\u9fff]+)\d+", compact))
+    if len(ms) < 2:
+        return False
+
+    def _sk_prefix(prefix: str) -> str:
+        out: List[str] = []
+        for ch in prefix:
+            if bool(_CJK_RE.fullmatch(ch)):
+                out.append("C")
+            elif ch.isalpha():
+                out.append("A")
+            else:
+                out.append(ch)
+        if not out:
+            return ""
+        s = "".join(out)
+        comp: List[str] = [s[0]]
+        for ch in s[1:]:
+            if ch == comp[-1] and ch in {"A", "C"}:
+                continue
+            comp.append(ch)
+        return "".join(comp)
+
+    first = _sk_prefix(ms[0].group(1))
+    if not first:
+        return False
+    for m in ms[1:]:
+        if _sk_prefix(m.group(1)) != first:
+            return False
+    return True
 # 行标签粘连：比较例1 86 Bk-1 → 切成多段
-_ROW_LABEL_STICKY_RE = re.compile(
-    r"^(比较例|实施例|合成例)\s*(\d+)\s+(.+)$"
-)
-_ROW_LABEL_COMPACT_RE = re.compile(
-    r"^(比较例|实施例|合成例)\s*(\d+)(\d{1,3})([A-Za-z].*)$"
-)
+def _split_generic_row_label(tb_text: str) -> Optional[List[str]]:
+    """
+    通用数字粘连切分（不依赖比较例/实施例等词表）。
+
+    - 若至少两个数字块：按第一个数字块结束切成两段
+    - 若只有一个数字块且长度足够：尝试把数字拆成两段（适配无空格粘连）
+    """
+    t = (tb_text or "").strip()
+    if not t:
+        return None
+    t = re.sub(r"\s+", " ", t)
+    digits = list(re.finditer(r"\d+", t))
+    if len(digits) >= 2:
+        part1 = t[: digits[0].end()].strip()
+        part2 = t[digits[0].end() :].strip()
+        return [part1, part2] if part1 and part2 else None
+
+    if len(digits) == 1:
+        only = digits[0]
+        prefix = t[: only.start()].strip()
+        digits_str = only.group(0)
+        rest = t[only.end() :].strip()
+        if prefix and len(digits_str) >= 3:
+            for split_at in (1, 2):
+                if split_at >= len(digits_str):
+                    continue
+                part1 = (prefix + digits_str[:split_at]).strip()
+                part2 = (digits_str[split_at:] + ((" " + rest) if rest else "")).strip()
+                if part1 and part2:
+                    return [part1, part2]
+    return None
 
 
 def _text_top_left(tb: Dict[str, Any]) -> Tuple[float, float]:
@@ -410,19 +469,9 @@ def _split_sticky_row_label(
         return None
 
     parts: List[str] = []
-    m = _ROW_LABEL_STICKY_RE.match(text)
-    if m:
-        parts = [f"{m.group(1)}{m.group(2)}", m.group(3).strip()]
-        # 第二段可能仍含「86 Bk-1」
-        rest = parts[1]
-        rest_m = re.match(r"^(\d{1,4})\s+(.+)$", rest)
-        if rest_m:
-            parts = [parts[0], rest_m.group(1), rest_m.group(2).strip()]
-    else:
-        m2 = _ROW_LABEL_COMPACT_RE.match(re.sub(r"\s+", "", text))
-        if not m2:
-            return None
-        parts = [f"{m2.group(1)}{m2.group(2)}", m2.group(3), m2.group(4)]
+    parts = _split_generic_row_label(text) or []
+    if not parts or len(parts) < 2:
+        return None
 
     parts = [p for p in parts if p]
     if len(parts) < 2:
@@ -564,7 +613,7 @@ def _try_split_across_cells(
     # 表头合并格特殊路径：竖线只通表身时，仅对重复标签按合并格内部 col_seps 切
     if len(slots) < 2 and col_seps is not None:
         compact0 = re.sub(r"\s+", "", text)
-        if _REPEAT_LABEL_RE.match(compact0):
+        if _looks_like_repeated_header_units(text):
             for cell in cells:
                 if max(int(cell.get("col_span") or 1), 1) < 2:
                     continue
@@ -675,7 +724,7 @@ def _try_split_across_cells(
 
     all_wide = all(w >= wide_need for w in run_widths)
     compact = re.sub(r"\s+", "", text)
-    is_repeat = bool(_REPEAT_LABEL_RE.match(compact))
+    is_repeat = _looks_like_repeated_header_units(text)
     fits = _pieces_match_slot_widths(text, cuts, slots)
     if all_wide:
         # 非重复标签还须列宽比例匹配，避免「基团的|化合物」这类误切
@@ -925,10 +974,12 @@ def join_cell_texts(
             rows.append((y, 1, [(x, tb)]))
 
     parts: List[str] = []
+    row_parts: List[str] = []
     for _, _, members in rows:
         members.sort(key=lambda m: m[0])
         prev_right: Optional[float] = None
         prev_h: float = 10.0
+        row_buf: List[str] = []
         for x, tb in members:
             text = str(tb.get("text") or "").strip()
             if not text:
@@ -938,14 +989,19 @@ def join_cell_texts(
             force_space = False
             if prev_right is not None and (bx1 - prev_right) > 0.8 * max(prev_h, box_h):
                 force_space = True
-            if not parts:
-                parts.append(text)
+            if not row_buf:
+                row_buf.append(text)
             elif force_space:
-                parts.append(" " + text)
-            elif _should_join_with_space(parts[-1], text):
-                parts.append(" " + text)
+                row_buf.append(" " + text)
+            elif _should_join_with_space(row_buf[-1], text):
+                row_buf.append(" " + text)
             else:
-                parts.append(text)
+                row_buf.append(text)
             prev_right = bx2
             prev_h = box_h
-    return _normalize_dash_text("".join(parts))
+        row_text = "".join(row_buf).strip()
+        if row_text:
+            row_parts.append(row_text)
+    if not row_parts:
+        return ""
+    return _normalize_dash_text("\n".join(row_parts))

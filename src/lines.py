@@ -468,6 +468,238 @@ def _recover_columns_by_ink_gutters(
     return sorted(list(v_seps) + new_seps, key=lambda s: s.coord)
 
 
+def _recover_columns_by_ocr_corridors(
+    text_boxes: Sequence[Dict[str, Any]],
+    h_seps: Sequence[Separator],
+    v_seps: Sequence[Separator],
+    *,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    corridor_hold_ratio: float = 0.70,
+    min_corridor_px: float = 5.5,
+    near_tol: float = 6.0,
+    max_new: int = 10,
+    min_col_text_rows: int = 2,
+) -> List[Separator]:
+    """
+    用 OCR 文本框的“x 覆盖空洞”来补回缺失竖分隔线（用于 lineless 表）。
+
+    思路：
+      1) 只看表体区域（跳过前两条横线，和 _recover_columns_by_ink_gutters 保持一致）。
+      2) 在 ROI 内对 x 做 1D coverage：若某 x 落在任意 OCR bbox 内 → coverage=1。
+      3) 找 coverage=0 的长空洞 run，取 run 中心作为候选竖线。
+      4) 候选竖线必须在大多数行带上都保持空洞（corridor_hold_ratio）。
+      5) 候选竖线加入后，新列也要在足够多行带出现 OCR 文本（min_col_text_rows）。
+    """
+    if not text_boxes or len(v_seps) < 2 or len(h_seps) < 3:
+        return list(v_seps)
+
+    h_coords_sorted = sorted(float(s.coord) for s in h_seps)
+    body_top = float(max(y1, h_coords_sorted[min(2, len(h_coords_sorted) - 1)]))
+    body_bot = float(min(y2, h_coords_sorted[-1]))
+    if body_bot - body_top < 25:
+        return list(v_seps)
+
+    # relevant text：限制在表体区域
+    relevant: List[Dict[str, Any]] = []
+    for tb in text_boxes:
+        poly = np.asarray(tb["polygon"], dtype=np.float64).reshape(-1, 2)
+        bx1 = float(poly[:, 0].min())
+        by1 = float(poly[:, 1].min())
+        bx2 = float(poly[:, 0].max())
+        by2 = float(poly[:, 1].max())
+        # y 方向落入表体区域（用于筛选相关 OCR bbox）
+        if bx2 < x1 or bx1 > x2:
+            continue
+        if by2 < body_top or by1 > body_bot:
+            continue
+        relevant.append(tb)
+    if not relevant:
+        return list(v_seps)
+
+    v_sorted = sorted(list(v_seps), key=lambda s: s.coord)
+    coords = [float(s.coord) for s in v_sorted]
+    if len(coords) < 2:
+        return list(v_seps)
+    gaps = np.diff(coords)
+    med_gap = float(np.median(gaps)) if len(gaps) else (x2 - x1) / 4.0
+
+    width = float(x2 - x1)
+    step = max(2, int(round(width / 220.0)))  # 控制 1D 数组长度
+    if step <= 0:
+        step = 2
+    n = max(1, int(round(width / step)) + 1)
+    coverage = np.zeros(n, dtype=np.uint8)
+    # 将 OCR bbox 在 x 方向投影成 coverage=1
+    for tb in relevant:
+        poly = np.asarray(tb["polygon"], dtype=np.float64).reshape(-1, 2)
+        bx1 = float(poly[:, 0].min())
+        bx2 = float(poly[:, 0].max())
+        lo = int(max(0, np.floor((bx1 - x1) / step)))
+        hi = int(min(n - 1, np.ceil((bx2 - x1) / step)))
+        coverage[lo : hi + 1] = 1
+
+    # 找覆盖为 0 的 run
+    candidates: List[Tuple[float, float]] = []  # (run_len, x_center)
+    i = 0
+    while i < n:
+        if coverage[i] == 0:
+            j = i
+            while j < n and coverage[j] == 0:
+                j += 1
+            run_len = (j - i) * step
+            if run_len >= min_corridor_px:
+                x_center = x1 + (i + j - 1) / 2.0 * step
+                candidates.append((float(run_len), float(x_center)))
+            i = j
+        else:
+            i += 1
+    if not candidates:
+        return list(v_seps)
+
+    # 候选必须落在“大间隔”区域（否则在密表上乱补）
+    big_gap_thr = med_gap * 1.2
+    big_gaps: List[Tuple[float, float]] = []
+    for a, b in zip(coords[:-1], coords[1:]):
+        if b - a >= big_gap_thr:
+            big_gaps.append((a, b))
+    if not big_gaps:
+        return list(v_seps)
+
+    def in_big_gap(x: float) -> bool:
+        return any(lo - near_tol <= x <= hi + near_tol for lo, hi in big_gaps)
+
+    filtered: List[Tuple[float, float]] = []
+    for run_len, x_center in candidates:
+        if not in_big_gap(x_center):
+            continue
+        if any(abs(x_center - c) <= near_tol for c in coords):
+            continue
+        filtered.append((run_len, x_center))
+
+    # 备用候选：用 OCR bbox 的中心点 x 的“大间隙”直接推断分隔线位置
+    # 当空洞 run 候选偏少时更有效（lineless + 文字宽度变化较大时）。
+    if len(filtered) < 4:
+        centroids: List[float] = []
+        for tb in relevant:
+            poly = np.asarray(tb["polygon"], dtype=np.float64).reshape(-1, 2)
+            bx1 = float(poly[:, 0].min())
+            bx2 = float(poly[:, 0].max())
+            centroids.append((bx1 + bx2) / 2.0)
+        centroids.sort()
+        for a, b in zip(centroids[:-1], centroids[1:]):
+            if b - a < med_gap * 0.55:
+                continue
+            x_center = (a + b) / 2.0
+            if not in_big_gap(x_center):
+                continue
+            if any(abs(x_center - c) <= near_tol for c in coords):
+                continue
+            filtered.append((float(b - a), float(x_center)))
+    if not filtered:
+        return list(v_seps)
+
+    filtered.sort(reverse=True, key=lambda t: t[0])
+
+    # 行带边界：从 h_seps 坐标取与 body_top/body_bot 重叠的区间
+    h_sorted = sorted(float(s.coord) for s in h_seps)
+    row_bands: List[Tuple[float, float]] = []
+    for y_lo, y_hi in zip(h_sorted[:-1], h_sorted[1:]):
+        lo = max(body_top, y_lo)
+        hi = min(body_bot, y_hi)
+        if hi - lo >= 8:
+            row_bands.append((lo, hi))
+    if not row_bands:
+        return list(v_seps)
+
+    # 预先算每行带里哪些 tb 在 y 上有效
+    tb_bboxes: List[Tuple[float, float, float, float]] = []
+    for tb in relevant:
+        poly = np.asarray(tb["polygon"], dtype=np.float64).reshape(-1, 2)
+        bx1 = float(poly[:, 0].min())
+        by1 = float(poly[:, 1].min())
+        bx2 = float(poly[:, 0].max())
+        by2 = float(poly[:, 1].max())
+        tb_bboxes.append((bx1, by1, bx2, by2))
+
+    def corridor_holds_at_x(xc: float) -> float:
+        holds = 0
+        for lo, hi in row_bands:
+            band_has_text_at_x = False
+            for (bx1, by1, bx2, by2), tb in zip(tb_bboxes, relevant):
+                if by2 < lo or by1 > hi:
+                    continue
+                if bx1 <= xc <= bx2:
+                    band_has_text_at_x = True
+                    break
+            if not band_has_text_at_x:
+                holds += 1
+        return holds / max(1, len(row_bands))
+
+    def columns_have_text_at_coords(col_coords: Sequence[float]) -> bool:
+        # 计算每列“出现文本的行带数”
+        cols = list(col_coords)
+        if len(cols) < 2:
+            return False
+        n_cols_local = len(cols) - 1
+        col_good = 0
+        for ci in range(n_cols_local):
+            c_lo, c_hi = cols[ci], cols[ci + 1]
+            rows_with_text = 0
+            for lo, hi in row_bands:
+                has = False
+                for bx1, by1, bx2, by2 in tb_bboxes:
+                    if by2 < lo or by1 > hi:
+                        continue
+                    cx = (bx1 + bx2) / 2.0
+                    if c_lo <= cx <= c_hi:
+                        has = True
+                        break
+                if has:
+                    rows_with_text += 1
+            if rows_with_text >= min_col_text_rows:
+                col_good += 1
+        return (col_good / max(1, n_cols_local)) >= 0.50
+
+    existing_coords = sorted(set(float(s.coord) for s in v_seps))
+    accepted: List[float] = []
+
+    for _run_len, x_center in filtered[: max_new * 4]:
+        if len(accepted) >= max_new:
+            break
+        hold_ratio = corridor_holds_at_x(x_center)
+        if hold_ratio < corridor_hold_ratio:
+            continue
+        proposed = sorted(existing_coords + accepted + [x_center])
+        if columns_have_text_at_coords(proposed):
+            accepted.append(x_center)
+
+    if not accepted:
+        return list(v_seps)
+
+    body_span = float(body_bot - body_top)
+    new_seps: List[Separator] = []
+    for xc in accepted:
+        new_seps.append(
+            Separator(
+                coord=float(xc),
+                spans=[(float(body_top), float(body_bot))],
+                length=float(body_span),
+            )
+        )
+
+    merged = _merge_separator_lists(
+        list(v_seps),
+        new_seps,
+        near_tol=near_tol,
+        min_cover_total=body_span,
+        min_cover_ratio=0.25,
+    )
+    return merged
+
+
 def _find_table_rois(
     hmask: np.ndarray,
     vmask: np.ndarray,
@@ -752,6 +984,7 @@ def detect_tables(
     *,
     confidence_thresh: float = _CONFIDENCE_THRESH,
     merge_cover_thresh: float = _MERGE_COVER_THRESH,
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> List[DetectedTable]:
     """检测图像中所有有框线表格。"""
     if image is None or getattr(image, "size", 0) == 0:
@@ -845,6 +1078,17 @@ def detect_tables(
         v_roi = _recover_columns_by_ink_gutters(
             otsu, h_roi, v_roi, x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2)
         )
+        # 对 lineless 表：用 OCR 空白走廊补回缺失竖线
+        if text_boxes:
+            v_roi = _recover_columns_by_ocr_corridors(
+                text_boxes,
+                h_roi,
+                v_roi,
+                x1=float(x1),
+                y1=float(y1),
+                x2=float(x2),
+                y2=float(y2),
+            )
         v_roi = _suppress_shadow_vlines(v_roi, th)
         h_roi, v_roi = _ensure_border_seps(h_roi, v_roi, float(x1), float(y1), float(x2), float(y2))
 

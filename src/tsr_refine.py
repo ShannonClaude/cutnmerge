@@ -667,16 +667,47 @@ def split_underspanned_rows(
         if 2 <= bh <= 80:
             box_heights.append(bh)
     median_box_h = float(np.median(box_heights)) if box_heights else 14.0
-    gap_thresh = max(3.0, gap_ratio * median_box_h)
+    base_gap_thresh = max(3.0, gap_ratio * median_box_h)
+
+    # 表头带识别：从顶部开始连续若干“非数字/长标签行”，跳过子行切分
+    # （避免把表头折行当作“子行”拆开）
+    def _row_is_header(r: int) -> bool:
+        y0, y1 = row_seps[r], row_seps[r + 1]
+        row_texts: List[str] = []
+        for tb in boxes:
+            _x1, by1, _x2, by2 = _tb_bbox(tb)
+            my = (by1 + by2) / 2.0
+            if not (y0 <= my < y1 or (r == n_rows - 1 and y0 <= my <= y1)):
+                continue
+            t = str(tb.get("text") or "").strip()
+            if t:
+                row_texts.append(t)
+        if not row_texts:
+            return False
+        has_long = any(len(t) > 12 for t in row_texts)
+        digit_n = sum(1 for t in row_texts if any(ch.isdigit() for ch in t))
+        digit_ratio = digit_n / max(len(row_texts), 1)
+        # 长标签 + 数字少（或完全没有）更像表头
+        return has_long and digit_ratio < 0.45
+
+    header_until = 0
+    for r in range(n_rows):
+        if _row_is_header(r):
+            header_until = r + 1
+        else:
+            break
 
     # splits: row_idx -> list of split_y ascending
     row_splits: Dict[int, List[float]] = {}
 
     for r in range(n_rows):
+        if r < header_until:
+            continue
         y0, y1 = row_seps[r], row_seps[r + 1]
         row_h = y1 - y0
         # 行高至少能放下约 2.5 行文字才考虑切
-        if row_h < gap_thresh * 2.5 + median_box_h:
+        # 注意：表头带已跳过，剩余行更像数据行，此时 gap 阈值才有意义
+        if row_h < base_gap_thresh * 2.5 + median_box_h:
             continue
 
         # 每列的 y 中心列表
@@ -696,14 +727,31 @@ def split_underspanned_rows(
                     col_ys[c].append(my)
                     break
 
-        # 对每列做 1D 间隙聚类
+        # 对每列做 1D 间隙聚类：
+        # gap_thresh 使用“该行内相邻文本中心的间隙分布”推导出来的更严格阈值，
+        # 只有明显大于折行/换行尺度的间隙才会被当成“子行切分”。
+        diffs: List[float] = []
+        for _c, ys in col_ys.items():
+            if len(ys) < 2:
+                continue
+            ys_sorted = sorted(ys)
+            for k in range(len(ys_sorted) - 1):
+                d = ys_sorted[k + 1] - ys_sorted[k]
+                # 只统计更可能对应“同一格内换行”的小间隙
+                if d < 2.5 * median_box_h:
+                    diffs.append(d)
+        local_gap_thresh = base_gap_thresh
+        if diffs:
+            q75 = float(np.quantile(diffs, 0.75))
+            local_gap_thresh = max(base_gap_thresh, q75 * 1.8)
+
         def cluster_ys(ys: List[float]) -> List[Tuple[float, float]]:
             if len(ys) < 2:
                 return []
             ys = sorted(ys)
             bands: List[List[float]] = [[ys[0]]]
             for y in ys[1:]:
-                if y - bands[-1][-1] > gap_thresh:
+                if y - bands[-1][-1] > local_gap_thresh:
                     bands.append([y])
                 else:
                     bands[-1].append(y)
@@ -732,17 +780,17 @@ def split_underspanned_rows(
             if short_n / len(row_texts) < 0.55:
                 continue
 
-        # 多数列的 band 数一致且 >= 4；至少 4 列同意（表头折行常只有 2~3 列碰巧对齐）
+        # 多数列的 band 数一致；两行合并也允许切开，但仍要求多列共同支持
         k_counts: Dict[int, int] = defaultdict(int)
         for bands in col_bands.values():
             k_counts[len(bands)] += 1
         k_best, support = max(k_counts.items(), key=lambda kv: kv[1])
-        need_support = max(min_support_cols, 4)
-        if k_best < 4 or support < need_support:
+        need_support = max(min_support_cols, min(4, len(col_bands)))
+        if k_best < 2 or support < need_support:
             continue
 
-        # 行必须明显偏高：至少能放下 ~5 行文字
-        if row_h < 5.0 * median_box_h:
+        # 行必须明显偏高：至少能放下 k_best 行文字并留出间隙
+        if row_h < max(2.2 * median_box_h, k_best * 1.4 * median_box_h):
             continue
 
         # 每带高度应接近「单行文字」尺度
@@ -755,7 +803,7 @@ def split_underspanned_rows(
             for c, bands in col_bands.items()
             if len(bands) == k_best
         }
-        if len(supporting) < need_support:
+        if len(supporting) < max(need_support, int(np.ceil(0.6 * len(col_bands)))):
             continue
 
         # 带间隙中位作为切点
