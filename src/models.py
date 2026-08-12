@@ -773,6 +773,7 @@ def predict_texts(
                 use_doc_unwarping=settings.use_doc_unwarping,
                 use_chart_recognition=settings.use_chart_recognition,
                 prettify_markdown=settings.prettify_markdown,
+                markdown_ignore_labels=settings.markdown_ignore_labels or None,
             )
             result = client.parse_document(
                 file_path=file_path,
@@ -783,6 +784,11 @@ def predict_texts(
             options = OCROptions(
                 use_doc_orientation_classify=settings.use_doc_orientation_classify,
                 use_doc_unwarping=settings.use_doc_unwarping,
+                use_textline_orientation=settings.use_textline_orientation,
+                text_det_thresh=settings.text_det_thresh,
+                text_det_box_thresh=settings.text_det_box_thresh,
+                text_det_unclip_ratio=settings.text_det_unclip_ratio,
+                text_rec_score_thresh=settings.text_rec_score_thresh,
             )
             result = client.ocr(
                 file_path=file_path,
