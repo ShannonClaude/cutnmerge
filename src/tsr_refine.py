@@ -1015,128 +1015,660 @@ def split_underspanned_rows(
     return out
 
 
-def explode_header_colspans_by_body(
+def _cluster_1d(
+    values: List[float],
+    *,
+    gap_thresh: float,
+) -> List[List[int]]:
+    """对一维坐标做间隙聚类，返回每簇的原始下标列表。"""
+    if not values:
+        return []
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    clusters: List[List[int]] = [[order[0]]]
+    for idx in order[1:]:
+        prev = values[clusters[-1][-1]]
+        if values[idx] - prev > gap_thresh:
+            clusters.append([idx])
+        else:
+            clusters[-1].append(idx)
+    return clusters
+
+
+def _snap_x_range_to_cols(
+    x_lo: float,
+    x_hi: float,
+    col_seps: List[float],
+    *,
+    fallback: Tuple[int, int],
+) -> Tuple[int, int]:
+    """将物理 x 区间吸附到逻辑列 [cs, ce]。"""
+    n_cols = len(col_seps) - 1
+    if n_cols <= 0:
+        return fallback
+    mid = 0.5 * (x_lo + x_hi)
+    # 优先：区间覆盖的列
+    covered: List[int] = []
+    for c in range(n_cols):
+        left, right = col_seps[c], col_seps[c + 1]
+        overlap = min(x_hi, right) - max(x_lo, left)
+        if overlap > 0.25 * (right - left):
+            covered.append(c)
+    if covered:
+        return covered[0], covered[-1]
+    # 回退：中心所在列
+    for c in range(n_cols):
+        if col_seps[c] <= mid < col_seps[c + 1] or (
+            c == n_cols - 1 and col_seps[c] <= mid <= col_seps[c + 1]
+        ):
+            return c, c
+    return fallback
+
+
+def _fill_col_spans_among_groups(
+    spans: List[Tuple[int, int]],
+    *,
+    cs: int,
+    ce: int,
+) -> List[Tuple[int, int]]:
+    """
+    将若干已吸附的列区间按左→右填满 [cs, ce]，避免子表头之间留下空洞列。
+    """
+    if not spans:
+        return []
+    ordered = sorted(spans, key=lambda t: (t[0], t[1]))
+    seeds = [max(cs, min(ce, (a + b) // 2)) for a, b in ordered]
+    uniq_seeds: List[int] = []
+    for s in seeds:
+        if not uniq_seeds or uniq_seeds[-1] != s:
+            uniq_seeds.append(s)
+    if len(uniq_seeds) == 1:
+        return [(cs, ce)]
+    boundaries = [cs]
+    for i in range(len(uniq_seeds) - 1):
+        mid = (uniq_seeds[i] + uniq_seeds[i + 1] + 1) // 2
+        boundaries.append(max(boundaries[-1] + 1, min(ce, mid)))
+    boundaries.append(ce + 1)
+    out: List[Tuple[int, int]] = []
+    for i in range(len(boundaries) - 1):
+        a, b = boundaries[i], boundaries[i + 1] - 1
+        if b >= a:
+            out.append((a, b))
+    return out
+
+
+def _body_merge_spans(
+    work: List[Dict[str, Any]],
+    *,
+    after_row: int,
+    seg_hi: int,
+    cs: int,
+    ce: int,
+) -> List[Tuple[int, int]]:
+    """取身行在 [cs,ce] 上的合并区间，用于表头与身列拓扑对齐。"""
+    body_row = None
+    for r in range(after_row + 1, seg_hi + 1):
+        row_cells = [
+            c
+            for c in work
+            if int(c["row_start"]) == r and int(c["row_end"]) == r
+        ]
+        if not row_cells:
+            continue
+        wide_n = sum(
+            1 for c in row_cells if int(c["col_end"]) - int(c["col_start"]) + 1 >= 2
+        )
+        if wide_n >= max(2, len(row_cells) // 2):
+            continue
+        body_row = r
+        break
+    if body_row is None:
+        return []
+    spans: List[Tuple[int, int]] = []
+    for c in work:
+        if int(c["row_start"]) != body_row:
+            continue
+        a, b = int(c["col_start"]), int(c["col_end"])
+        if b < cs or a > ce:
+            continue
+        spans.append((max(a, cs), min(b, ce)))
+    return sorted(set(spans), key=lambda t: t[0])
+
+
+def _align_spans_to_body(
+    raw_spans: List[Tuple[int, int]],
+    body_spans: List[Tuple[int, int]],
+    *,
+    cs: int,
+    ce: int,
+) -> List[Tuple[int, int]]:
+    """
+    将 OCR 簇吸附的列区间对齐到身行合并拓扑。
+    若身行某格为 colspan>=2，则对应表头保持合并，避免单标签被拆散后串行。
+    """
+    if not raw_spans:
+        return []
+    if not body_spans:
+        return _fill_col_spans_among_groups(raw_spans, cs=cs, ce=ce)
+
+    seeds = [max(cs, min(ce, (a + b) // 2)) for a, b in raw_spans]
+    # 身行若全是原子列，没有合并先验，改用 OCR 簇填满
+    if all(a == b for a, b in body_spans):
+        return _fill_col_spans_among_groups(raw_spans, cs=cs, ce=ce)
+
+    hit_spans: List[Tuple[int, int]] = []
+    for ba, bb in body_spans:
+        if any(ba <= s <= bb for s in seeds):
+            hit_spans.append((ba, bb))
+    if not hit_spans:
+        return _fill_col_spans_among_groups(raw_spans, cs=cs, ce=ce)
+    # 已是身行拓扑：直接使用（仅补齐左右到 [cs,ce] 的空隙）
+    hit_spans = sorted(hit_spans, key=lambda t: t[0])
+    fixed = [list(s) for s in hit_spans]
+    fixed[0][0] = cs
+    fixed[-1][1] = ce
+    out: List[Tuple[int, int]] = []
+    for i, (a, b) in enumerate(fixed):
+        if i + 1 < len(fixed):
+            na = fixed[i + 1][0]
+            if b + 1 < na:
+                mid = (b + na) // 2
+                b = mid
+                fixed[i + 1][0] = mid + 1
+        out.append((a, b))
+    return out
+
+
+def _make_empty_cell(
+    *,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    row_start: int,
+    row_end: int,
+    col_start: int,
+    col_end: int,
+) -> Dict[str, Any]:
+    poly = _rebuild_polygon(x1, y1, x2, y2)
+    return {
+        "polygon": poly,
+        "x_key": x1,
+        "y_key": y1,
+        "row_start": row_start,
+        "row_end": row_end,
+        "col_start": col_start,
+        "col_end": col_end,
+        "row_span": row_end - row_start + 1,
+        "col_span": col_end - col_start + 1,
+        "texts": [],
+        "text": "",
+    }
+
+
+def reconstruct_header_cells(
     cells: List[Dict[str, Any]],
     boxes: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    顶部宽格（col_span>=2）若其覆盖列在下方身行上多数已是原子格，则拆成原子列。
+    按子表分段，用表头 OCR 的 Y/X 聚类重建多级表头结构。
 
-    专治「单体[摩尔比] 子标签全部堆进一个 colspan，而合成例身行已正确分列」。
+    - 相对行号在表头带内的宽格才处理（不再硬编码全局 rs<=2）
+    - Y 向多带 → 拆成多级表头行（如「单体[mol%]」+「三官能/四官能…」）
+    - 每带内仅 1 个 X 簇 → 保持合并格（避免单标签被拆散串行）
+    - 每带内 ≥2 个 X 簇 → 吸附到身列边界拆成若干格（可保留 colspan>1）
     """
     if not cells:
         return cells
-    row_seps, col_seps = _derive_seps(cells)
-    if len(col_seps) < 3 or len(row_seps) < 3:
+    boxes = list(boxes) if boxes else []
+    if not boxes:
         return cells
 
-    n_cols = len(col_seps) - 1
-    boxes = list(boxes) if boxes else []
+    from .segments import find_row_segments
 
-    # 每列在「某行以下」是否出现过原子格
-    def _atomic_below(col: int, after_row: int) -> bool:
-        for cell in cells:
-            if int(cell["col_start"]) != col or int(cell["col_end"]) != col:
-                continue
-            if int(cell["row_start"]) > after_row:
-                return True
-        return False
+    row_seps, col_seps = _derive_seps(cells)
+    if len(col_seps) < 3 or len(row_seps) < 2:
+        return cells
 
-    # OCR 命中也算身列证据
-    body_hits = [0] * n_cols
-    if boxes and len(row_seps) >= 2:
-        # 取整表上半之后的区域作为身行粗略带
-        mid_y = float(row_seps[min(2, len(row_seps) - 1)])
-        for tb in boxes:
-            x1, y1, x2, y2 = _tb_bbox(tb)
-            mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-            if my < mid_y:
+    segments = find_row_segments(cells, text_boxes=boxes)
+    if not segments:
+        min_r = min(int(c["row_start"]) for c in cells)
+        max_r = max(int(c["row_end"]) for c in cells)
+        segments = [(min_r, max_r)]
+
+    # 文本框高度中位数 → Y/X 聚类间隙
+    box_hs = []
+    box_ws = []
+    for tb in boxes:
+        x1, y1, x2, y2 = _tb_bbox(tb)
+        h, w = y2 - y1, x2 - x1
+        if 2 <= h <= 80:
+            box_hs.append(h)
+        if 2 <= w <= 400:
+            box_ws.append(w)
+    median_h = float(np.median(box_hs)) if box_hs else 14.0
+    median_w = float(np.median(box_ws)) if box_ws else 40.0
+    y_gap = max(6.0, 0.85 * median_h)
+    x_gap = max(12.0, 0.55 * median_w)
+
+    # 计划中的行插入：row_idx 之后插入 split_y（升序处理时从大行号开始）
+    # cell_replacements: id(cell) -> list of new cells (in old coords before row remap)
+    # 先收集每个段内要处理的宽格改造，统一做行插入重映射
+
+    # 工作副本
+    work = [dict(c) for c in cells]
+    # 按段处理；可能多次插入行，每次插入后刷新 seps / 段边界
+    total_y_splits = 0
+    total_x_splits = 0
+
+    for _pass in range(4):  # 有限轮次，避免死循环
+        row_seps, col_seps = _derive_seps(work)
+        segments = find_row_segments(work, text_boxes=boxes)
+        changed = False
+
+        for seg_lo, seg_hi in segments:
+            # 段内无身行则跳过（纯题注段）
+            body_rows = [
+                r
+                for r in range(seg_lo, seg_hi + 1)
+                if any(
+                    int(c["row_start"]) == r
+                    and int(c["row_end"]) == r
+                    and int(c.get("col_span") or 1) == 1
+                    for c in work
+                )
+            ]
+            # 表头带：段内相对前 2 行；若段很短则最多到身行前
+            header_hi = min(seg_lo + 1, seg_hi)
+            if body_rows:
+                header_hi = min(header_hi, max(body_rows[0] - 1, seg_lo))
+
+            # 找该段要处理的宽格（单行宽 colspan）
+            candidates = [
+                c
+                for c in work
+                if seg_lo <= int(c["row_start"]) <= header_hi
+                and int(c["row_start"]) == int(c["row_end"])
+                and int(c["col_end"]) - int(c["col_start"]) + 1 >= 2
+            ]
+            if not candidates:
                 continue
-            for c in range(n_cols):
-                if col_seps[c] <= mx < col_seps[c + 1] or (
-                    c == n_cols - 1 and col_seps[c] <= mx <= col_seps[c + 1]
-                ):
-                    body_hits[c] += 1
+
+            for cell in candidates:
+                cs, ce = int(cell["col_start"]), int(cell["col_end"])
+                rs = int(cell["row_start"])
+                cx1, cy1, cx2, cy2 = _cell_bbox(cell)
+                # 落入宽格的 OCR
+                hits: List[Tuple[float, float, float, float, Dict[str, Any]]] = []
+                for tb in boxes:
+                    bx1, by1, bx2, by2 = _tb_bbox(tb)
+                    mx, my = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
+                    if cx1 - 3 <= mx <= cx2 + 3 and cy1 - 3 <= my <= cy2 + 3:
+                        hits.append((mx, my, bx1, bx2, tb))
+                if len(hits) < 2:
+                    continue
+
+                mys = [h[1] for h in hits]
+                y_clusters = _cluster_1d(mys, gap_thresh=y_gap)
+                # 过滤过小的噪声簇
+                y_clusters = [cl for cl in y_clusters if len(cl) >= 1]
+                if not y_clusters:
+                    continue
+
+                # 每 Y 带内再做 X 聚类
+                band_xgroups: List[List[List[int]]] = []
+                for ycl in y_clusters:
+                    mxs = [hits[i][0] for i in ycl]
+                    # 映射回 hits 下标的簇
+                    local = _cluster_1d(mxs, gap_thresh=x_gap)
+                    # local 存的是 ycl 内的局部下标 → 转 hits 下标
+                    groups = [[ycl[j] for j in loc] for loc in local]
+                    band_xgroups.append(groups)
+
+                n_y = len(y_clusters)
+                max_xgroups = max(len(g) for g in band_xgroups)
+                # 无需任何拆分
+                if n_y == 1 and max_xgroups <= 1:
+                    continue
+
+                # 身列证据：该宽格覆盖列在下方是否多为原子格
+                def _atomic_below(col: int) -> bool:
+                    for c2 in work:
+                        if int(c2["col_start"]) != col or int(c2["col_end"]) != col:
+                            continue
+                        if int(c2["row_start"]) > rs and seg_lo <= int(c2["row_start"]) <= seg_hi:
+                            return True
+                    return False
+
+                covered = list(range(cs, ce + 1))
+                body_support = sum(1 for c in covered if _atomic_below(c))
+                # X 拆分需要身列支持；纯 Y 拆分（父级+子级）只要多带即可
+                allow_x_split = body_support >= max(2, int(0.5 * len(covered) + 0.5)) or max_xgroups >= 2
+
+                # ---- 构建替换格（可能插入一行）----
+                # 计算每带的 y 范围
+                band_yranges: List[Tuple[float, float]] = []
+                for ycl in y_clusters:
+                    tops, bots = [], []
+                    for i in ycl:
+                        _mx, _my, _bx1, _bx2, tb = hits[i]
+                        _x1, y1, _x2, y2 = _tb_bbox(tb)
+                        tops.append(y1)
+                        bots.append(y2)
+                    band_yranges.append((min(tops), max(bots)))
+
+                # 下层 OCR 是否已落入其它逻辑格（说明子表头行已存在，勿再插行）
+                lower_owned = 0
+                lower_total = 0
+                if n_y >= 2:
+                    for ycl in y_clusters[1:]:
+                        for i in ycl:
+                            lower_total += 1
+                            mx, my = hits[i][0], hits[i][1]
+                            for c2 in work:
+                                if (
+                                    int(c2["row_start"]) == rs
+                                    and int(c2["col_start"]) == cs
+                                    and int(c2["col_end"]) == ce
+                                ):
+                                    continue
+                                if int(c2["row_start"]) <= rs:
+                                    continue
+                                bx1, by1, bx2, by2 = _cell_bbox(c2)
+                                if bx1 - 2 <= mx <= bx2 + 2 and by1 - 2 <= my <= by2 + 2:
+                                    lower_owned += 1
+                                    break
+                # 下一逻辑行在覆盖列上已有多个格 → 可能是已存在的子表头行
+                next_row_overlap = [
+                    c2
+                    for c2 in work
+                    if int(c2["row_start"]) == rs + 1
+                    and int(c2["col_end"]) >= cs
+                    and int(c2["col_start"]) <= ce
+                ]
+                next_is_subheader = False
+                if len(next_row_overlap) >= 2:
+                    # 用 OCR 判断下一行是子表头还是数据行
+                    y0 = float(row_seps[rs + 1]) if rs + 1 < len(row_seps) else 0.0
+                    y1 = (
+                        float(row_seps[rs + 2])
+                        if rs + 2 < len(row_seps)
+                        else y0 + 1.0
+                    )
+                    next_texts = []
+                    for tb in boxes:
+                        bx1, by1, bx2, by2 = _tb_bbox(tb)
+                        my = (by1 + by2) / 2.0
+                        mx = (bx1 + bx2) / 2.0
+                        if not (y0 - 2 <= my <= y1 + 2):
+                            continue
+                        if not (float(col_seps[cs]) - 2 <= mx <= float(col_seps[ce + 1]) + 2):
+                            continue
+                        t = str(tb.get("text") or "").strip()
+                        if t:
+                            next_texts.append(t)
+                    joined = " ".join(next_texts)
+                    if next_texts and not re.search(
+                        r"(合成例|实施例|実施例|比較例|比较例)\s*\d*", joined
+                    ):
+                        # 长中文占比高 → 子表头；短码/数值多 → 数据行
+                        long_cjk = sum(
+                            1
+                            for t in next_texts
+                            if _has_cjk(t) and len(re.sub(r"\s+", "", t)) >= 4
+                        )
+                        next_is_subheader = long_cjk >= max(1, len(next_texts) // 3)
+
+                children_already_exist = (
+                    (
+                        lower_total > 0
+                        and lower_owned >= max(1, int(0.5 * lower_total + 0.5))
+                    )
+                    or next_is_subheader
+                )
+
+                top_texts = [
+                    str(hits[i][4].get("text") or "")
+                    for i in y_clusters[0]
+                ]
+                top_joined = "".join(top_texts)
+                top_is_parent = bool(
+                    re.search(r"(单体\s*[\[［]|聚合物)", top_joined)
+                ) or (
+                    len(re.sub(r"\s+", "", top_joined)) <= 16
+                    and ("[" in top_joined or "［" in top_joined or "%" in top_joined)
+                )
+                bottom_max_x = (
+                    max(len(g) for g in band_xgroups[1:]) if n_y >= 2 else 0
+                )
+
+                # 仅当「上带父级标题 + 下带多列标签」时插行；避免把折行长标签拆成多行
+                need_y_split = (
+                    n_y >= 2
+                    and not children_already_exist
+                    and top_is_parent
+                    and len(band_xgroups[0]) == 1
+                    and bottom_max_x >= 2
+                )
+
+                # 子表头行已存在：仅收缩父格物理框到上带，避免 OCR 串入
+                if children_already_exist and n_y >= 2 and len(band_xgroups[0]) <= 1:
+                    split_y = 0.5 * (band_yranges[0][1] + band_yranges[1][0])
+                    if cy1 + 3 < split_y < cy2 - 3:
+                        cell["polygon"] = _rebuild_polygon(cx1, cy1, cx2, split_y)
+                        cell["y_key"] = cy1
+                        changed = True
+                    continue
+
+                # 单带多 X：只做列拆，不插行
+                if not need_y_split and max_xgroups >= 2 and allow_x_split:
+                    groups = band_xgroups[0]
+                    new_cells: List[Dict[str, Any]] = []
+                    y1 = float(row_seps[rs]) if rs < len(row_seps) else cy1
+                    y2 = (
+                        float(row_seps[rs + 1])
+                        if rs + 1 < len(row_seps)
+                        else cy2
+                    )
+                    for g in groups:
+                        xs_lo = min(hits[i][2] for i in g)
+                        xs_hi = max(hits[i][3] for i in g)
+                        ncs, nce = _snap_x_range_to_cols(
+                            xs_lo, xs_hi, col_seps, fallback=(cs, ce)
+                        )
+                        ncs = max(cs, min(ncs, ce))
+                        nce = max(ncs, min(nce, ce))
+                        x1 = float(col_seps[ncs])
+                        x2 = float(col_seps[nce + 1])
+                        new_cells.append(
+                            _make_empty_cell(
+                                x1=x1,
+                                y1=y1,
+                                x2=x2,
+                                y2=y2,
+                                row_start=rs,
+                                row_end=rs,
+                                col_start=ncs,
+                                col_end=nce,
+                            )
+                        )
+                    if len(new_cells) >= 2:
+                        work = [
+                            c
+                            for c in work
+                            if not (
+                                int(c["row_start"]) == rs
+                                and int(c["row_end"]) == rs
+                                and int(c["col_start"]) == cs
+                                and int(c["col_end"]) == ce
+                            )
+                        ]
+                        work.extend(new_cells)
+                        total_x_splits += 1
+                        changed = True
+                        break
+                    continue
+
+                if need_y_split and n_y >= 2:
+                    # 在第一带与第二带之间插入行切分
+                    split_y = 0.5 * (band_yranges[0][1] + band_yranges[1][0])
+                    if not (cy1 + 3 < split_y < cy2 - 3):
+                        continue
+                    insert_at = rs
+                    remapped: List[Dict[str, Any]] = []
+                    for c in work:
+                        # 丢弃原宽格，后面按 Y/X 簇重建
+                        if (
+                            int(c["row_start"]) == rs
+                            and int(c["row_end"]) == rs
+                            and int(c["col_start"]) == cs
+                            and int(c["col_end"]) == ce
+                        ):
+                            continue
+                        nc = dict(c)
+                        crs, cre = int(c["row_start"]), int(c["row_end"])
+                        # 同行其它表头格：扩展为跨两级表头的 rowspan
+                        if crs == insert_at and cre == insert_at:
+                            nc["row_end"] = insert_at + 1
+                            _refresh_spans(nc)
+                            x1, y1, x2, y2 = _cell_bbox(c)
+                            nc["polygon"] = _rebuild_polygon(
+                                x1, y1, x2, max(y2, cy2)
+                            )
+                            remapped.append(nc)
+                            continue
+                        if crs > insert_at:
+                            nc["row_start"] = crs + 1
+                            nc["row_end"] = cre + 1
+                        elif cre > insert_at:
+                            nc["row_end"] = cre + 1
+                        _refresh_spans(nc)
+                        remapped.append(nc)
+
+                    # 上带：通常 1 个 X 簇 → 整段合并
+                    top_groups = band_xgroups[0]
+                    y1_top = cy1
+                    y2_top = split_y
+                    if len(top_groups) <= 1 or not allow_x_split:
+                        remapped.append(
+                            _make_empty_cell(
+                                x1=float(col_seps[cs]),
+                                y1=y1_top,
+                                x2=float(col_seps[ce + 1]),
+                                y2=y2_top,
+                                row_start=rs,
+                                row_end=rs,
+                                col_start=cs,
+                                col_end=ce,
+                            )
+                        )
+                    else:
+                        for g in top_groups:
+                            xs_lo = min(hits[i][2] for i in g)
+                            xs_hi = max(hits[i][3] for i in g)
+                            ncs, nce = _snap_x_range_to_cols(
+                                xs_lo, xs_hi, col_seps, fallback=(cs, ce)
+                            )
+                            ncs = max(cs, min(ncs, ce))
+                            nce = max(ncs, min(nce, ce))
+                            remapped.append(
+                                _make_empty_cell(
+                                    x1=float(col_seps[ncs]),
+                                    y1=y1_top,
+                                    x2=float(col_seps[nce + 1]),
+                                    y2=y2_top,
+                                    row_start=rs,
+                                    row_end=rs,
+                                    col_start=ncs,
+                                    col_end=nce,
+                                )
+                            )
+
+                    # 下带：所有后续 Y 带合并到 rs+1，再按 X 聚类
+                    bottom_hit_idxs: List[int] = []
+                    for ycl in y_clusters[1:]:
+                        bottom_hit_idxs.extend(ycl)
+                    bottom_mxs = [hits[i][0] for i in bottom_hit_idxs]
+                    bottom_local = _cluster_1d(bottom_mxs, gap_thresh=x_gap)
+                    bottom_groups = [
+                        [bottom_hit_idxs[j] for j in loc] for loc in bottom_local
+                    ]
+                    y1_bot = split_y
+                    y2_bot = cy2
+                    if len(bottom_groups) <= 1:
+                        remapped.append(
+                            _make_empty_cell(
+                                x1=float(col_seps[cs]),
+                                y1=y1_bot,
+                                x2=float(col_seps[ce + 1]),
+                                y2=y2_bot,
+                                row_start=rs + 1,
+                                row_end=rs + 1,
+                                col_start=cs,
+                                col_end=ce,
+                            )
+                        )
+                    else:
+                        raw_spans: List[Tuple[int, int]] = []
+                        for g in bottom_groups:
+                            xs_lo = min(hits[i][2] for i in g)
+                            xs_hi = max(hits[i][3] for i in g)
+                            ncs, nce = _snap_x_range_to_cols(
+                                xs_lo, xs_hi, col_seps, fallback=(cs, ce)
+                            )
+                            ncs = max(cs, min(ncs, ce))
+                            nce = max(ncs, min(nce, ce))
+                            raw_spans.append((ncs, nce))
+                        body_spans = _body_merge_spans(
+                            work,
+                            after_row=rs,
+                            seg_hi=seg_hi,
+                            cs=cs,
+                            ce=ce,
+                        )
+                        filled = _align_spans_to_body(
+                            raw_spans, body_spans, cs=cs, ce=ce
+                        )
+                        for ncs, nce in filled:
+                            remapped.append(
+                                _make_empty_cell(
+                                    x1=float(col_seps[ncs]),
+                                    y1=y1_bot,
+                                    x2=float(col_seps[nce + 1]),
+                                    y2=y2_bot,
+                                    row_start=rs + 1,
+                                    row_end=rs + 1,
+                                    col_start=ncs,
+                                    col_end=nce,
+                                )
+                            )
+                            total_x_splits += 1
+
+                    work = remapped
+                    total_y_splits += 1
+                    changed = True
                     break
 
-    out: List[Dict[str, Any]] = []
-    exploded = 0
-    for cell in cells:
-        cs, ce = int(cell["col_start"]), int(cell["col_end"])
-        rs, re_ = int(cell["row_start"]), int(cell["row_end"])
-        col_span = ce - cs + 1
-        # 只拆顶部若干行的宽格（表头带）
-        if col_span < 2 or rs > 2:
-            out.append(cell)
-            continue
-        covered = list(range(cs, ce + 1))
-        support = sum(
-            1
-            for c in covered
-            if _atomic_below(c, re_) or body_hits[c] > 0
-        )
-        need = max(2, int(0.5 * len(covered) + 0.5))
-        if support < need:
-            out.append(cell)
-            continue
-        # 宽格所在行带内须有落在不同列的多个 OCR 框，才拆；纯父级合并标题保留
-        hit_cols = set()
-        y0 = float(row_seps[rs]) if rs < len(row_seps) else _cell_bbox(cell)[1]
-        y1 = (
-            float(row_seps[re_ + 1])
-            if re_ + 1 < len(row_seps)
-            else _cell_bbox(cell)[3]
-        )
-        x_lo = float(col_seps[cs])
-        x_hi = float(col_seps[ce + 1]) if ce + 1 < len(col_seps) else x_lo + 1.0
-        for tb in boxes:
-            bx1, by1, bx2, by2 = _tb_bbox(tb)
-            mx, my = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
-            if not (y0 - 2 <= my <= y1 + 2 and x_lo - 2 <= mx <= x_hi + 2):
-                continue
-            for c in covered:
-                if col_seps[c] <= mx < col_seps[c + 1] or (
-                    c == covered[-1] and col_seps[c] <= mx <= col_seps[c + 1]
-                ):
-                    hit_cols.add(c)
-                    break
-        if len(hit_cols) < 2:
-            out.append(cell)
-            continue
-        if ce + 1 >= len(col_seps):
-            out.append(cell)
-            continue
-        if rs < len(row_seps) and re_ + 1 < len(row_seps):
-            y1 = float(row_seps[rs])
-            y2 = float(row_seps[re_ + 1])
-        else:
-            _x1, y1, _x2, y2 = _cell_bbox(cell)
-        if y2 <= y1:
-            _x1, y1, _x2, y2 = _cell_bbox(cell)
-        for c in range(cs, ce + 1):
-            x1 = float(col_seps[c])
-            x2 = float(col_seps[c + 1])
-            poly = _rebuild_polygon(x1, y1, x2, y2)
-            out.append(
-                {
-                    "polygon": poly,
-                    "x_key": x1,
-                    "y_key": y1,
-                    "row_start": rs,
-                    "row_end": re_,
-                    "col_start": c,
-                    "col_end": c,
-                    "row_span": re_ - rs + 1,
-                    "col_span": 1,
-                    "texts": [],
-                    "text": "",
-                }
-            )
-        exploded += 1
+            if changed:
+                break
+        if not changed:
+            break
 
-    if exploded:
-        logger.info("表头 colspan 按身列拆开: %d 个宽格", exploded)
-    return out
+    if total_y_splits or total_x_splits:
+        logger.info(
+            "表头重建: y_splits=%d x_group_splits=%d cells=%d",
+            total_y_splits,
+            total_x_splits,
+            len(work),
+        )
+    return dedupe_overlapping_cells(work)
+
+
+def explode_header_colspans_by_body(
+    cells: List[Dict[str, Any]],
+    boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """兼容旧名：转发到证据驱动的表头重建。"""
+    return reconstruct_header_cells(cells, boxes)
 
 
 def refine_tsr_cells(

@@ -21,69 +21,19 @@
 from __future__ import annotations
 
 import logging
-import re
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
-import numpy as np
+from .segments import (
+    _HEADER_CAPTION_RE,
+    _Y_GAP_THRESH_PX,
+    find_row_segments,
+)
 
 logger = logging.getLogger(__name__)
 
-# 相邻逻辑行物理 Y 间距超过此阈值则切分为新子表
-_Y_GAP_THRESH_PX = 48.0
-# 通用表题：表 / Table / Tab. / 図 / Fig + 编号
-_HEADER_CAPTION_RE = re.compile(
-    r"(?:\[?\s*(?:表|図)\s*[\d\-ー－]+|\b(?:Table|Tab\.?|Fig\.?|Figure)\s*[\d\-]+)",
-    re.IGNORECASE,
-)
 # 游离散文不应当作 caption：过长则保持为独立块
 _MAX_CAPTION_CHARS = 80
-# 重复表头 Jaccard 阈值（略放宽以切开上下两段不同表头）
-_HEADER_JACCARD_THRESH = 0.28
-# 分段异形表：中段再出现「聚合物」等列名时切开
-_SECTION_HEADER_RE = re.compile(
-    r"(聚合物|单体\s*\[|来自具有|酸当量|双键当量|有机硅烷)"
-)
-
-
-def _tokenize_row_text(joined: str) -> set:
-    """把行文本切成可比对的 token 集合（中文按字、拉丁按词）。"""
-    s = (joined or "").strip().lower()
-    if not s:
-        return set()
-    # 拉丁/数字词
-    latin = set(re.findall(r"[a-z0-9][a-z0-9\.\-/%]{0,24}", s))
-    # CJK 连续片段拆成 bigram / 单字（短词）
-    cjk_chunks = re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]+", s)
-    cjk: set = set()
-    for ch in cjk_chunks:
-        if len(ch) <= 2:
-            cjk.add(ch)
-        else:
-            cjk.update(ch[i : i + 2] for i in range(len(ch) - 1))
-    return latin | cjk
-
-
-def _jaccard(a: set, b: set) -> float:
-    if not a or not b:
-        return 0.0
-    inter = len(a & b)
-    union = len(a | b)
-    return inter / union if union else 0.0
-
-
-def _cell_y_top(cell: Dict[str, Any]) -> float:
-    """单元格物理顶部 Y（优先 y_key，否则 polygon 最小 Y）。"""
-    if cell.get("y_key") is not None:
-        return float(cell["y_key"])
-    poly = np.asarray(cell["polygon"], dtype=np.float64).reshape(-1, 2)
-    return float(poly[:, 1].min())
-
-
-def _cell_y_bottom(cell: Dict[str, Any]) -> float:
-    """单元格物理底部 Y。"""
-    poly = np.asarray(cell["polygon"], dtype=np.float64).reshape(-1, 2)
-    return float(poly[:, 1].max())
 
 
 def _renormalize_subtable(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -106,28 +56,6 @@ def _renormalize_subtable(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         c["row_span"] = int(c["row_end"]) - int(c["row_start"]) + 1
         c["col_span"] = int(c["col_end"]) - int(c["col_start"]) + 1
     return copied
-
-def _row_has_header_caption(row_cells: List[Dict[str, Any]]) -> bool:
-    """该逻辑行文本是否呈现表题特征（表 N / Table N 等）。"""
-    joined = " ".join(str(c.get("text") or "") for c in row_cells)
-    return bool(_HEADER_CAPTION_RE.search(joined))
-
-
-def _row_tokens(row_cells: List[Dict[str, Any]]) -> set:
-    joined = " ".join(str(c.get("text") or "") for c in row_cells)
-    return _tokenize_row_text(joined)
-
-
-def _row_looks_like_repeated_header(
-    row_cells: List[Dict[str, Any]], header_tokens: set
-) -> bool:
-    """与子表首行文本集合 Jaccard 高 → 视为中段换头。"""
-    if not header_tokens:
-        return False
-    toks = _row_tokens(row_cells)
-    if len(toks) < 2:
-        return False
-    return _jaccard(toks, header_tokens) >= _HEADER_JACCARD_THRESH
 
 
 def extract_caption_row(
@@ -193,79 +121,21 @@ def split_cells_into_subtables(
     """
     将可能混杂的多子表单元格列表，拆成多个独立子表。
 
-    切分条件（按 row_start 升序扫描相邻逻辑行）：
-    1. 物理 Y 间距：下一行顶部 Y - 上一行底部 Y > y_gap_thresh；
-    2. 表头特征：该行文本匹配「表 N」类标题，且不是当前子表首行；
-    3. 重复表头：非首行与当前子表首行文本 Jaccard 高（换头切分）。
-
-    每个子表内会重新将 row_* / col_* 归一到从 0 开始，便于独立 unroll。
+    切分判据见 segments.find_row_segments；每个子表内 row_*/col_* 归一到 0。
     """
     if not cells:
         return []
 
-    # 按 row_start 分组
-    by_row: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    for cell in cells:
-        by_row[int(cell["row_start"])].append(cell)
-
-    sorted_rows = sorted(by_row.keys())
-    if not sorted_rows:
-        return [cells]
-
-    # 每逻辑行的物理 Y 范围与单元格
-    row_meta: List[Tuple[int, float, float, List[Dict[str, Any]]]] = []
-    for rs in sorted_rows:
-        row_cells = by_row[rs]
-        y_top = min(_cell_y_top(c) for c in row_cells)
-        y_bot = max(_cell_y_bottom(c) for c in row_cells)
-        row_meta.append((rs, y_top, y_bot, row_cells))
+    segments = find_row_segments(cells, y_gap_thresh=y_gap_thresh)
+    if not segments:
+        return [_renormalize_subtable(cells)]
 
     subtables: List[List[Dict[str, Any]]] = []
-    current: List[Dict[str, Any]] = []
-    prev_y_bot: float | None = None
-    is_first_row_of_subtable = True
-    header_tokens: set = set()
-
-    for _, y_top, y_bot, row_cells in row_meta:
-        should_split = False
-        if current and prev_y_bot is not None:
-            # 条件 1：相邻逻辑行物理空隙过大
-            if (y_top - prev_y_bot) > y_gap_thresh:
-                should_split = True
-            # 条件 2：非首行再次出现表题特征
-            elif (not is_first_row_of_subtable) and _row_has_header_caption(row_cells):
-                should_split = True
-            # 条件 2b：分段异形表中段换头（聚合物/单体…）
-            elif (not is_first_row_of_subtable) and _SECTION_HEADER_RE.search(
-                " ".join(str(c.get("text") or "") for c in row_cells)
-            ):
-                # 需同时像短表头行（非数据行：合成例 / 实施例）
-                joined = " ".join(str(c.get("text") or "") for c in row_cells)
-                if not re.search(r"(合成例|实施例|実施例|比較例|比较例)\s*\d*", joined):
-                    should_split = True
-            # 条件 3：与子表首行文本高度重合 → 换头
-            elif (not is_first_row_of_subtable) and _row_looks_like_repeated_header(
-                row_cells, header_tokens
-            ):
-                should_split = True
-
-        if should_split:
-            subtables.append(_renormalize_subtable(current))
-            current = []
-            is_first_row_of_subtable = True
-            header_tokens = set()
-
-        if is_first_row_of_subtable:
-            header_tokens = _row_tokens(row_cells)
-
-        current.extend(row_cells)
-        prev_y_bot = y_bot
-        is_first_row_of_subtable = False
-
-    if current:
-        subtables.append(_renormalize_subtable(current))
-
-    return subtables if subtables else [cells]
+    for row_lo, row_hi in segments:
+        group = [c for c in cells if row_lo <= int(c["row_start"]) <= row_hi]
+        if group:
+            subtables.append(_renormalize_subtable(group))
+    return subtables if subtables else [_renormalize_subtable(cells)]
 
 
 def unroll_cells_to_grid(cells: List[Dict[str, Any]]) -> List[List[str]]:
