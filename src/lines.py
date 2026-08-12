@@ -477,10 +477,10 @@ def _recover_columns_by_ocr_corridors(
     y1: float,
     x2: float,
     y2: float,
-    corridor_hold_ratio: float = 0.70,
-    min_corridor_px: float = 5.5,
+    corridor_hold_ratio: float = 0.92,
+    min_corridor_px: float = 8.5,
     near_tol: float = 6.0,
-    max_new: int = 10,
+    max_new: int = 4,
     min_col_text_rows: int = 2,
 ) -> List[Separator]:
     """
@@ -560,7 +560,7 @@ def _recover_columns_by_ocr_corridors(
         return list(v_seps)
 
     # 候选必须落在“大间隔”区域（否则在密表上乱补）
-    big_gap_thr = med_gap * 1.2
+    big_gap_thr = med_gap * 1.8
     big_gaps: List[Tuple[float, float]] = []
     for a, b in zip(coords[:-1], coords[1:]):
         if b - a >= big_gap_thr:
@@ -579,25 +579,6 @@ def _recover_columns_by_ocr_corridors(
             continue
         filtered.append((run_len, x_center))
 
-    # 备用候选：用 OCR bbox 的中心点 x 的“大间隙”直接推断分隔线位置
-    # 当空洞 run 候选偏少时更有效（lineless + 文字宽度变化较大时）。
-    if len(filtered) < 4:
-        centroids: List[float] = []
-        for tb in relevant:
-            poly = np.asarray(tb["polygon"], dtype=np.float64).reshape(-1, 2)
-            bx1 = float(poly[:, 0].min())
-            bx2 = float(poly[:, 0].max())
-            centroids.append((bx1 + bx2) / 2.0)
-        centroids.sort()
-        for a, b in zip(centroids[:-1], centroids[1:]):
-            if b - a < med_gap * 0.55:
-                continue
-            x_center = (a + b) / 2.0
-            if not in_big_gap(x_center):
-                continue
-            if any(abs(x_center - c) <= near_tol for c in coords):
-                continue
-            filtered.append((float(b - a), float(x_center)))
     if not filtered:
         return list(v_seps)
 
@@ -1079,7 +1060,8 @@ def detect_tables(
             otsu, h_roi, v_roi, x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2)
         )
         # 对 lineless 表：用 OCR 空白走廊补回缺失竖线
-        if text_boxes:
+        # 竖线稀疏门控：有框线表直接跳过走廊补列，避免“无证据即动手”。
+        if text_boxes and len(v_roi) <= 4:
             v_roi = _recover_columns_by_ocr_corridors(
                 text_boxes,
                 h_roi,
