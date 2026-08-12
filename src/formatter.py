@@ -39,7 +39,11 @@ _HEADER_CAPTION_RE = re.compile(
 # 游离散文不应当作 caption：过长则保持为独立块
 _MAX_CAPTION_CHARS = 80
 # 重复表头 Jaccard 阈值（略放宽以切开上下两段不同表头）
-_HEADER_JACCARD_THRESH = 0.32
+_HEADER_JACCARD_THRESH = 0.28
+# 分段异形表：中段再出现「聚合物」等列名时切开
+_SECTION_HEADER_RE = re.compile(
+    r"(聚合物|单体\s*\[|来自具有|酸当量|双键当量|有机硅烷)"
+)
 
 
 def _tokenize_row_text(joined: str) -> set:
@@ -149,16 +153,30 @@ def extract_caption_row(
     non_empty = [t for t in texts if t]
     if not non_empty:
         return "", cells
-    # 非空单元格都应像表题，或整行拼接后是表题且非空格子很少
+
     joined = " ".join(non_empty)
-    if not _HEADER_CAPTION_RE.search(joined):
+    caption_hits = [t for t in non_empty if _HEADER_CAPTION_RE.search(t)]
+    # 碎片题注：一格是 [表1-2]，其余为短噪声（单字/数字/[表）
+    fragmented = False
+    if caption_hits and len(non_empty) > 3:
+        others = [t for t in non_empty if t not in caption_hits]
+        if others and all(
+            len(t) <= 4 and (t.isdigit() or t in {"[", "]", "表", "[表", "1", "1 1"} or _HEADER_CAPTION_RE.search(t))
+            for t in others
+        ):
+            fragmented = True
+            # 取最完整的题注片段
+            joined = max(caption_hits, key=len)
+
+    if not _HEADER_CAPTION_RE.search(joined) and not fragmented:
         return "", cells
-    # 允许 1~2 个非空格（表题可能被切到相邻空列边）
-    if len(non_empty) > 3:
-        return "", cells
-    # 其它非空内容不能太长（避免误伤真正表头行）
-    if any(len(t) > 24 and not _HEADER_CAPTION_RE.search(t) for t in non_empty):
-        return "", cells
+    if not fragmented:
+        # 允许 1~3 个非空格（表题可能被切到相邻空列边）
+        if len(non_empty) > 3:
+            return "", cells
+        # 其它非空内容不能太长（避免误伤真正表头行）
+        if any(len(t) > 24 and not _HEADER_CAPTION_RE.search(t) for t in non_empty):
+            return "", cells
 
     caption = joined.strip()
     # 过长「caption」实为结构失败后的散文粘连，勿提升为表题
@@ -217,6 +235,14 @@ def split_cells_into_subtables(
             # 条件 2：非首行再次出现表题特征
             elif (not is_first_row_of_subtable) and _row_has_header_caption(row_cells):
                 should_split = True
+            # 条件 2b：分段异形表中段换头（聚合物/单体…）
+            elif (not is_first_row_of_subtable) and _SECTION_HEADER_RE.search(
+                " ".join(str(c.get("text") or "") for c in row_cells)
+            ):
+                # 需同时像短表头行（非数据行：合成例 / 实施例）
+                joined = " ".join(str(c.get("text") or "") for c in row_cells)
+                if not re.search(r"(合成例|实施例|実施例|比較例|比较例)\s*\d*", joined):
+                    should_split = True
             # 条件 3：与子表首行文本高度重合 → 换头
             elif (not is_first_row_of_subtable) and _row_looks_like_repeated_header(
                 row_cells, header_tokens

@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+from .label_patterns import are_independent_row_labels
+
 logger = logging.getLogger(__name__)
 
 _CJK_RE = re.compile(
@@ -408,7 +410,8 @@ def unmerge_bad_rowspans(
         ]
         all_same = all(t == texts[0] for t in texts)
         none_cjk = all(not _has_cjk(t) for t in texts)
-        if not (all_same or none_cjk):
+        # 实施例N / 合成例N / iii-N / OXL-* / 序号：CJK 不同也不应纵向粘连
+        if not (all_same or none_cjk or are_independent_row_labels(texts)):
             out.append(cell)
             continue
 
@@ -496,7 +499,7 @@ def split_bad_colspans(
             gaps = [(xs[i + 1] - xs[i], (xs[i] + xs[i + 1]) / 2.0) for i in range(len(xs) - 1)]
             gaps.sort(reverse=True)
             best_gap, mid = gaps[0]
-            if best_gap < 0.25 * width:
+            if best_gap < 0.15 * width:
                 continue
             # 左右都有点
             left_n = sum(1 for x in xs if x < mid)
@@ -506,7 +509,15 @@ def split_bad_colspans(
             support += 1
             split_xs.append(mid)
 
-        if support >= min_support_rows and split_xs:
+        # 双数值列（酸当量|双键当量）即使仅 2 行支持也切
+        need = min_support_rows
+        dual_numeric = 0
+        for xs in by_row.values():
+            if len(xs) >= 2:
+                dual_numeric += 1
+        if dual_numeric >= 2:
+            need = min(need, 2)
+        if support >= need and split_xs:
             splits.append((c, float(np.median(split_xs))))
 
     if not splits:

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
-from .matching import join_cell_texts
+from .label_patterns import fix_iii_ocr, split_value_grade
+from .matching import join_cell_texts, unmerge_filled_label_rowspans
 from .models import predict_texts
 
 
@@ -121,6 +123,20 @@ def _column_template_skeletons(cells: Sequence[Dict[str, Any]]) -> Dict[int, str
     return templates
 
 
+def _looks_garbled_cjk(text: str) -> bool:
+    """密表化学中文常见乱码启发式：短串内重复生僻字或无意义碎片。"""
+    t = (text or "").strip()
+    if len(t) < 2:
+        return False
+    # 明显乱码片段
+    if re.search(r"(后居游|别房|品民房|路学总|即房号|品市安|66-7X)", t):
+        return True
+    cjk = re.findall(r"[\u3400-\u9fff]", t)
+    if len(cjk) >= 3 and len(set(cjk)) <= max(2, len(cjk) // 3):
+        return True
+    return False
+
+
 def _suspicious_indices(cells: Sequence[Dict[str, Any]], binary: np.ndarray) -> List[int]:
     suspects: List[int] = []
     cols: dict[int, list[str]] = {}
@@ -141,6 +157,7 @@ def _suspicious_indices(cells: Sequence[Dict[str, Any]], binary: np.ndarray) -> 
         scores = [float(tb.get("score", 1.0)) for tb in texts if str(tb.get("text") or "").strip()]
         low_conf = bool(scores) and min(scores) < 0.75
         multiline = any(bool(tb.get("needs_reocr")) for tb in texts)
+        vertical = any(bool(tb.get("maybe_vertical")) for tb in texts)
         empty_but_inky = not text and _cell_ink_ratio(binary, cell) >= 0.02
         numeric_mismatch = int(cell["col_start"]) in numeric_cols and text and not _looks_numeric(text)
 
@@ -149,7 +166,26 @@ def _suspicious_indices(cells: Sequence[Dict[str, Any]], binary: np.ndarray) -> 
         if col_template and text:
             template_mismatch = _char_skeleton(text) != col_template
 
-        if low_conf or multiline or empty_but_inky or numeric_mismatch or template_mismatch:
+        # 细长竖排格
+        x1, y1, x2, y2 = _cell_bbox(cell)
+        cw, ch = max(x2 - x1, 1), max(y2 - y1, 1)
+        tall_narrow = ch >= 2.5 * cw and ch >= 40
+
+        garbled = _looks_garbled_cjk(text)
+        # 末行/短串数字崩坏：如 "0 0" "+0"
+        broken_num = bool(re.fullmatch(r"[0+\-\s]{1,6}", text)) and int(cell.get("col_start") or 0) in numeric_cols
+
+        if (
+            low_conf
+            or multiline
+            or vertical
+            or empty_but_inky
+            or numeric_mismatch
+            or template_mismatch
+            or tall_narrow
+            or garbled
+            or broken_num
+        ):
             suspects.append(i)
     return suspects
 
@@ -232,11 +268,13 @@ def apply_reocr_to_cells(
     suspect_ids = suspect_ids[:max_cells]
     templates = _column_template_skeletons(cells)
     
-    def _ocr_candidate_for_cell(cell_idx: int, *, rot180: bool) -> Optional[List[Dict[str, Any]]]:
+    def _ocr_candidate_for_cell(
+        cell_idx: int, *, rotate: int = 0
+    ) -> Optional[List[Dict[str, Any]]]:
         """
         对单个可疑 cell 做定向二次 OCR：
           1) 按原分辨率放大到更稳定的字高尺度
-          2) 可选 180° 旋转
+          2) 可选 90/180/270° 旋转（竖排标签）
           3) OCR 后把 polygon 映射回“未放大、未旋转”的 cell crop 坐标系
         """
         cell = cells[cell_idx]
@@ -252,12 +290,16 @@ def apply_reocr_to_cells(
         scale = float(target_h) / float(h0)
         w1 = max(8, int(round(w0 * scale)))
         crop_scaled = cv2.resize(crop, (w1, target_h), interpolation=cv2.INTER_CUBIC)
-        if rot180:
+        rot = int(rotate) % 360
+        if rot == 90:
+            crop_scaled = cv2.rotate(crop_scaled, cv2.ROTATE_90_CLOCKWISE)
+        elif rot == 180:
             crop_scaled = cv2.rotate(crop_scaled, cv2.ROTATE_180)
+        elif rot == 270:
+            crop_scaled = cv2.rotate(crop_scaled, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-        # 让缓存区分旋转/缩放
         cache_extra = (
-            f"reocr|cell={cell_idx}|rot={int(rot180)}|s={scale:.3f}|"
+            f"reocr|cell={cell_idx}|rot={rot}|s={scale:.3f}|"
             f"{_cell_bbox(cell)}|{str(cell.get('col_start') or '')}"
         )
         tbs = predict_texts(
@@ -270,24 +312,40 @@ def apply_reocr_to_cells(
         if not tbs:
             return None
 
-        # polygon 坐标映射回 unscaled crop 坐标系
-        if rot180:
-            # rotate-180: (x, y) -> (w-x, h-y)（在像素坐标上）
-            w_scaled, h_scaled = crop_scaled.shape[1], crop_scaled.shape[0]
-            for tb in tbs:
-                poly = np.asarray(tb.get("polygon"), dtype=np.float64).reshape(-1, 2)
-                poly[:, 0] = float(w_scaled) - poly[:, 0]
-                poly[:, 1] = float(h_scaled) - poly[:, 1]
-                tb["polygon"] = poly / scale
-        else:
-            for tb in tbs:
-                poly = np.asarray(tb.get("polygon"), dtype=np.float64).reshape(-1, 2)
-                tb["polygon"] = poly / scale
-        return tbs
+        w_scaled, h_scaled = float(crop_scaled.shape[1]), float(crop_scaled.shape[0])
+        mapped: List[Dict[str, Any]] = []
+        for i, tb in enumerate(tbs):
+            ntb = dict(tb)
+            text = fix_iii_ocr(str(tb.get("text") or ""))
+            g = split_value_grade(text)
+            if g is not None:
+                text = f"{g[0]}\n{g[1]}"
+            ntb["text"] = text
+            if rot == 0:
+                poly = np.asarray(tb.get("polygon"), dtype=np.float64).reshape(-1, 2) / scale
+            elif rot == 180:
+                poly = np.asarray(tb.get("polygon"), dtype=np.float64).reshape(-1, 2).copy()
+                poly[:, 0] = w_scaled - poly[:, 0]
+                poly[:, 1] = h_scaled - poly[:, 1]
+                poly = poly / scale
+            else:
+                # 90/270：按阅读序合成框即可（整格替换不依赖精确坐标）
+                y0 = 4.0 + i * 12.0
+                poly = np.array(
+                    [
+                        [2.0, y0],
+                        [max(w0 - 2.0, 8.0), y0],
+                        [max(w0 - 2.0, 8.0), y0 + 10.0],
+                        [2.0, y0 + 10.0],
+                    ],
+                    dtype=np.float64,
+                )
+            ntb["polygon"] = poly
+            mapped.append(ntb)
+        return mapped
 
     for idx in suspect_ids:
         cell = cells[idx]
-        # 有些 cell 的“源文本”可能只在 texts 列表里（text 字段为空），用 join_cell_texts 统一取值。
         old_text_from_texts = (
             join_cell_texts(cell.get("texts") or []).strip()
             if cell.get("texts")
@@ -295,70 +353,61 @@ def apply_reocr_to_cells(
         )
         old_text = (old_text_from_texts or str(cell.get("text") or "")).strip()
         old_score = _avg_score(cell.get("texts") or [])
+        x1, y1, x2, y2 = _cell_bbox(cell)
+        tall = (y2 - y1) >= 2.5 * max(x2 - x1, 1)
+        rotations = [0, 180]
+        if tall or any(bool(tb.get("maybe_vertical")) for tb in (cell.get("texts") or [])):
+            rotations = [0, 90, 180, 270]
 
-        # (score, text, tbs)
-        cand_fwd: List[Tuple[float, str, List[Dict[str, Any]]]] = []
-        cand_rot: List[Tuple[float, str, List[Dict[str, Any]]]] = []
-        for rot180 in (False, True):
-            tbs = _ocr_candidate_for_cell(idx, rot180=rot180)
+        candidates: List[Tuple[float, str, List[Dict[str, Any]]]] = []
+        for rot in rotations:
+            tbs = _ocr_candidate_for_cell(idx, rotate=rot)
             if not tbs:
                 continue
             new_text = join_cell_texts(tbs).strip()
             if not new_text:
                 continue
-            entry = (_avg_score(tbs), new_text, tbs)
-            if rot180:
-                cand_rot.append(entry)
-            else:
-                cand_fwd.append(entry)
+            candidates.append((_avg_score(tbs), new_text, tbs))
 
-        if not cand_fwd and not cand_rot:
+        if not candidates:
             continue
 
-        best_fwd = max(cand_fwd, key=lambda x: x[0], default=None)
-        best_rot = max(cand_rot, key=lambda x: x[0], default=None)
+        new_score, new_text, new_tbs = max(candidates, key=lambda x: x[0])
 
-        # rot180 只有在明显更好时才采用（防止碎片覆盖）
-        chosen = None
-        if best_fwd is not None and best_rot is not None:
-            chosen = best_rot if best_rot[0] >= best_fwd[0] + 0.05 else best_fwd
-        elif best_fwd is not None:
-            chosen = best_fwd
-        else:
-            chosen = best_rot
-
-        if chosen is None:
-            continue
-
-        new_score, new_text, new_tbs = chosen
-
-        # 表题/表外格不做二次覆盖：
-        # 1) row_start 最小附近通常是标题
-        # 2) 旧文本带有类似 `[表1-2]` 的方括号标记时也跳过（更稳）
+        # 表题/表外格不做二次覆盖
         if old_text and (
-            (int(cell.get("row_start") or 0) <= 1)
+            (int(cell.get("row_start") or 0) <= 1 and ("表" in old_text or old_text.startswith("[")))
             or ("表" in old_text and "[" in old_text)
             or (old_text.startswith("[") and len(old_text) <= 6)
         ):
             continue
 
-        # 允许“旧文本为空”直接补齐
         if not old_text:
             cell["texts"] = new_tbs
             cell["text"] = new_text
             continue
 
-        # 否则要求明显优于旧文本且不塌缩
+        garbled_old = _looks_garbled_cjk(old_text) or bool(
+            re.fullmatch(r"[0+\-\s]{1,6}", old_text)
+        )
+        if garbled_old:
+            if len(new_text) >= 1 and new_score >= max(0.35, old_score - 0.1):
+                cell["texts"] = new_tbs
+                cell["text"] = new_text
+            continue
+
         if new_score < old_score + 0.05:
             continue
         if len(new_text) < 0.6 * max(1, len(old_text)):
             continue
 
-        # 骨架贴合列模板：宁可不改，也不接受不贴合模板的碎片覆盖
         col_template = templates.get(int(cell.get("col_start") or 0))
         if col_template and _char_skeleton(new_text) != col_template:
             continue
 
         cell["texts"] = new_tbs
         cell["text"] = new_text
+
+    # 二次 OCR 后可能修好行标签，再拆一次错误 rowspan
+    cells = unmerge_filled_label_rowspans(cells)
     return cells
