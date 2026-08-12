@@ -18,6 +18,12 @@ import numpy as np
 from shapely.geometry import Point, box
 
 from .geometry import compute_ioa, polygon_to_shapely
+from .label_patterns import (
+    are_independent_row_labels,
+    extract_independent_labels_from_joined,
+    fix_iii_ocr,
+    split_value_grade,
+)
 
 # 格内动态行分组：与上一组平均 Y 的容差
 _ROW_Y_TOL_PX = 8.0
@@ -926,7 +932,162 @@ def assign_texts_to_cells(
     for cell in cells:
         cell["text"] = join_cell_texts(cell.get("texts") or [])
 
+    cells = unmerge_filled_label_rowspans(cells)
     return cells, free_texts
+
+
+def _derive_row_col_seps(
+    cells: Sequence[Dict[str, Any]],
+) -> Tuple[List[float], List[float]]:
+    """从单元格物理框粗推 row_seps / col_seps。"""
+    if not cells:
+        return [], []
+    max_row = max(int(c["row_end"]) for c in cells)
+    max_col = max(int(c["col_end"]) for c in cells)
+    row_tops: Dict[int, List[float]] = {}
+    row_bots: Dict[int, List[float]] = {}
+    col_lefts: Dict[int, List[float]] = {}
+    col_rights: Dict[int, List[float]] = {}
+    for c in cells:
+        x1, y1, x2, y2 = _cell_bbox(c)
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        row_tops.setdefault(rs, []).append(y1)
+        row_bots.setdefault(re, []).append(y2)
+        col_lefts.setdefault(cs, []).append(x1)
+        col_rights.setdefault(ce, []).append(x2)
+
+    row_seps: List[float] = []
+    for r in range(max_row + 1):
+        vals = row_tops.get(r) or []
+        row_seps.append(float(np.median(vals)) if vals else (row_seps[-1] + 10.0 if row_seps else 0.0))
+    last = row_bots.get(max_row) or []
+    row_seps.append(float(np.median(last)) if last else row_seps[-1] + 10.0)
+
+    col_seps: List[float] = []
+    for c in range(max_col + 1):
+        vals = col_lefts.get(c) or []
+        col_seps.append(float(np.median(vals)) if vals else (col_seps[-1] + 10.0 if col_seps else 0.0))
+    last_c = col_rights.get(max_col) or []
+    col_seps.append(float(np.median(last_c)) if last_c else col_seps[-1] + 10.0)
+    return row_seps, col_seps
+
+
+def _row_index_of(cy: float, row_seps: Sequence[float]) -> int:
+    for r in range(len(row_seps) - 1):
+        if row_seps[r] <= cy < row_seps[r + 1]:
+            return r
+    if row_seps and cy >= row_seps[-1]:
+        return len(row_seps) - 2
+    return -1
+
+
+def unmerge_filled_label_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    文本入格后拆错误 rowspan：格内每原子行恰好一个独立标签（实施例N 等）。
+
+    覆盖结构阶段因 CJK 门控未拆、或粘连文本事后可解析的情况。
+    """
+    if not cells:
+        return cells
+    row_seps, col_seps = _derive_row_col_seps(cells)
+    if len(row_seps) < 3:
+        return cells
+
+    out: List[Dict[str, Any]] = []
+    changed = False
+    for cell in cells:
+        row_span = int(cell.get("row_span") or 1)
+        col_span = int(cell.get("col_span") or 1)
+        if col_span != 1 or row_span < 2:
+            out.append(cell)
+            continue
+
+        rs, re = int(cell["row_start"]), int(cell["row_end"])
+        cs = int(cell["col_start"])
+        texts_boxes = list(cell.get("texts") or [])
+        by_row: Dict[int, List[Dict[str, Any]]] = {r: [] for r in range(rs, re + 1)}
+        for tb in texts_boxes:
+            _x1, y1, _x2, y2 = _text_bbox(tb)
+            ri = _row_index_of((y1 + y2) / 2.0, row_seps)
+            if rs <= ri <= re:
+                by_row[ri].append(tb)
+
+        row_texts = []
+        ok = True
+        for r in range(rs, re + 1):
+            tbs = by_row[r]
+            if len(tbs) == 1:
+                row_texts.append(str(tbs[0].get("text") or "").strip())
+            elif len(tbs) == 0:
+                ok = False
+                break
+            else:
+                # 同行多框：拼接后再判
+                row_texts.append(join_cell_texts(tbs))
+        if ok and are_independent_row_labels(row_texts):
+            for r in range(rs, re + 1):
+                if r >= len(row_seps) - 1 or cs >= len(col_seps) - 1:
+                    continue
+                x1, x2 = float(col_seps[cs]), float(col_seps[cs + 1])
+                y1, y2 = float(row_seps[r]), float(row_seps[r + 1])
+                poly = np.array(
+                    [[x1 + 0.5, y1 + 0.5], [x2 - 0.5, y1 + 0.5], [x2 - 0.5, y2 - 0.5], [x1 + 0.5, y2 - 0.5]],
+                    dtype=np.float64,
+                )
+                tbs = by_row[r]
+                out.append(
+                    {
+                        "polygon": poly,
+                        "x_key": x1,
+                        "y_key": y1,
+                        "row_start": r,
+                        "row_end": r,
+                        "col_start": cs,
+                        "col_end": cs,
+                        "row_span": 1,
+                        "col_span": 1,
+                        "texts": tbs,
+                        "text": join_cell_texts(tbs) if tbs else row_texts[r - rs],
+                    }
+                )
+            changed = True
+            continue
+
+        # 无分框：从拼接文本解析标签序列
+        joined = str(cell.get("text") or "").strip()
+        labels = extract_independent_labels_from_joined(joined)
+        if len(labels) == row_span and are_independent_row_labels(labels):
+            for i, r in enumerate(range(rs, re + 1)):
+                if r >= len(row_seps) - 1 or cs >= len(col_seps) - 1:
+                    continue
+                x1, x2 = float(col_seps[cs]), float(col_seps[cs + 1])
+                y1, y2 = float(row_seps[r]), float(row_seps[r + 1])
+                poly = np.array(
+                    [[x1 + 0.5, y1 + 0.5], [x2 - 0.5, y1 + 0.5], [x2 - 0.5, y2 - 0.5], [x1 + 0.5, y2 - 0.5]],
+                    dtype=np.float64,
+                )
+                out.append(
+                    {
+                        "polygon": poly,
+                        "x_key": x1,
+                        "y_key": y1,
+                        "row_start": r,
+                        "row_end": r,
+                        "col_start": cs,
+                        "col_end": cs,
+                        "row_span": 1,
+                        "col_span": 1,
+                        "texts": [],
+                        "text": labels[i],
+                    }
+                )
+            changed = True
+            continue
+
+        out.append(cell)
+
+    return out if changed else cells
 
 
 def _normalize_dash_text(text: str) -> str:
@@ -981,6 +1142,19 @@ def join_cell_texts(
         for x, tb in members:
             text = str(tb.get("text") or "").strip()
             if not text:
+                continue
+            text = fix_iii_ocr(text)
+            grade_parts = split_value_grade(text)
+            if grade_parts is not None:
+                # 叠放「数值+等级」拆成两行，避免 40A 粘连
+                if row_buf:
+                    prev = "".join(row_buf).strip()
+                    if prev:
+                        row_parts.append(prev)
+                    row_buf = []
+                row_parts.append(grade_parts[0])
+                row_parts.append(grade_parts[1])
+                prev_right = None
                 continue
             bx1, by1, bx2, by2 = _text_bbox(tb)
             box_h = max(by2 - by1, 1.0)

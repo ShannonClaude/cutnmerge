@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html
 import logging
+import re
 from typing import Any, Dict, List, Set, Tuple
 
 import numpy as np
@@ -19,6 +20,9 @@ from .formatter import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 噪声行：整行仅剩孤立字母/符号（如末行 "L"）
+_NOISE_CELL_RE = re.compile(r"^[A-Za-z]$|^[·•\.\,;:]$")
 
 
 def _cell_key(cell: Dict[str, Any]) -> Tuple[int, int, int, int]:
@@ -390,6 +394,58 @@ def drop_evidenceless_rows(cells: List[Dict[str, Any]], *, short_ratio: float = 
     return out
 
 
+def drop_noise_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    丢弃几乎全空、仅含孤立噪声字符的逻辑行（如表末幻觉 'L'）。
+
+    不丢弃含数字、多字中文或跨行 rowspan 起点的行。
+    """
+    if not cells:
+        return cells
+
+    max_row = max(int(c["row_end"]) for c in cells)
+    by_origin_row: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(max_row + 1)}
+    for c in cells:
+        by_origin_row[int(c["row_start"])].append(c)
+
+    dropped: Set[int] = set()
+    for row, row_cells in by_origin_row.items():
+        if not row_cells:
+            continue
+        # 有跨多行的起点格 → 保留
+        if any(int(c.get("row_span") or 1) > 1 for c in row_cells):
+            continue
+        texts = [str(c.get("text") or "").strip() for c in row_cells]
+        non_empty = [t for t in texts if t]
+        if not non_empty:
+            # 全空行留给 compress_empty_logic_rows
+            continue
+        if len(non_empty) <= 2 and all(_NOISE_CELL_RE.fullmatch(t) for t in non_empty):
+            dropped.add(row)
+
+    if not dropped:
+        return cells
+
+    kept_rows = [i for i in range(max_row + 1) if i not in dropped]
+    if not kept_rows:
+        return cells
+
+    remap = {old: new for new, old in enumerate(kept_rows)}
+    out: List[Dict[str, Any]] = []
+    for c in cells:
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        new_idxs = [remap[i] for i in range(rs, re + 1) if i in remap]
+        if not new_idxs:
+            continue
+        nc = dict(c)
+        nc["row_start"] = min(new_idxs)
+        nc["row_end"] = max(new_idxs)
+        nc["row_span"] = nc["row_end"] - nc["row_start"] + 1
+        out.append(nc)
+    logger.info("丢弃噪声行: %s", sorted(dropped))
+    return out
+
+
 def _escape_cell_text(text: str) -> str:
     t = (text or "").strip()
     if not t:
@@ -417,6 +473,7 @@ def cells_to_html_table(
     # 去掉原先只处理“行首标签”的非对称美化；改为对称幽灵行/列清理
     work = drop_evidenceless_columns(work)
     work = drop_evidenceless_rows(work)
+    work = drop_noise_rows(work)
     if compress_empty:
         work = compress_empty_logic_columns(work)
         work = compress_empty_logic_rows(work)

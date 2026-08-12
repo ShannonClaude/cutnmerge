@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .label_patterns import are_independent_row_labels
 from .lines import DetectedTable, Separator, build_cells_from_separators
 
 logger = logging.getLogger(__name__)
@@ -85,9 +86,9 @@ def _find_column_split(
     row_seps: Sequence[float],
     boxes: Sequence[Dict[str, Any]],
     *,
-    min_gap_frac: float = 0.30,
+    min_gap_frac: float = 0.18,
     min_support_rows: int = 2,
-    max_box_frac: float = 0.60,
+    max_box_frac: float = 0.65,
 ) -> Optional[Tuple[float, List[Tuple[float, float]]]]:
     """
     在 [col_left, col_right] 内找文本双簇分界。
@@ -165,7 +166,7 @@ def split_columns_by_text_clusters(
     table: DetectedTable,
     boxes: Sequence[Dict[str, Any]],
     *,
-    max_iters: int = 2,
+    max_iters: int = 4,
 ) -> DetectedTable:
     """
     对过宽原子列按 OCR 文本双簇插入竖线，重建网格。
@@ -192,7 +193,7 @@ def split_columns_by_text_clusters(
         for i in range(len(cols) - 1):
             a, b = cols[i], cols[i + 1]
             w = b - a
-            if w < med_w:
+            if w < 0.85 * med_w:
                 continue
             found = _find_column_split(a, b, current.row_seps, boxes)
             if found is None:
@@ -286,10 +287,10 @@ def unmerge_row_spanned_cells(
         if not texts:
             new_cells.append(cell)
             continue
-        # 全部无 CJK，或全部文本相同
+        # 全部无 CJK，或全部文本相同，或均为独立行标签（实施例N 等）
         all_same = all(t == texts[0] for t in texts)
         none_cjk = all(not _has_cjk(t) for t in texts)
-        if not (all_same or none_cjk):
+        if not (all_same or none_cjk or are_independent_row_labels(texts)):
             new_cells.append(cell)
             continue
 

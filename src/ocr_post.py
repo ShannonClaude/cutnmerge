@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+from .label_patterns import fix_iii_ocr, split_value_grade
+
 logger = logging.getLogger(__name__)
 
 # 各类破折号 / 否定符 → ASCII '-'（几何归一会再覆盖单字符横线误识）
@@ -47,6 +49,13 @@ def normalize_ocr_text(text: str) -> str:
     # 整段仅为破折号变体时统一为 '-'
     if re.fullmatch(r"[\-\s]+", t):
         return "-"
+    t = fix_iii_ocr(t)
+    # 叠放等级常见误序：A+/0 → "+0"
+    if t in {"+0", "0+"}:
+        return "0\nA+"
+    grade = split_value_grade(t)
+    if grade is not None:
+        return f"{grade[0]}\n{grade[1]}"
     return t
 
 
@@ -389,6 +398,10 @@ def postprocess_text_boxes(
                 line_bands = _count_text_line_bands(binary, tb)
                 if box_h >= 1.8 * median_box_h and line_bands >= 2:
                     tb["needs_reocr"] = True
+                # 竖排候选：细长框
+                if box_h >= 2.2 * max(_w, 1.0) and box_h >= 1.5 * median_box_h:
+                    tb["needs_reocr"] = True
+                    tb["maybe_vertical"] = True
         if _looks_like_garbage_ink(
             norm,
             score,
