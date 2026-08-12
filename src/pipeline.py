@@ -33,7 +33,7 @@ from .refine import refine_table
 from .tsr import cells_to_debug_table, predict_cells_tsr
 from .tsr_refine import (
     coverage_score,
-    explode_header_colspans_by_body,
+    reconstruct_header_cells,
     refine_tsr_cells,
 )
 
@@ -365,8 +365,8 @@ def _extract_via_tsr(
         text_boxes,
         line_tables=line_tables,
     )
-    # 表头宽格按身列原子化，避免子表头全部堆进同一个 colspan
-    cells = explode_header_colspans_by_body(cells, text_boxes)
+    # 按子表分段重建多级表头（OCR Y/X 聚类），避免全局 rs<=2 漏掉后续子表
+    cells = reconstruct_header_cells(cells, text_boxes)
 
     # 表头宽格按身列原子化后，传 col_seps 以便横切「一行多列表头」；
     # 括号不成对的误切由 matching 侧拒绝。
