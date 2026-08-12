@@ -33,6 +33,18 @@ def _as_float(value: str | None, default: float) -> float:
     return float(value)
 
 
+def _as_optional_float(value: str | None) -> float | None:
+    if value is None or value.strip() == "":
+        return None
+    return float(value)
+
+
+def _as_csv_list(value: str | None) -> list[str]:
+    if value is None or value.strip() == "":
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 class Settings:
     """PaddleOCR 云端相关配置。"""
 
@@ -66,6 +78,24 @@ class Settings:
         )
         self.prettify_markdown: bool = _as_bool(
             os.getenv("PADDLEOCR_PRETTIFY_MARKDOWN"), False
+        )
+        self.use_textline_orientation: bool = _as_bool(
+            os.getenv("PADDLEOCR_USE_TEXTLINE_ORIENTATION"), False
+        )
+        self.text_det_thresh: float | None = _as_optional_float(
+            os.getenv("PADDLEOCR_TEXT_DET_THRESH")
+        )
+        self.text_det_box_thresh: float | None = _as_optional_float(
+            os.getenv("PADDLEOCR_TEXT_DET_BOX_THRESH")
+        )
+        self.text_det_unclip_ratio: float | None = _as_optional_float(
+            os.getenv("PADDLEOCR_TEXT_DET_UNCLIP_RATIO")
+        )
+        self.text_rec_score_thresh: float | None = _as_optional_float(
+            os.getenv("PADDLEOCR_TEXT_REC_SCORE_THRESH")
+        )
+        self.markdown_ignore_labels: list[str] = _as_csv_list(
+            os.getenv("PADDLEOCR_MARKDOWN_IGNORE_LABELS")
         )
 
     def require_token(self) -> str:

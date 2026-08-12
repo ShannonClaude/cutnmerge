@@ -40,6 +40,12 @@ def cache_key_for_image(image: Any, *, extra: Optional[str] = None) -> str:
         f"|layout={settings.use_layout_detection}"
         f"|orient={settings.use_doc_orientation_classify}"
         f"|unwarp={settings.use_doc_unwarping}"
+        f"|textline={settings.use_textline_orientation}"
+        f"|det_thresh={settings.text_det_thresh}"
+        f"|det_box={settings.text_det_box_thresh}"
+        f"|det_unclip={settings.text_det_unclip_ratio}"
+        f"|rec_score={settings.text_rec_score_thresh}"
+        f"|md_ignore={','.join(settings.markdown_ignore_labels)}"
     )
     if extra:
         meta += f"|{extra}"
