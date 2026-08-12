@@ -230,6 +230,7 @@ def apply_reocr_to_cells(
     if not suspect_ids:
         return cells
     suspect_ids = suspect_ids[:max_cells]
+    templates = _column_template_skeletons(cells)
     
     def _ocr_candidate_for_cell(cell_idx: int, *, rot180: bool) -> Optional[List[Dict[str, Any]]]:
         """
@@ -286,10 +287,18 @@ def apply_reocr_to_cells(
 
     for idx in suspect_ids:
         cell = cells[idx]
-        old_text = str(cell.get("text") or "").strip()
+        # 有些 cell 的“源文本”可能只在 texts 列表里（text 字段为空），用 join_cell_texts 统一取值。
+        old_text_from_texts = (
+            join_cell_texts(cell.get("texts") or []).strip()
+            if cell.get("texts")
+            else ""
+        )
+        old_text = (old_text_from_texts or str(cell.get("text") or "")).strip()
         old_score = _avg_score(cell.get("texts") or [])
 
-        cand: List[Tuple[float, str, List[Dict[str, Any]]]] = []
+        # (score, text, tbs)
+        cand_fwd: List[Tuple[float, str, List[Dict[str, Any]]]] = []
+        cand_rot: List[Tuple[float, str, List[Dict[str, Any]]]] = []
         for rot180 in (False, True):
             tbs = _ocr_candidate_for_cell(idx, rot180=rot180)
             if not tbs:
@@ -297,13 +306,59 @@ def apply_reocr_to_cells(
             new_text = join_cell_texts(tbs).strip()
             if not new_text:
                 continue
-            cand.append((_avg_score(tbs), new_text, tbs))
+            entry = (_avg_score(tbs), new_text, tbs)
+            if rot180:
+                cand_rot.append(entry)
+            else:
+                cand_fwd.append(entry)
 
-        if not cand:
+        if not cand_fwd and not cand_rot:
             continue
-        cand.sort(key=lambda x: x[0], reverse=True)
-        new_score, new_text, new_tbs = cand[0]
-        if not old_text or new_score >= old_score - 0.02:
+
+        best_fwd = max(cand_fwd, key=lambda x: x[0], default=None)
+        best_rot = max(cand_rot, key=lambda x: x[0], default=None)
+
+        # rot180 只有在明显更好时才采用（防止碎片覆盖）
+        chosen = None
+        if best_fwd is not None and best_rot is not None:
+            chosen = best_rot if best_rot[0] >= best_fwd[0] + 0.05 else best_fwd
+        elif best_fwd is not None:
+            chosen = best_fwd
+        else:
+            chosen = best_rot
+
+        if chosen is None:
+            continue
+
+        new_score, new_text, new_tbs = chosen
+
+        # 表题/表外格不做二次覆盖：
+        # 1) row_start 最小附近通常是标题
+        # 2) 旧文本带有类似 `[表1-2]` 的方括号标记时也跳过（更稳）
+        if old_text and (
+            (int(cell.get("row_start") or 0) <= 1)
+            or ("表" in old_text and "[" in old_text)
+            or (old_text.startswith("[") and len(old_text) <= 6)
+        ):
+            continue
+
+        # 允许“旧文本为空”直接补齐
+        if not old_text:
             cell["texts"] = new_tbs
             cell["text"] = new_text
+            continue
+
+        # 否则要求明显优于旧文本且不塌缩
+        if new_score < old_score + 0.05:
+            continue
+        if len(new_text) < 0.6 * max(1, len(old_text)):
+            continue
+
+        # 骨架贴合列模板：宁可不改，也不接受不贴合模板的碎片覆盖
+        col_template = templates.get(int(cell.get("col_start") or 0))
+        if col_template and _char_skeleton(new_text) != col_template:
+            continue
+
+        cell["texts"] = new_tbs
+        cell["text"] = new_text
     return cells

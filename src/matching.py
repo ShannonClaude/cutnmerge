@@ -832,11 +832,9 @@ def assign_texts_to_cells(
     _rebuild_rects()
 
     for tb in text_boxes:
-        # ---- 行标签粘连预切分（比较例1 86 Bk-1）----
-        sticky = _split_sticky_row_label(tb)
-        pending = sticky if sticky else [tb]
-
-        for piece_tb in pending:
+        # 预切分已关闭：避免“无证据即切”把如表题/数字拆碎。
+        # 跨格切分仅通过 _try_split_across_cells()（需要 binary/墨迹沟/几何校验）进行。
+        for piece_tb in [tb]:
             text_shape = polygon_to_shapely(piece_tb["polygon"])
             centroid = text_shape.centroid
             center_pt = Point(centroid.x, centroid.y)

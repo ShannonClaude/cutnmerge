@@ -289,9 +289,6 @@ def drop_evidenceless_columns(cells: List[Dict[str, Any]], *, narrow_ratio: floa
         any_text = any(str(c.get("text") or "").strip() for c in covered_cells)
         if any_text:
             continue
-        any_span = any(int(c.get("col_span") or 1) > 1 for c in covered_cells)
-        if any_span:
-            continue
 
         # 该列的窄宽度判断：取其原子 cell 的宽度中位数
         widths: List[float] = []
@@ -358,9 +355,6 @@ def drop_evidenceless_rows(cells: List[Dict[str, Any]], *, short_ratio: float = 
             continue
         any_text = any(str(c.get("text") or "").strip() for c in covered_cells)
         if any_text:
-            continue
-        any_span = any(int(c.get("row_span") or 1) > 1 for c in covered_cells)
-        if any_span:
             continue
 
         heights: List[float] = []

@@ -77,6 +77,105 @@ def _count_expected_lost(html: str, expected_texts: list[str]) -> tuple[int, lis
     return len(lost), lost[:8]
 
 
+def _strip_tags(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", s or "")
+
+
+def _parse_html_table_stats(html: str) -> dict[str, int | float]:
+    """
+    从真实输出 html 解析统计，用于“回归护栏”，避免 TSR 独立算出来的 rows/cols 与最终 html 不一致。
+    """
+    if not html:
+        return {"rows": 0, "cols": 0, "empty_ratio": 0.0, "text_chars": 0}
+
+    hu = html_lib.unescape(html)
+    tables = re.findall(
+        r"<table\b[^>]*>(.*?)</table>",
+        hu,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not tables:
+        tables = [hu]
+
+    best_rows = 0
+    best_cols = 0
+    total_tds = 0
+    empty_tds = 0
+
+    for t_html in tables:
+        row_segs = re.findall(
+            r"<tr\b[^>]*>(.*?)</tr>",
+            t_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        best_rows = max(best_rows, len(row_segs))
+        for row_seg in row_segs:
+            col_sum = 0
+            tds = re.findall(
+                r"<td\b([^>]*)>(.*?)</td>",
+                row_seg,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not tds:
+                continue
+            for td_attr, td_inner in tds:
+                total_tds += 1
+                m = re.search(r'colspan\s*=\s*["\']?(\d+)', td_attr or "", flags=re.IGNORECASE)
+                span = int(m.group(1)) if m else 1
+                col_sum += span
+                inner_txt = _strip_tags(td_inner).strip()
+                inner_txt = re.sub(r"\s+", "", inner_txt)
+                if inner_txt == "":
+                    empty_tds += 1
+            best_cols = max(best_cols, col_sum)
+
+    all_text = _strip_tags(hu)
+    all_text = re.sub(r"\s+", "", all_text)
+    text_chars = len(all_text)
+    empty_ratio = empty_tds / max(1, total_tds)
+    return {
+        "rows": int(best_rows),
+        "cols": int(best_cols),
+        "empty_ratio": float(empty_ratio),
+        "text_chars": int(text_chars),
+    }
+
+
+def _parse_regress_stats_report(report_text: str) -> dict[str, dict[str, float | int]]:
+    """
+    解析 format_report 输出的 tab-separated 报告，用于与历史基线做护栏对比。
+    只提取 empty_ratio/text_chars。
+    """
+    if not report_text:
+        return {}
+    lines = [ln for ln in report_text.splitlines() if ln.strip()]
+    if not lines:
+        return {}
+    header = lines[0].split("\t")
+    if "name" not in header or "empty_ratio" not in header or "text_chars" not in header:
+        return {}
+    idx_name = header.index("name")
+    idx_empty = header.index("empty_ratio")
+    idx_text = header.index("text_chars")
+
+    out: dict[str, dict[str, float | int]] = {}
+    for ln in lines[1:]:
+        if ln.startswith("  "):
+            continue
+        parts = ln.split("\t")
+        if len(parts) <= max(idx_name, idx_empty, idx_text):
+            continue
+        name = parts[idx_name]
+        try:
+            out[name] = {
+                "empty_ratio": float(parts[idx_empty]),
+                "text_chars": int(float(parts[idx_text])),
+            }
+        except Exception:
+            continue
+    return out
+
+
 def run_one(
     path: Path,
     *,
@@ -94,6 +193,7 @@ def run_one(
         debug=False,
     )
     html = result.get("html") or ""
+    table_stats = _parse_html_table_stats(html)
 
     img = _load_image(str(path))
     img, axis, kind = apply_orientation_axis(img, mode=orientation)
@@ -132,8 +232,11 @@ def run_one(
         filled = []
     max_row = max((int(c["row_end"]) for c in filled), default=-1)
     max_col = max((int(c["col_end"]) for c in filled), default=-1)
-    rows = max_row + 1 if max_row >= 0 else 0
-    cols = max_col + 1 if max_col >= 0 else 0
+    # rows/cols/empty_ratio/text_chars 直接来自真实 html，避免“另跑 TSR”造成的指标失真
+    rows = int(table_stats["rows"])
+    cols = int(table_stats["cols"])
+    empty_ratio = float(table_stats["empty_ratio"])
+    text_chars = int(table_stats["text_chars"])
     nonempty = sum(1 for c in filled if str(c.get("text") or "").strip())
     lost_n, lost_s = _count_lost(html, [str(t.get("text") or "") for t in tb])
     expected = expected or {}
@@ -156,6 +259,8 @@ def run_one(
         "expected_rows": expected_rows,
         "expected_cols": expected_cols,
         "cov": round(cov, 3),
+        "empty_ratio": round(empty_ratio, 4),
+        "text_chars": text_chars,
         "lost": lost_n,
         "lost_samples": [t[:20] for t in lost_s],
         "gt_lost": gt_lost,
@@ -168,7 +273,7 @@ def format_report(rows: list[dict]) -> str:
     lines = [
         (
             "name\torient\tboxes\tcells\tnonempty\trows\tcols\texpected_rows"
-            "\texpected_cols\tmaxrow\tmaxcol\tcov\tlost\tgt_lost\thtml_len"
+            "\texpected_cols\tmaxrow\tmaxcol\tcov\tempty_ratio\ttext_chars\tguard_flags\tlost\tgt_lost\thtml_len"
         ),
     ]
     for r in rows:
@@ -176,6 +281,7 @@ def format_report(rows: list[dict]) -> str:
             f"{r['name']}\t{r['orient']}\t{r['boxes']}\t{r['cells']}\t"
             f"{r['nonempty']}\t{r['rows']}\t{r['cols']}\t{r['expected_rows']}\t"
             f"{r['expected_cols']}\t{r['maxrow']}\t{r['maxcol']}\t{r['cov']}\t"
+            f"{r.get('empty_ratio', 0.0)}\t{r.get('text_chars', 0)}\t{r.get('guard_flags','')}\t"
             f"{r['lost']}\t{r['gt_lost']}\t{r['html_len']}"
         )
         if r["lost_samples"]:
@@ -189,6 +295,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="表格提取回归统计")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--refresh-cache", action="store_true")
+    parser.add_argument(
+        "--expected-only",
+        action="store_true",
+        help="只运行 data/expected.json 中列出的图片（用于快速验证）",
+    )
     parser.add_argument(
         "--orientation",
         default="auto",
@@ -209,6 +320,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     expected = _load_expected(Path(args.expected))
+    if args.expected_only and expected:
+        images = [p for p in images if p.name in expected]
+    baseline_stats = {}
+    if args.baseline and Path(args.baseline).is_file():
+        try:
+            baseline_text = Path(args.baseline).read_text(encoding="utf-8")
+            baseline_stats = _parse_regress_stats_report(baseline_text)
+        except Exception:  # noqa: BLE001
+            baseline_stats = {}
 
     rows = []
     for i, path in enumerate(images, 1):
@@ -249,6 +369,28 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
 
+    # 护栏：empty_ratio 不升高；text_chars 不下降
+    if baseline_stats:
+        for r in rows:
+            b = baseline_stats.get(r.get("name", ""))
+            if not b:
+                r["guard_flags"] = ""
+                continue
+            flags = []
+            cur_empty = float(r.get("empty_ratio", 0.0))
+            cur_text = int(r.get("text_chars", 0))
+            if cur_empty > float(b["empty_ratio"]) + 1e-6:
+                flags.append("empty_up")
+            if cur_text < int(b["text_chars"]):
+                flags.append("text_down")
+            r["guard_flags"] = ",".join(flags)
+
+        violations = [r.get("name", "") for r in rows if r.get("guard_flags")]
+        if violations:
+            print("guard violation (empty_ratio↑ or text_chars↓):")
+            for n in violations[:20]:
+                print(f" - {n}")
+
     report = format_report(rows)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -260,6 +402,9 @@ def main(argv: list[str] | None = None) -> int:
         bp.parent.mkdir(parents=True, exist_ok=True)
         bp.write_text(report, encoding="utf-8")
         print(f"baseline: {bp}")
+        if baseline_stats:
+            if any(r.get("guard_flags") for r in rows):
+                return 2
     return 0
 
 
