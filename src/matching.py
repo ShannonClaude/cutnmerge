@@ -504,6 +504,17 @@ def _split_sticky_row_label(
     return pieces
 
 
+def _split_breaks_paired_marks(text: str, cuts: Sequence[int]) -> bool:
+    """切分后若某段括号/方括号不成对，视为误切（如「单体[」|「摩尔比]」）。"""
+    pairs = (("(", ")"), ("[", "]"), ("（", "）"), ("【", "】"))
+    for i in range(len(cuts) - 1):
+        part = text[cuts[i] : cuts[i + 1]]
+        for a, b in pairs:
+            if part.count(a) != part.count(b):
+                return True
+    return False
+
+
 def _geometric_multi_col_split(
     tb: Dict[str, Any],
     cells: List[Dict[str, Any]],
@@ -559,6 +570,9 @@ def _geometric_multi_col_split(
     for i in range(1, len(cuts)):
         if cuts[i] < cuts[i - 1]:
             cuts[i] = cuts[i - 1]
+
+    if _split_breaks_paired_marks(text, cuts):
+        return False
 
     assigned = False
     for si, (ci, _, cb) in enumerate(candidates):
@@ -727,6 +741,9 @@ def _try_split_across_cells(
     for i in range(1, len(cuts)):
         if cuts[i] < cuts[i - 1]:
             cuts[i] = cuts[i - 1]
+
+    if _split_breaks_paired_marks(text, cuts):
+        return False
 
     all_wide = all(w >= wide_need for w in run_widths)
     compact = re.sub(r"\s+", "", text)
@@ -1176,4 +1193,13 @@ def join_cell_texts(
             row_parts.append(row_text)
     if not row_parts:
         return ""
+    # 连续相同行塌缩：横线断口导致同一「A-2 50g」被重复读入多行时去重
+    deduped: List[str] = []
+    for part in row_parts:
+        if deduped and deduped[-1] == part:
+            continue
+        deduped.append(part)
+    # 仅当塌缩掉 ≥2 次重复时采用（避免误伤合法双行相同标签）
+    if len(row_parts) - len(deduped) >= 2:
+        row_parts = deduped
     return _normalize_dash_text("\n".join(row_parts))

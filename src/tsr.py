@@ -232,7 +232,7 @@ def predict_cells_tsr(
 
     primary_kind = kind
     # 分类为无线但线密度偏高 → 更可能是有线表被误判
-    prefer_wired_probe = primary_kind != "wired" and dens >= 0.012
+    prefer_wired_probe = primary_kind != "wired" and dens >= 0.010
     if primary_kind == "wired":
         logger.info("TSR 路径: wired (unet), dens=%.4f", dens)
         cells = _predict_kind(wired_engine, infer_img, scale, kind_label="wired")

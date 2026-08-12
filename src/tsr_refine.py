@@ -242,6 +242,19 @@ def _texts_in_cell(
     return out
 
 
+def _looks_like_ocr_fragment(text: str) -> bool:
+    """短碎片 / 孤立数字 / 单字截断，常见于假列吃到邻格尾巴。"""
+    t = (text or "").strip()
+    if not t:
+        return True
+    compact = re.sub(r"\s+", "", t)
+    if len(compact) <= 2:
+        return True
+    if re.fullmatch(r"[0-9一二三四五六七八九十]+", compact):
+        return True
+    return False
+
+
 def merge_ghost_columns(
     cells: List[Dict[str, Any]],
     boxes: Sequence[Dict[str, Any]],
@@ -250,6 +263,7 @@ def merge_ghost_columns(
 ) -> List[Dict[str, Any]]:
     """
     几乎无文本落入且物理宽度异常窄的逻辑列 → 合并到右侧邻列。
+    窄列若仅有短碎片 OCR（而邻列有实质文本）也视为幽灵列。
     """
     if not cells:
         return cells
@@ -261,8 +275,9 @@ def merge_ghost_columns(
     widths = [col_seps[i + 1] - col_seps[i] for i in range(n_cols)]
     median_w = float(np.median(widths)) if widths else 1.0
 
-    # 每列文本命中数
+    # 每列文本命中数与样本文本
     hits = [0] * n_cols
+    col_texts: List[List[str]] = [[] for _ in range(n_cols)]
     for tb in boxes:
         x1, y1, x2, y2 = _tb_bbox(tb)
         mx = (x1 + x2) / 2.0
@@ -271,13 +286,31 @@ def merge_ghost_columns(
                 c == n_cols - 1 and col_seps[c] <= mx <= col_seps[c + 1]
             ):
                 hits[c] += 1
+                t = str(tb.get("text") or "").strip()
+                if t:
+                    col_texts[c].append(t)
                 break
 
-    # 标记幽灵列：窄 + 无文本（或极少）
-    ghost = [
-        (widths[c] < min_width_ratio * median_w and hits[c] == 0)
-        for c in range(n_cols)
-    ]
+    def _neighbor_has_substance(c: int) -> bool:
+        for t in (c - 1, c + 1):
+            if 0 <= t < n_cols and any(not _looks_like_ocr_fragment(x) for x in col_texts[t]):
+                return True
+        return False
+
+    # 标记幽灵列：窄 + 无文本，或窄 + 仅碎片且邻列有实质文本
+    ghost = []
+    for c in range(n_cols):
+        narrow = widths[c] < min_width_ratio * median_w
+        if not narrow:
+            ghost.append(False)
+            continue
+        if hits[c] == 0:
+            ghost.append(True)
+            continue
+        only_frag = bool(col_texts[c]) and all(
+            _looks_like_ocr_fragment(t) for t in col_texts[c]
+        )
+        ghost.append(bool(only_frag and _neighbor_has_substance(c)))
     if not any(ghost):
         return cells
 
@@ -509,7 +542,8 @@ def split_bad_colspans(
             support += 1
             split_xs.append(mid)
 
-        # 双数值列（酸当量|双键当量）即使仅 2 行支持也切
+        # 双数值列（酸当量|双键当量）即使仅 2 行支持也切；
+        # 表头成对短标签（種類|添加量）仅 1 行双簇也可切。
         need = min_support_rows
         dual_numeric = 0
         for xs in by_row.values():
@@ -517,6 +551,34 @@ def split_bad_colspans(
                 dual_numeric += 1
         if dual_numeric >= 2:
             need = min(need, 2)
+
+        header_pair = False
+        for ri, xs in by_row.items():
+            if len(xs) < 2:
+                continue
+            # 顶部两行视为表头带
+            if ri > 1:
+                continue
+            y0 = row_seps[ri] if ri < len(row_seps) else 0.0
+            y1 = row_seps[ri + 1] if ri + 1 < len(row_seps) else y0 + 1.0
+            short_n = 0
+            for tb in boxes:
+                bx1, by1, bx2, by2 = _tb_bbox(tb)
+                mx, my = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
+                if not (y0 <= my < y1):
+                    continue
+                if not (left <= mx < right):
+                    continue
+                t = str(tb.get("text") or "").strip()
+                compact = "".join(t.split())
+                if 1 <= len(compact) <= 6:
+                    short_n += 1
+            if short_n >= 2:
+                header_pair = True
+                break
+        if header_pair:
+            need = 1
+
         if support >= need and split_xs:
             splits.append((c, float(np.median(split_xs))))
 
@@ -950,6 +1012,130 @@ def split_underspanned_rows(
         sorted(row_splits.keys()),
         n_ins,
     )
+    return out
+
+
+def explode_header_colspans_by_body(
+    cells: List[Dict[str, Any]],
+    boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    顶部宽格（col_span>=2）若其覆盖列在下方身行上多数已是原子格，则拆成原子列。
+
+    专治「单体[摩尔比] 子标签全部堆进一个 colspan，而合成例身行已正确分列」。
+    """
+    if not cells:
+        return cells
+    row_seps, col_seps = _derive_seps(cells)
+    if len(col_seps) < 3 or len(row_seps) < 3:
+        return cells
+
+    n_cols = len(col_seps) - 1
+    boxes = list(boxes) if boxes else []
+
+    # 每列在「某行以下」是否出现过原子格
+    def _atomic_below(col: int, after_row: int) -> bool:
+        for cell in cells:
+            if int(cell["col_start"]) != col or int(cell["col_end"]) != col:
+                continue
+            if int(cell["row_start"]) > after_row:
+                return True
+        return False
+
+    # OCR 命中也算身列证据
+    body_hits = [0] * n_cols
+    if boxes and len(row_seps) >= 2:
+        # 取整表上半之后的区域作为身行粗略带
+        mid_y = float(row_seps[min(2, len(row_seps) - 1)])
+        for tb in boxes:
+            x1, y1, x2, y2 = _tb_bbox(tb)
+            mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            if my < mid_y:
+                continue
+            for c in range(n_cols):
+                if col_seps[c] <= mx < col_seps[c + 1] or (
+                    c == n_cols - 1 and col_seps[c] <= mx <= col_seps[c + 1]
+                ):
+                    body_hits[c] += 1
+                    break
+
+    out: List[Dict[str, Any]] = []
+    exploded = 0
+    for cell in cells:
+        cs, ce = int(cell["col_start"]), int(cell["col_end"])
+        rs, re_ = int(cell["row_start"]), int(cell["row_end"])
+        col_span = ce - cs + 1
+        # 只拆顶部若干行的宽格（表头带）
+        if col_span < 2 or rs > 2:
+            out.append(cell)
+            continue
+        covered = list(range(cs, ce + 1))
+        support = sum(
+            1
+            for c in covered
+            if _atomic_below(c, re_) or body_hits[c] > 0
+        )
+        need = max(2, int(0.5 * len(covered) + 0.5))
+        if support < need:
+            out.append(cell)
+            continue
+        # 宽格所在行带内须有落在不同列的多个 OCR 框，才拆；纯父级合并标题保留
+        hit_cols = set()
+        y0 = float(row_seps[rs]) if rs < len(row_seps) else _cell_bbox(cell)[1]
+        y1 = (
+            float(row_seps[re_ + 1])
+            if re_ + 1 < len(row_seps)
+            else _cell_bbox(cell)[3]
+        )
+        x_lo = float(col_seps[cs])
+        x_hi = float(col_seps[ce + 1]) if ce + 1 < len(col_seps) else x_lo + 1.0
+        for tb in boxes:
+            bx1, by1, bx2, by2 = _tb_bbox(tb)
+            mx, my = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
+            if not (y0 - 2 <= my <= y1 + 2 and x_lo - 2 <= mx <= x_hi + 2):
+                continue
+            for c in covered:
+                if col_seps[c] <= mx < col_seps[c + 1] or (
+                    c == covered[-1] and col_seps[c] <= mx <= col_seps[c + 1]
+                ):
+                    hit_cols.add(c)
+                    break
+        if len(hit_cols) < 2:
+            out.append(cell)
+            continue
+        if ce + 1 >= len(col_seps):
+            out.append(cell)
+            continue
+        if rs < len(row_seps) and re_ + 1 < len(row_seps):
+            y1 = float(row_seps[rs])
+            y2 = float(row_seps[re_ + 1])
+        else:
+            _x1, y1, _x2, y2 = _cell_bbox(cell)
+        if y2 <= y1:
+            _x1, y1, _x2, y2 = _cell_bbox(cell)
+        for c in range(cs, ce + 1):
+            x1 = float(col_seps[c])
+            x2 = float(col_seps[c + 1])
+            poly = _rebuild_polygon(x1, y1, x2, y2)
+            out.append(
+                {
+                    "polygon": poly,
+                    "x_key": x1,
+                    "y_key": y1,
+                    "row_start": rs,
+                    "row_end": re_,
+                    "col_start": c,
+                    "col_end": c,
+                    "row_span": re_ - rs + 1,
+                    "col_span": 1,
+                    "texts": [],
+                    "text": "",
+                }
+            )
+        exploded += 1
+
+    if exploded:
+        logger.info("表头 colspan 按身列拆开: %d 个宽格", exploded)
     return out
 
 
