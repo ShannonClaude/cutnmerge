@@ -31,7 +31,11 @@ from .orient import apply_orientation_axis, ensure_upright_axis, maybe_flip_180_
 from .reocr import apply_reocr_to_cells
 from .refine import refine_table
 from .tsr import cells_to_debug_table, predict_cells_tsr
-from .tsr_refine import coverage_score, refine_tsr_cells
+from .tsr_refine import (
+    coverage_score,
+    explode_header_colspans_by_body,
+    refine_tsr_cells,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +365,20 @@ def _extract_via_tsr(
         text_boxes,
         line_tables=line_tables,
     )
+    # 表头宽格按身列原子化，避免子表头全部堆进同一个 colspan
+    cells = explode_header_colspans_by_body(cells, text_boxes)
+
+    # 表头宽格按身列原子化后，传 col_seps 以便横切「一行多列表头」；
+    # 括号不成对的误切由 matching 侧拒绝。
+    from .tsr_refine import _derive_seps as _derive_seps_local
+
+    _row_seps, col_seps = _derive_seps_local(cells)
+    v_separators = None
+    if line_tables:
+        best = max(
+            line_tables, key=lambda t: float(getattr(t, "confidence", 0.0) or 0.0)
+        )
+        v_separators = getattr(best, "v_separators", None)
 
     cells, free_texts = assign_texts_to_cells(
         cells,
@@ -369,6 +387,8 @@ def _extract_via_tsr(
         split_cross_cell=True,
         table_bboxes=None,
         binary=binary,
+        col_seps=col_seps if len(col_seps) >= 3 else None,
+        v_separators=v_separators,
     )
     if reocr:
         cells = apply_reocr_to_cells(

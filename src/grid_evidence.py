@@ -238,6 +238,67 @@ def apply_grid_evidence_merge(
         blank_corridor = not crosses
         if (not line_ok) and (not blank_corridor):
             merge_cols.append(j)
+            continue
+
+        # 额外：一侧列几乎只有表头短碎片、身行无 OCR，且邻列有实质文本 → 假列
+        if line_ok:
+            # 有线证据时仍可能切穿折行表头；若身行一侧为空另一侧有字且跨 strip 的框存在弱重叠，仍合并
+            weak_cross = False
+            for tb in relevant_tbs:
+                bx1, _by1, bx2, _by2 = _tb_bbox(tb)
+                # 弱跨：框覆盖分隔坐标且左右各至少伸入 2px
+                if bx1 < x - 2 and bx2 > x + 2:
+                    weak_cross = True
+                    break
+            if not weak_cross:
+                continue
+
+        left_hits = 0
+        right_hits = 0
+        left_body = 0
+        right_body = 0
+        left_frag = 0
+        right_frag = 0
+        body_y0 = float(row_seps[min(2, n_rows - 1)]) if n_rows >= 2 else float(row_seps[0])
+        for tb in relevant_tbs:
+            bx1, by1, bx2, by2 = _tb_bbox(tb)
+            mx = (bx1 + bx2) / 2.0
+            my = (by1 + by2) / 2.0
+            t = str(tb.get("text") or "").strip()
+            compact = "".join(t.split())
+            is_frag = (not compact) or len(compact) <= 2
+            if col_seps[j] <= mx < col_seps[j + 1]:
+                left_hits += 1
+                if my >= body_y0:
+                    left_body += 1
+                if is_frag:
+                    left_frag += 1
+            elif col_seps[j + 1] <= mx < col_seps[j + 2]:
+                right_hits += 1
+                if my >= body_y0:
+                    right_body += 1
+                if is_frag:
+                    right_frag += 1
+
+        # 左列几乎全是碎片且身行空，右列有身行文本 → 并入右
+        if (
+            left_hits > 0
+            and left_body == 0
+            and left_frag == left_hits
+            and right_body > 0
+            and j not in merge_cols
+        ):
+            merge_cols.append(j)
+            continue
+        # 右列同理并入左
+        if (
+            right_hits > 0
+            and right_body == 0
+            and right_frag == right_hits
+            and left_body > 0
+            and j not in merge_cols
+        ):
+            merge_cols.append(j)
 
     if merge_rows:
         _merge_row_indices(cells, n_rows=n_rows, merge_lower_row_indices=merge_rows)

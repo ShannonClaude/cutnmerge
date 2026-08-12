@@ -258,12 +258,20 @@ def _cell_physical_bbox_x_y(cell: Dict[str, Any]) -> Tuple[float, float, float, 
 def drop_evidenceless_columns(cells: List[Dict[str, Any]], *, narrow_ratio: float = 0.35) -> List[Dict[str, Any]]:
     """
     丢弃“证据不足”的幽灵列（零文本、且几何上非常窄、且不参与跨列 colspan）。
+    窄列若仅有短碎片文本、且不参与 colspan，同样丢弃。
 
     注意：此实现无法直接判定“无框线/无墨迹”（html_formatter 不接收原图），
-    因此使用可观测代理：窄宽度 + 不存在跨列占用 + 覆盖该列的文本为空。
+    因此使用可观测代理：窄宽度 + 不存在跨列占用 + 覆盖该列的文本为空/碎片。
     """
     if not cells:
         return cells
+
+    def _is_frag(text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return True
+        compact = "".join(t.split())
+        return len(compact) <= 2
 
     # 物理宽度统计：用所有 col_span==1 的 cell 估计“标准列宽”
     atomic_widths: List[float] = []
@@ -290,8 +298,13 @@ def drop_evidenceless_columns(cells: List[Dict[str, Any]], *, narrow_ratio: floa
     for col, covered_cells in col_to_cells.items():
         if not covered_cells:
             continue
-        any_text = any(str(c.get("text") or "").strip() for c in covered_cells)
-        if any_text:
+        texts = [str(c.get("text") or "").strip() for c in covered_cells]
+        any_text = any(texts)
+        only_frag = (not any_text) or all(_is_frag(t) for t in texts if t) or (
+            any_text and all(_is_frag(t) for t in texts)
+        )
+        spans_cross = any(int(c.get("col_span") or 1) > 1 for c in covered_cells)
+        if spans_cross and any(not _is_frag(t) for t in texts):
             continue
 
         # 该列的窄宽度判断：取其原子 cell 的宽度中位数
@@ -302,8 +315,27 @@ def drop_evidenceless_columns(cells: List[Dict[str, Any]], *, narrow_ratio: floa
             x1, _y1, x2, _y2 = _cell_physical_bbox_x_y(c)
             widths.append(max(0.0, x2 - x1))
         if not widths:
+            # 无原子格宽度时，若整列只有碎片文本且无跨列，仍丢弃
+            if only_frag and not spans_cross:
+                dropped.add(col)
             continue
-        if float(np.median(widths)) < narrow_ratio * median_w:
+        narrow = float(np.median(widths)) < narrow_ratio * median_w
+        # 窄列碎片，或非窄但整列仅孤立数字/单字且多数格为空
+        empty_n = sum(1 for t in texts if not t)
+        frag_only_sparse = only_frag and empty_n >= max(1, len(texts) // 2)
+        if (narrow and only_frag) or (frag_only_sparse and not spans_cross):
+            # 碎片文本并入左侧邻列（若存在）
+            if any_text and col > 0:
+                frag_bits = [t for t in texts if t]
+                for c in cells:
+                    if int(c["col_start"]) <= col - 1 <= int(c["col_end"]) and int(
+                        c.get("row_start", 0)
+                    ) == min(int(x.get("row_start", 0)) for x in covered_cells):
+                        prev = str(c.get("text") or "").strip()
+                        add = "".join(frag_bits)
+                        if add and add not in prev:
+                            c["text"] = (prev + add).strip() if prev else add
+                        break
             dropped.add(col)
 
     if not dropped:
