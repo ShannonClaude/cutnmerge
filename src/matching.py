@@ -19,10 +19,12 @@ from shapely.geometry import Point, box
 
 from .geometry import compute_ioa, polygon_to_shapely
 from .label_patterns import (
+    _CAPTION_CHUNK_RE,
     are_independent_row_labels,
     extract_independent_labels_from_joined,
     fix_iii_ocr,
     is_independent_row_label,
+    normalize_spaces,
     split_value_grade,
 )
 
@@ -1166,6 +1168,21 @@ def assign_texts_to_cells(
 
     for cell in cells:
         cell["text"] = join_cell_texts(cell.get("texts") or [])
+        # 表题碎片与表头正文同格时剥掉表题，避免「[表1-2]/聚合物」
+        raw_texts = list(cell.get("texts") or [])
+        if len(raw_texts) >= 2:
+            kept = []
+            captions = []
+            for tb in raw_texts:
+                t = str(tb.get("text") or "").strip()
+                if t and _CAPTION_CHUNK_RE.fullmatch(t):
+                    captions.append(tb)
+                else:
+                    kept.append(tb)
+            if captions and kept:
+                cell["texts"] = kept
+                cell["text"] = join_cell_texts(kept)
+                free_texts.extend(captions)
 
     cells = unmerge_filled_label_rowspans(cells)
     return cells, free_texts
@@ -1293,6 +1310,15 @@ def unmerge_filled_label_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str,
         joined = str(cell.get("text") or "").strip()
         labels = extract_independent_labels_from_joined(joined)
         if len(labels) == row_span and are_independent_row_labels(labels):
+            # 去掉标签与表题后若仍有实质正文（如「聚合物」），禁止误拆
+            remainder = joined
+            for lb in labels:
+                remainder = remainder.replace(lb, "", 1)
+            remainder = _CAPTION_CHUNK_RE.sub("", remainder)
+            rem_compact = normalize_spaces(remainder)
+            if rem_compact and (_CJK_RE.search(rem_compact) or len(rem_compact) >= 3):
+                out.append(cell)
+                continue
             for i, r in enumerate(range(rs, re + 1)):
                 if r >= len(row_seps) - 1 or cs >= len(col_seps) - 1:
                     continue
