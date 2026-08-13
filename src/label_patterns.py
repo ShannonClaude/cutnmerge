@@ -77,6 +77,13 @@ def fix_iii_ocr(text: str) -> str:
     return _III_OCR_RE.sub(r"iii-\1", text)
 
 
+# 表题/图题碎片：从中抽出的裸数字不能当作行标签（否则 [表1-2]+聚合物 会被拆成 1|2）
+_CAPTION_CHUNK_RE = re.compile(
+    r"\[?\s*(?:表|図|图)\s*[\d\-ー－]+\s*\]?",
+    re.IGNORECASE,
+)
+
+
 def extract_independent_labels_from_joined(text: str) -> List[str]:
     """从已拼接的多行/粘连文本中抽出独立行标签序列。"""
     if not text:
@@ -86,23 +93,31 @@ def extract_independent_labels_from_joined(text: str) -> List[str]:
         line = line.strip()
         if not line:
             continue
+        # 去掉表题碎片后再解析，避免 [表1-2] 贡献假数字标签
+        line_wo_cap = _CAPTION_CHUNK_RE.sub(" ", line).strip()
+        if not line_wo_cap:
+            continue
         # 同行无空格粘连：实施例51实施例52
-        compact = normalize_spaces(line)
+        compact = normalize_spaces(line_wo_cap)
+        # 多标签扫描：不含裸 \d{1,3}（裸数字只允许整行 fullmatch）
         ms = list(
             re.finditer(
                 r"(?:实[施試]例|実[施試]例|実施例|比較例|比较例|合成例)"
                 r"[IVXivx０-９\d]+|"
                 r"(?:iii|ii|i)\s*[-－]?\s*\d+|"
-                r"(?:OXL|OXE)\s*[-－]?\s*[A-Za-z0-9]+|"
-                r"\d{1,3}(?!\d)",
+                r"(?:OXL|OXE)\s*[-－]?\s*[A-Za-z0-9]+",
                 compact,
                 flags=re.IGNORECASE,
             )
         )
         if len(ms) >= 2 and all(is_independent_row_label(m.group(0)) for m in ms):
-            parts.extend(m.group(0) for m in ms)
-        elif is_independent_row_label(line):
-            parts.append(normalize_spaces(line))
+            covered = sum(len(m.group(0)) for m in ms)
+            # 匹配必须覆盖绝大部分文本，避免「表题数字 + 正文」误抽
+            if covered >= max(2, int(0.7 * len(compact))):
+                parts.extend(m.group(0) for m in ms)
+                continue
+        if is_independent_row_label(line_wo_cap):
+            parts.append(normalize_spaces(line_wo_cap))
         elif is_independent_row_label(compact):
             parts.append(compact)
     return parts

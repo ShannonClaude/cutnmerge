@@ -405,6 +405,11 @@ def _extract_via_tsr(
                 key=lambda t: float(getattr(t, "confidence", 0.0) or 0.0),
             )
             v_separators = getattr(best, "v_separators", None)
+    else:
+        # 默认路径：仅表头带按列横线连通性局部恢复 rowspan（不改列、不开激进融合）
+        from .hline_repair import repair_rowspans_by_hline_gaps
+
+        cells = repair_rowspans_by_hline_gaps(cells, binary, text_boxes)
 
     cells, free_texts = assign_texts_to_cells(
         cells,

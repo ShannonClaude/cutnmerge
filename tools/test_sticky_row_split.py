@@ -48,6 +48,16 @@ def test_no_bare_peel_single_intent():
     assert _parse_sticky_row_parts("实施例10", n_cols=1) is None
 
 
+def test_caption_digits_not_labels():
+    from src.label_patterns import extract_independent_labels_from_joined
+
+    assert extract_independent_labels_from_joined("[表1-2]\n聚合物") == []
+    assert extract_independent_labels_from_joined("[表1-2]聚合物") == []
+    assert extract_independent_labels_from_joined("实施例1\n实施例2") == [
+        "实施例1",
+        "实施例2",
+    ]
+
 def test_sticky_requires_multi_col():
     tb = {
         "text": "比较例 186Bk-1",
