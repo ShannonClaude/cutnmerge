@@ -197,6 +197,147 @@ def _predict_kind(
     return _result_to_cells(cell_bboxes, logic_points, scale=scale)
 
 
+def _pick_finer_grid(
+    primary: List[Dict[str, Any]],
+    alt: List[Dict[str, Any]],
+    text_boxes: Optional[List[Dict[str, Any]]],
+    *,
+    primary_label: str,
+    alt_label: str,
+    hybrid: bool,
+) -> List[Dict[str, Any]]:
+    """按结构质量（列/行/格数相对 OCR）选型，避免大格假覆盖或过切毁掉后处理。"""
+    from .tsr_refine import (
+        cell_grid_stats,
+        coverage_score,
+        looks_oversegmented,
+        looks_undersegmented,
+        structure_quality_score,
+    )
+
+    boxes = text_boxes or []
+    p_cols, p_rows, p_n = cell_grid_stats(primary)
+    a_cols, a_rows, a_n = cell_grid_stats(alt)
+    score_p = coverage_score(primary, boxes)
+    score_a = coverage_score(alt, boxes)
+    q_p = structure_quality_score(primary, boxes)
+    q_a = structure_quality_score(alt, boxes)
+    alt_under = bool(boxes) and looks_undersegmented(alt, boxes)
+    pri_under = bool(boxes) and looks_undersegmented(primary, boxes)
+    alt_over = bool(boxes) and looks_oversegmented(alt, boxes)
+    pri_over = bool(boxes) and looks_oversegmented(primary, boxes)
+
+    logger.info(
+        "TSR 对照 %s vs %s: cols=%d/%d rows=%d/%d cells=%d/%d cov=%.3f/%.3f "
+        "qual=%.3f/%.3f hybrid=%s under=%s/%s over=%s/%s",
+        primary_label,
+        alt_label,
+        p_cols,
+        a_cols,
+        p_rows,
+        a_rows,
+        p_n,
+        a_n,
+        score_p,
+        score_a,
+        q_p,
+        q_a,
+        hybrid,
+        pri_under,
+        alt_under,
+        pri_over,
+        alt_over,
+    )
+
+    # 过切候选：除非覆盖率塌了，否则不换过去
+    if alt_over and not pri_over and score_p >= 0.7:
+        logger.info(
+            "TSR 保留 %s（拒绝过切 %s: cols=%d rows=%d cells=%d）",
+            primary_label,
+            alt_label,
+            a_cols,
+            a_rows,
+            a_n,
+        )
+        return primary
+
+    # 主路径过切、对照不过切 → 换到对照（即使列更少）
+    if pri_over and not alt_over and score_a >= score_p - 0.08:
+        logger.info(
+            "TSR 选用 %s（主路径过切，对照更稳: qual %.3f→%.3f）",
+            alt_label,
+            q_p,
+            q_a,
+        )
+        return alt
+
+    # 拒绝明显更粗的网格（大格假高覆盖是挤格主因）
+    if a_cols + 2 <= p_cols and not pri_under and not pri_over:
+        logger.info(
+            "TSR 保留 %s（拒绝更粗 %s: cols %d→%d）",
+            primary_label,
+            alt_label,
+            p_cols,
+            a_cols,
+        )
+        return primary
+    if alt_under and not pri_under and a_n < p_n * 0.7 and not pri_over:
+        logger.info(
+            "TSR 保留 %s（拒绝欠切 %s: cells %d→%d）",
+            primary_label,
+            alt_label,
+            p_n,
+            a_n,
+        )
+        return primary
+
+    # 结构质量分明显更高
+    if q_a > q_p + 0.04 and score_a >= score_p - 0.08:
+        logger.info(
+            "TSR 选用 %s（结构质量更优: %.3f→%.3f）",
+            alt_label,
+            q_p,
+            q_a,
+        )
+        return alt
+
+    # 覆盖率明显更优，且不是拿欠切换细切 / 过切
+    if score_a > score_p + 0.05 and not alt_under and not alt_over:
+        logger.info("TSR 选用 %s（覆盖率更优）", alt_label)
+        return alt
+
+    # 列更细且未过切：允许覆盖率略低
+    cov_slack = 0.10 if (hybrid or pri_under) else 0.05
+    if (
+        a_cols >= p_cols + 2
+        and not alt_over
+        and score_a >= score_p - cov_slack
+    ):
+        logger.info(
+            "TSR 选用 %s（列更细: %d→%d, cov %.3f→%.3f）",
+            alt_label,
+            p_cols,
+            a_cols,
+            score_p,
+            score_a,
+        )
+        return alt
+    if (
+        (hybrid or pri_under)
+        and a_cols > p_cols
+        and not alt_over
+        and score_a >= score_p - cov_slack
+    ):
+        logger.info(
+            "TSR 选用 %s（hybrid/欠切 列粒度: %d→%d）",
+            alt_label,
+            p_cols,
+            a_cols,
+        )
+        return alt
+    return primary
+
+
 def predict_cells_tsr(
     image: np.ndarray,
     *,
@@ -211,10 +352,16 @@ def predict_cells_tsr(
 
     Args:
         force_kind: None 时用 table_cls；也可强制 "wired" / "lineless"
-        text_boxes: 若提供，则在 cls=lineless 且线密度高、或覆盖率差时
-            额外跑 wired，按 OCR 覆盖率择优。
+        text_boxes: 若提供，则按覆盖率/列粒度在 wired↔lineless 间纠偏。
+            混合表（竖多横少）或欠切时会对称探测，避免锁死有线大格。
     """
-    from .tsr_refine import coverage_score, line_density_score
+    from .tsr_refine import (
+        coverage_score,
+        is_hybrid_line_table,
+        line_density_axes,
+        looks_fully_wired,
+        looks_undersegmented,
+    )
 
     cls_eng, wired, lineless = load_tsr_models()
     table_cls = table_cls or cls_eng
@@ -223,44 +370,99 @@ def predict_cells_tsr(
 
     infer_img, scale = _maybe_downscale(image)
     kind = (force_kind or _classify_table(table_cls, infer_img)).strip().lower()
-    dens = line_density_score(image)
+    if kind not in {"wired", "lineless"}:
+        kind = "lineless"
+    h_dens, v_dens = line_density_axes(image)
+    dens = h_dens + v_dens
+    hybrid = is_hybrid_line_table(h_dens, v_dens)
+    fully_wired = looks_fully_wired(h_dens, v_dens)
 
     if force_kind:
         engine = wired_engine if kind == "wired" else lineless_engine
-        logger.info("TSR 路径: %s (forced)", kind)
+        logger.info(
+            "TSR 路径: %s (forced), h=%.4f v=%.4f dens=%.4f hybrid=%s",
+            kind,
+            h_dens,
+            v_dens,
+            dens,
+            hybrid,
+        )
         return _predict_kind(engine, infer_img, scale, kind_label=kind)
 
     primary_kind = kind
-    # 分类为无线但线密度偏高 → 更可能是有线表被误判
-    prefer_wired_probe = primary_kind != "wired" and dens >= 0.010
+    # 仅当横竖都够密且非 hybrid 时，才额外探测 wired；最终仍按列粒度选型
+    prefer_wired_probe = primary_kind != "wired" and fully_wired and not hybrid
+
     if primary_kind == "wired":
-        logger.info("TSR 路径: wired (unet), dens=%.4f", dens)
+        logger.info(
+            "TSR 路径: wired (unet) primary, h=%.4f v=%.4f dens=%.4f hybrid=%s",
+            h_dens,
+            v_dens,
+            dens,
+            hybrid,
+        )
         cells = _predict_kind(wired_engine, infer_img, scale, kind_label="wired")
-        if text_boxes and coverage_score(cells, text_boxes) < 0.45:
-            alt = _predict_kind(lineless_engine, infer_img, scale, kind_label="lineless")
-            if coverage_score(alt, text_boxes) > coverage_score(cells, text_boxes) + 0.05:
-                logger.info("TSR 选用 lineless（覆盖率更优）")
-                return alt
+        boxes = text_boxes or []
+        cov = coverage_score(cells, boxes) if boxes else 1.0
+        underseg = bool(boxes) and looks_undersegmented(cells, boxes)
+        should_probe = bool(boxes) and (hybrid or underseg or cov < 0.45)
+        if should_probe:
+            alt = _predict_kind(
+                lineless_engine, infer_img, scale, kind_label="lineless"
+            )
+            chosen = _pick_finer_grid(
+                cells,
+                alt,
+                text_boxes,
+                primary_label="wired",
+                alt_label="lineless",
+                hybrid=hybrid or underseg,
+            )
+            logger.info(
+                "TSR 最终: %s (primary=wired hybrid=%s underseg=%s)",
+                "lineless" if chosen is alt else "wired",
+                hybrid,
+                underseg,
+            )
+            return chosen
+        logger.info(
+            "TSR 最终: wired (cells=%d cov=%.3f, 未探测 lineless)",
+            len(cells),
+            cov,
+        )
         return cells
 
-    logger.info("TSR 路径: lineless (lore), dens=%.4f", dens)
+    logger.info(
+        "TSR 路径: lineless (lore) primary, h=%.4f v=%.4f dens=%.4f hybrid=%s fully_wired=%s",
+        h_dens,
+        v_dens,
+        dens,
+        hybrid,
+        fully_wired,
+    )
     cells = _predict_kind(lineless_engine, infer_img, scale, kind_label="lineless")
-    if prefer_wired_probe or (text_boxes and coverage_score(cells, text_boxes) < 0.55):
+    boxes = text_boxes or []
+    cov = coverage_score(cells, boxes) if boxes else 1.0
+    underseg = bool(boxes) and looks_undersegmented(cells, boxes)
+    if prefer_wired_probe or (boxes and (cov < 0.55 or underseg)):
         alt = _predict_kind(wired_engine, infer_img, scale, kind_label="wired")
-        score_p = coverage_score(cells, text_boxes or [])
-        score_a = coverage_score(alt, text_boxes or [])
-        # 线密度高时偏 wired；否则看覆盖率
-        if prefer_wired_probe and (score_a >= score_p - 0.02 or len(alt) > len(cells) * 0.6):
-            if score_a >= score_p - 0.05:
-                logger.info(
-                    "TSR 选用 wired（线密度+覆盖: lineless=%.3f wired=%.3f）",
-                    score_p,
-                    score_a,
-                )
-                return alt
-        elif score_a > score_p + 0.05:
-            logger.info("TSR 选用 wired（覆盖率更优）")
-            return alt
+        # 一律走列粒度选型；禁止仅凭覆盖率把细切换成欠切大格
+        chosen = _pick_finer_grid(
+            cells,
+            alt,
+            text_boxes,
+            primary_label="lineless",
+            alt_label="wired",
+            hybrid=hybrid or underseg,
+        )
+        logger.info(
+            "TSR 最终: %s (primary=lineless hybrid=%s underseg=%s)",
+            "wired" if chosen is alt else "lineless",
+            hybrid,
+            underseg,
+        )
+        return chosen
+    logger.info("TSR 最终: lineless (cells=%d cov=%.3f)", len(cells), cov)
     return cells
 
 
@@ -292,3 +494,107 @@ def cells_to_debug_table(cells: List[Dict[str, Any]]) -> Any:
         col_seps=[],
         confidence=1.0,
     )
+
+
+def _cells_to_draw_list(
+    cells: Optional[List[Dict[str, Any]]] = None,
+    tables: Optional[List[Any]] = None,
+) -> List[Dict[str, Any]]:
+    if cells:
+        return list(cells)
+    out: List[Dict[str, Any]] = []
+    for table in tables or []:
+        out.extend(getattr(table, "cells", None) or [])
+    return out
+
+
+def render_table_vis(
+    image: np.ndarray,
+    cells: Optional[List[Dict[str, Any]]] = None,
+    tables: Optional[List[Any]] = None,
+    *,
+    colorful: bool = True,
+) -> np.ndarray:
+    """TableStructureRec VisTable / vis_table：在原图上描单元格框线。
+
+    colorful=True 时每个单元格用随机颜色描边（库内 vis_table）；
+    False 时统一蓝色（VisTable.draw_polylines）。
+    """
+    import random
+
+    draw_cells = _cells_to_draw_list(cells, tables)
+    if image.ndim == 2:
+        canvas = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    else:
+        canvas = image.copy()
+
+    for i, cell in enumerate(draw_cells):
+        poly = np.asarray(cell["polygon"], dtype=np.float64).reshape(-1, 2)
+        poly_i = np.round(poly).astype(np.int32)
+        if colorful:
+            rng = random.Random(i * 9973 + 17)
+            color = (rng.randint(32, 255), rng.randint(32, 255), rng.randint(32, 255))
+        else:
+            color = (255, 0, 0)  # BGR 蓝，对齐 VisTable
+        cv2.polylines(canvas, [poly_i], True, color, 2)
+        if colorful:
+            cv2.putText(
+                canvas,
+                str(i),
+                (int(poly_i[0, 0]), int(poly_i[0, 1])),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 0, 255),
+                1,
+                cv2.LINE_AA,
+            )
+    return canvas
+
+
+def render_table_vis_logic(
+    image: np.ndarray,
+    cells: Optional[List[Dict[str, Any]]] = None,
+    tables: Optional[List[Any]] = None,
+) -> np.ndarray:
+    """对齐 TableStructureRec VisTable.plot_rec_box_with_logic_info：框 + row/col 标注。"""
+    draw_cells = _cells_to_draw_list(cells, tables)
+    if image.ndim == 2:
+        canvas = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    else:
+        canvas = image.copy()
+    canvas = cv2.copyMakeBorder(
+        canvas, 0, 0, 0, 100, cv2.BORDER_CONSTANT, value=[255, 255, 255]
+    )
+
+    for cell in draw_cells:
+        poly = np.asarray(cell["polygon"], dtype=np.float64).reshape(-1, 2)
+        x0 = int(round(float(poly[:, 0].min())))
+        y0 = int(round(float(poly[:, 1].min())))
+        x1 = int(round(float(poly[:, 0].max())))
+        y1 = int(round(float(poly[:, 1].max())))
+        cv2.rectangle(canvas, (x0, y0), (x1, y1), (0, 0, 255), 1)
+        rs = cell.get("row_start", 0)
+        re = cell.get("row_end", rs)
+        cs = cell.get("col_start", 0)
+        ce = cell.get("col_end", cs)
+        cv2.putText(
+            canvas,
+            f"row: {rs}-{re}",
+            (x0 + 3, y0 + 12),
+            cv2.FONT_HERSHEY_PLAIN,
+            0.9,
+            (0, 0, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            f"col: {cs}-{ce}",
+            (x0 + 3, y0 + 24),
+            cv2.FONT_HERSHEY_PLAIN,
+            0.9,
+            (0, 0, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    return canvas
