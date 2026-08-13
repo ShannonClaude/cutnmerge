@@ -1807,6 +1807,234 @@ def refine_tsr_cells_light(
     return dedupe_overlapping_cells(cells)
 
 
+_MONOMER_PARENT_RE = re.compile(r"单体\s*[\[［]")
+_MONOMER_LEFT_ANCHOR_RE = re.compile(r"聚合物")
+_MONOMER_RIGHT_ANCHOR_RE = re.compile(
+    r"(含有比率|酸当量|双键当量|含有率)"
+)
+
+
+def _cell_label_text(
+    cell: Dict[str, Any], boxes: Sequence[Dict[str, Any]]
+) -> str:
+    parts = [str(tb.get("text") or "") for tb in _texts_in_cell(cell, boxes)]
+    own = str(cell.get("text") or "")
+    if own:
+        parts.append(own)
+    return re.sub(r"\s+", "", "".join(parts))
+
+
+def _set_cell_cols(
+    cell: Dict[str, Any],
+    cs: int,
+    ce: int,
+    col_seps: Sequence[float],
+) -> None:
+    """更新逻辑列并按 col_seps 重写多边形 x 范围（保留原 y）。"""
+    cs = int(cs)
+    ce = int(ce)
+    if ce < cs:
+        return
+    cell["col_start"] = cs
+    cell["col_end"] = ce
+    _refresh_spans(cell)
+    if len(col_seps) > ce + 1:
+        x1 = float(col_seps[cs])
+        x2 = float(col_seps[ce + 1])
+        _, y1, _, y2 = _cell_bbox(cell)
+        cell["polygon"] = _rebuild_polygon(x1, y1, x2, y2)
+
+
+def repair_monomer_parent_spans(
+    cells: List[Dict[str, Any]],
+    boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    按子表分段，把过窄/错位的「单体[…]」父格对齐到同段单体子列并集。
+
+    只改已有格子的 col_start/col_end 与多边形，不插列、不融合框线。
+    用于轻量 TSR 路径修复 P98 类分段异形表。
+    """
+    if not cells:
+        return cells
+    boxes = list(boxes) if boxes else []
+    if not boxes:
+        return cells
+
+    from .segments import find_row_segments
+
+    work = [dict(c) for c in cells]
+    row_seps, col_seps = _derive_seps(work)
+    if len(col_seps) < 3:
+        return work
+
+    segments = find_row_segments(work, text_boxes=boxes)
+    if not segments:
+        return work
+
+    removed: set = set()
+    changed = 0
+
+    for seg_lo, seg_hi in segments:
+        seg_cells = [
+            c
+            for c in work
+            if id(c) not in removed
+            and seg_lo <= int(c["row_start"]) <= seg_hi
+        ]
+        if not seg_cells:
+            continue
+
+        parents = [
+            c
+            for c in seg_cells
+            if _MONOMER_PARENT_RE.search(_cell_label_text(c, boxes))
+        ]
+        if not parents:
+            continue
+        # 取段内最靠上的单体父格
+        parent = min(
+            parents,
+            key=lambda c: (int(c["row_start"]), int(c["col_start"])),
+        )
+        prs = int(parent["row_start"])
+        pre = int(parent["row_end"])
+
+        left_anchor_ce = -1
+        right_anchor_cs = 10**9
+        for c in seg_cells:
+            label = _cell_label_text(c, boxes)
+            if not label:
+                continue
+            if _MONOMER_LEFT_ANCHOR_RE.search(label):
+                left_anchor_ce = max(left_anchor_ce, int(c["col_end"]))
+            if _MONOMER_RIGHT_ANCHOR_RE.search(label):
+                right_anchor_cs = min(right_anchor_cs, int(c["col_start"]))
+
+        if left_anchor_ce < 0 or right_anchor_cs >= 10**9:
+            continue
+        if right_anchor_cs <= left_anchor_ce + 1:
+            continue
+
+        band_lo = left_anchor_ce + 1
+        band_hi = right_anchor_cs - 1
+
+        # 子表头行：父格下一行（多级表头）
+        child_row = pre + 1
+        if child_row > seg_hi:
+            child_row = prs + 1
+        children = [
+            c
+            for c in seg_cells
+            if int(c["row_start"]) == child_row
+            and int(c["col_end"]) >= band_lo
+            and int(c["col_start"]) <= band_hi
+            and c is not parent
+            and max(int(c.get("row_span") or 1), 1) == 1
+        ]
+
+        # 表体行：段内第一个「非表头」行上的中间带格子
+        body_rows = sorted(
+            {
+                int(c["row_start"])
+                for c in seg_cells
+                if int(c["row_start"]) == int(c["row_end"])
+                and int(c["row_start"]) > child_row
+            }
+        )
+        body_cells: List[Dict[str, Any]] = []
+        for br in body_rows:
+            cand = [
+                c
+                for c in seg_cells
+                if int(c["row_start"]) == br == int(c["row_end"])
+                and int(c["col_end"]) >= band_lo
+                and int(c["col_start"]) <= band_hi
+            ]
+            # 至少两格才像单体数据带
+            if len(cand) >= 2:
+                body_cells = cand
+                break
+
+        span_cells = children if len(children) >= 2 else body_cells
+        if len(span_cells) < 2:
+            continue
+
+        target_cs = min(int(c["col_start"]) for c in span_cells)
+        target_ce = max(int(c["col_end"]) for c in span_cells)
+        target_cs = max(target_cs, band_lo)
+        target_ce = min(target_ce, band_hi)
+        if target_ce < target_cs:
+            continue
+
+        old_cs, old_ce = int(parent["col_start"]), int(parent["col_end"])
+        if (old_cs, old_ce) != (target_cs, target_ce):
+            _set_cell_cols(parent, target_cs, target_ce, col_seps)
+            changed += 1
+            logger.info(
+                "repair_monomer_parent_spans: seg[%d,%d] 单体 %d-%d → %d-%d",
+                seg_lo,
+                seg_hi,
+                old_cs,
+                old_ce,
+                target_cs,
+                target_ce,
+            )
+
+        # 去掉父行上落在新父格内部的空壳占位格
+        for c in list(seg_cells):
+            if c is parent or id(c) in removed:
+                continue
+            if int(c["row_start"]) != prs:
+                continue
+            if int(c["col_start"]) >= target_cs and int(c["col_end"]) <= target_ce:
+                label = _cell_label_text(c, boxes)
+                if not label.strip():
+                    removed.add(id(c))
+                    changed += 1
+
+        # 收缩与同级兄弟逻辑重叠的过宽格（不主动制造空洞微列）
+        for row_cells in (children, body_cells):
+            ordered = sorted(
+                [c for c in row_cells if id(c) not in removed],
+                key=lambda c: int(c["col_start"]),
+            )
+            for i, c in enumerate(ordered):
+                cs, ce = int(c["col_start"]), int(c["col_end"])
+                if ce <= cs:
+                    continue
+                nxt = None
+                for o in ordered[i + 1 :]:
+                    if int(o["col_start"]) > cs:
+                        nxt = o
+                        break
+                if nxt is None:
+                    if ce > target_ce:
+                        _set_cell_cols(c, cs, target_ce, col_seps)
+                        changed += 1
+                    continue
+                ncs = int(nxt["col_start"])
+                if ce >= ncs:
+                    new_ce = ncs - 1
+                    if new_ce >= cs:
+                        _set_cell_cols(c, cs, new_ce, col_seps)
+                        changed += 1
+                        logger.info(
+                            "repair_monomer_parent_spans: shrink overlap "
+                            "cols %d-%d → %d-%d",
+                            cs,
+                            ce,
+                            cs,
+                            new_ce,
+                        )
+
+    if removed:
+        work = [c for c in work if id(c) not in removed]
+    if changed:
+        work = dedupe_overlapping_cells(work)
+    return work
+
+
 def refine_tsr_cells(
     cells: List[Dict[str, Any]],
     boxes: Sequence[Dict[str, Any]],

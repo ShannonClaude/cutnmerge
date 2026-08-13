@@ -41,6 +41,7 @@ from .tsr_refine import (
     reconstruct_header_cells,
     refine_tsr_cells,
     refine_tsr_cells_light,
+    repair_monomer_parent_spans,
 )
 
 logger = logging.getLogger(__name__)
@@ -348,7 +349,8 @@ def _extract_via_tsr(
                 cells = fuse_tsr_with_lines(cells, line_tables)
         else:
             cells = refine_tsr_cells_light(cells)
-            logger.info("TSR-first 轻量路径：跳过激进 refine / 线融合")
+            cells = repair_monomer_parent_spans(cells, text_boxes)
+            logger.info("TSR-first 轻量路径：跳过激进 refine / 线融合；已尝试单体父格对齐")
 
     cov = coverage_score(cells, text_boxes) if cells else 0.0
     # 覆盖率偏低或格子过少时回退（竖排表头等场景常出现「有格但几乎填不进」）
