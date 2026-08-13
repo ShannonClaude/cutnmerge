@@ -18,6 +18,7 @@ from .formatter import (
     format_free_texts,
     split_cells_into_subtables,
 )
+from .label_patterns import is_index_column
 
 logger = logging.getLogger(__name__)
 
@@ -300,6 +301,9 @@ def drop_evidenceless_columns(cells: List[Dict[str, Any]], *, narrow_ratio: floa
             continue
         texts = [str(c.get("text") or "").strip() for c in covered_cells]
         any_text = any(texts)
+        # 整列多为行序号（如 16–30）：窄但仍是真实列，保留
+        if is_index_column(texts):
+            continue
         only_frag = (not any_text) or all(_is_frag(t) for t in texts if t) or (
             any_text and all(_is_frag(t) for t in texts)
         )
