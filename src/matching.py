@@ -22,6 +22,7 @@ from .label_patterns import (
     are_independent_row_labels,
     extract_independent_labels_from_joined,
     fix_iii_ocr,
+    is_independent_row_label,
     split_value_grade,
 )
 
@@ -78,37 +79,154 @@ def _looks_like_repeated_header_units(text: str) -> bool:
         if _sk_prefix(m.group(1)) != first:
             return False
     return True
-# 行标签粘连：比较例1 86 Bk-1 → 切成多段
+# 行标签粘连：比较例1 86 Bk-1 → 切成多段（须配合多列几何门槛，禁止裸剥首位）
+_ROW_LABEL_HEAD_RE = re.compile(
+    r"^(实[施試]例|実[施試]例|実施例|比較例|比较例|合成例|对照例|参考例)"
+)
+_TRAILING_CODE_RE = re.compile(
+    r"([A-Za-z]{1,8}(?:[-－.]\d+[A-Za-z0-9:]*)?)$"
+)
+
+
 def _split_generic_row_label(tb_text: str) -> Optional[List[str]]:
     """
-    通用数字粘连切分（不依赖比较例/实施例等词表）。
+    窄域粘连切分：仅处理「行标 + 数字串 [+ 尾缀码]」。
 
-    - 若至少两个数字块：按第一个数字块结束切成两段
-    - 若只有一个数字块且长度足够：尝试把数字拆成两段（适配无空格粘连）
+    不在此函数内裸剥「实施例10」——调用方必须提供 n_cols>=2 的几何证据，
+    且优先用 cut_fracs（列界）决定数字切开位置。
+    """
+    return _parse_sticky_row_parts(tb_text, n_cols=2, cut_fracs=None)
+
+
+def _digit_split_at_frac(digits: str, frac: float) -> int:
+    """把 [0,1] 比例映射到数字串切开位置，至少留 1 位给两侧（若长度允许）。"""
+    if not digits:
+        return 0
+    n = len(digits)
+    if n <= 1:
+        return 0
+    idx = int(round(max(0.0, min(1.0, frac)) * n))
+    idx = max(1, min(n - 1, idx))
+    return idx
+
+
+def _best_digit_split_for_label(
+    head: str,
+    digits: str,
+    *,
+    local_frac: Optional[float] = None,
+) -> Optional[int]:
+    """
+    在数字串上选切开点：左侧须构成独立行标，右侧优先 2–3 位组合物编号。
+    """
+    if len(digits) < 2:
+        return None
+    ideal = (
+        _digit_split_at_frac(digits, local_frac)
+        if local_frac is not None
+        else None
+    )
+    scored: List[Tuple[int, int]] = []
+    for split_at in range(1, len(digits)):
+        left_d = digits[:split_at]
+        right_d = digits[split_at:]
+        label = f"{head}{left_d}"
+        if not is_independent_row_label(label):
+            continue
+        score = 0
+        if len(right_d) in (2, 3):
+            score += 10
+        elif len(right_d) == 1:
+            score -= 2
+        if len(left_d) <= 2:
+            score += 3
+        if right_d.startswith("0") and len(right_d) > 1:
+            score -= 6
+        if ideal is not None:
+            score -= abs(split_at - ideal)
+        scored.append((score, split_at))
+    if not scored:
+        return None
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return scored[0][1]
+
+
+def _parse_sticky_row_parts(
+    tb_text: str,
+    *,
+    n_cols: int,
+    cut_fracs: Optional[Sequence[float]] = None,
+) -> Optional[List[str]]:
+    """
+    解析粘连行首。
+
+    - n_cols>=3 且有尾缀码：比较例 186Bk-1 → [比较例 1, 86, Bk-1]
+    - n_cols>=2 且有尾缀码：比较例287Bk-2 → [比较例 2, 87, Bk-2] 或两段
+    - n_cols==2 无尾缀：比较例893 → [比较例 8, 93]
     """
     t = (tb_text or "").strip()
-    if not t:
+    if not t or n_cols < 2:
         return None
     t = re.sub(r"\s+", " ", t)
-    digits = list(re.finditer(r"\d+", t))
-    if len(digits) >= 2:
-        part1 = t[: digits[0].end()].strip()
-        part2 = t[digits[0].end() :].strip()
-        return [part1, part2] if part1 and part2 else None
+    hm = _ROW_LABEL_HEAD_RE.match(t)
+    if not hm:
+        return None
+    head = hm.group(1)
+    rest = t[hm.end() :].strip()
+    if not rest:
+        return None
 
-    if len(digits) == 1:
-        only = digits[0]
-        prefix = t[: only.start()].strip()
-        digits_str = only.group(0)
-        rest = t[only.end() :].strip()
-        if prefix and len(digits_str) >= 3:
-            for split_at in (1, 2):
-                if split_at >= len(digits_str):
-                    continue
-                part1 = (prefix + digits_str[:split_at]).strip()
-                part2 = (digits_str[split_at:] + ((" " + rest) if rest else "")).strip()
-                if part1 and part2:
-                    return [part1, part2]
+    code = ""
+    compact_rest = rest.replace(" ", "")
+    cm = _TRAILING_CODE_RE.search(compact_rest)
+    # 尾缀码须紧跟在数字后：避免把普通英文句子当码
+    if cm and re.search(r"\d" + re.escape(cm.group(1)) + r"$", compact_rest):
+        code = cm.group(1)
+        body = compact_rest[: -len(code)]
+    else:
+        body = compact_rest
+    body = body.strip()
+    dm = re.search(r"(\d+)$", body) if body else None
+    if not dm:
+        return None
+    digits = dm.group(1)
+    prefix_body = body[: -len(digits)]
+    if prefix_body:
+        return None
+
+    fracs = list(cut_fracs) if cut_fracs else []
+
+    def _local_frac_in_digits() -> Optional[float]:
+        if not fracs:
+            return None
+        full = head + digits + (code or "")
+        d0 = len(head) / max(len(full), 1)
+        d1 = (len(head) + len(digits)) / max(len(full), 1)
+        return (fracs[0] - d0) / max(d1 - d0, 1e-6)
+
+    if code and n_cols >= 3:
+        if len(digits) < 2:
+            return None
+        split_at = _best_digit_split_for_label(
+            head, digits, local_frac=_local_frac_in_digits()
+        )
+        if split_at is None:
+            return None
+        left_d, right_d = digits[:split_at], digits[split_at:]
+        return [f"{head} {left_d}".strip(), right_d, code]
+
+    if code and n_cols == 2:
+        return [f"{head} {digits}".strip(), code]
+
+    if not code and n_cols >= 2 and len(digits) >= 2:
+        split_at = _best_digit_split_for_label(
+            head, digits, local_frac=_local_frac_in_digits()
+        )
+        if split_at is None:
+            return None
+        left_d, right_d = digits[:split_at], digits[split_at:]
+        return [f"{head} {left_d}".strip(), right_d]
+
     return None
 
 
@@ -464,44 +582,134 @@ def _col_index_for_slot(slot: Tuple[float, float], col_seps: Sequence[float]) ->
     return -1
 
 
+def _overlapping_atomic_cols(
+    tb: Dict[str, Any],
+    cells: List[Dict[str, Any]],
+) -> List[Tuple[int, Tuple[float, float, float, float]]]:
+    """同一数据行上与文本框有足够 X 重叠的原子列（按 x 排序）。"""
+    tb_box = _text_bbox(tb)
+    text_w = max(tb_box[2] - tb_box[0], 1.0)
+    cy = (tb_box[1] + tb_box[3]) / 2.0
+    out: List[Tuple[int, Tuple[float, float, float, float]]] = []
+    for i, cell in enumerate(cells):
+        if max(int(cell.get("row_span") or 1), 1) > 1:
+            continue
+        if max(int(cell.get("col_span") or 1), 1) > 1:
+            continue
+        cb = _cell_bbox(cell)
+        cell_cy = (cb[1] + cb[3]) / 2.0
+        row_tol = max(12.0, (cb[3] - cb[1]) * 0.55)
+        if abs(cell_cy - cy) > row_tol:
+            continue
+        xo = _x_overlap(tb_box, cb)
+        if xo / text_w < 0.12:
+            continue
+        cell_w = max(cb[2] - cb[0], 1.0)
+        if xo / cell_w < 0.35:
+            continue
+        out.append((i, cb))
+    out.sort(key=lambda t: t[1][0])
+    return out
+
+
 def _split_sticky_row_label(
     tb: Dict[str, Any],
+    cells: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """
-    将「比较例1 86 Bk-1」类粘连框按空白/紧凑模式切成多段，并按宽度比例切分 polygon。
+    将「比较例1 86 Bk-1」类粘连框切成多段。
+
+    必须有几何证据：文本框重叠 ≥2 个原子列；有尾缀码时允许 3 段。
+    polygon 优先贴列界，避免仅按字符数比例切。
     """
     text = str(tb.get("text") or "").strip()
     if not text:
         return None
 
-    parts: List[str] = []
-    parts = _split_generic_row_label(text) or []
+    overlaps: List[Tuple[int, Tuple[float, float, float, float]]] = []
+    if cells:
+        overlaps = _overlapping_atomic_cols(tb, cells)
+    if len(overlaps) < 2:
+        return None
+
+    tb_box = _text_bbox(tb)
+    text_w = max(tb_box[2] - tb_box[0], 1.0)
+    cut_fracs = [
+        (overlaps[j][1][2] - tb_box[0]) / text_w for j in range(len(overlaps) - 1)
+    ]
+    n_cols = len(overlaps)
+    parts = _parse_sticky_row_parts(text, n_cols=n_cols, cut_fracs=cut_fracs)
+    if not parts or len(parts) < 2:
+        # 解析段数可少于重叠列（例如只跨 2 列有码）；仍要求段数>=2
+        if n_cols >= 3:
+            parts = _parse_sticky_row_parts(text, n_cols=3, cut_fracs=cut_fracs)
+        if not parts or len(parts) < 2:
+            parts = _parse_sticky_row_parts(text, n_cols=2, cut_fracs=cut_fracs)
     if not parts or len(parts) < 2:
         return None
 
-    parts = [p for p in parts if p]
-    if len(parts) < 2:
+    # 尾缀码门槛：3 段必须带码；2 段可以是「行标+数字|数字」或「行标+数字|码」
+    if len(parts) >= 3 and not _TRAILING_CODE_RE.search(parts[-1].replace(" ", "")):
         return None
 
-    x1, y1, x2, y2 = _text_bbox(tb)
-    width = max(x2 - x1, 1.0)
-    weights = [max(len(p), 1) for p in parts]
-    total_w = float(sum(weights))
+    # 若段数与重叠列数不一致，取前 min 列贴列界；多余段并入最后一列
+    use_n = min(len(parts), len(overlaps))
+    if use_n < 2:
+        return None
+    if len(parts) > use_n:
+        parts = parts[: use_n - 1] + [" ".join(parts[use_n - 1 :]).strip()]
+
+    x1, y1, x2, y2 = tb_box
     pieces: List[Dict[str, Any]] = []
-    cursor = x1
     for i, part in enumerate(parts):
-        seg_w = width * (weights[i] / total_w)
-        right = x2 if i == len(parts) - 1 else cursor + seg_w
+        if not part:
+            continue
+        if i < len(overlaps):
+            cb = overlaps[i][1]
+            xa = max(x1, cb[0])
+            xb = min(x2, cb[2])
+            if xb <= xa:
+                xa, xb = cb[0], cb[2]
+        else:
+            # 不应发生
+            xa, xb = x1, x2
         piece = dict(tb)
         piece["text"] = part
         piece["polygon"] = np.array(
-            [[cursor, y1], [right, y1], [right, y2], [cursor, y2]],
+            [[xa, y1], [xb, y1], [xb, y2], [xa, y2]],
             dtype=np.float64,
         )
-        piece["top_left"] = (cursor, y1)
+        piece["top_left"] = (xa, y1)
         pieces.append(piece)
-        cursor = right
-    return pieces
+    return pieces if len(pieces) >= 2 else None
+
+
+def _snap_cuts_inside_digit_run(text: str, cuts: List[int]) -> List[int]:
+    """
+    若切点落在连续数字串内部，保留（这正是 186→1|86 所需）；
+    若切点紧贴数字串边界外 1 字符的非数字空隙，吸附到数字边界。
+    """
+    if not text or len(cuts) < 3:
+        return cuts
+    out = list(cuts)
+    digit_spans = [(m.start(), m.end()) for m in re.finditer(r"\d+", text)]
+    for i in range(1, len(out) - 1):
+        c = out[i]
+        for a, b in digit_spans:
+            if a < c < b:
+                # 已在数字内：按列界保留
+                break
+            if c == a or c == b:
+                break
+            # 切点落在数字前/后 1 格的空白：吸到边界（不把 CJK 切开）
+            if a - 1 <= c < a and text[a:b]:
+                out[i] = a
+            elif b < c <= b + 1:
+                out[i] = b
+    for i in range(1, len(out)):
+        if out[i] < out[i - 1]:
+            out[i] = out[i - 1]
+    return out
 
 
 def _split_breaks_paired_marks(text: str, cuts: Sequence[int]) -> bool:
@@ -530,37 +738,44 @@ def _geometric_multi_col_split(
 
     tb_box = _text_bbox(tb)
     text_w = max(tb_box[2] - tb_box[0], 1.0)
-    cy = (tb_box[1] + tb_box[3]) / 2.0
-
-    candidates: List[Tuple[int, float, Tuple[float, float, float, float]]] = []
-    for i, cell in enumerate(cells):
-        if max(int(cell.get("row_span") or 1), 1) > 1:
-            continue
-        if max(int(cell.get("col_span") or 1), 1) > 1:
-            continue
-        cb = _cell_bbox(cell)
-        cell_cy = (cb[1] + cb[3]) / 2.0
-        row_tol = max(12.0, (cb[3] - cb[1]) * 0.55)
-        if abs(cell_cy - cy) > row_tol:
-            continue
-        xo = _x_overlap(tb_box, cb)
-        if xo / text_w < 0.12:
-            continue
-        cell_w = max(cb[2] - cb[0], 1.0)
-        if xo / cell_w < 0.35:
-            continue
-        candidates.append((i, xo, cb))
-
-    if len(candidates) < 2:
+    overlaps = _overlapping_atomic_cols(tb, cells)
+    if len(overlaps) < 2:
         return False
 
-    candidates.sort(key=lambda t: t[2][0])
-    # 文本须明显宽于单列均值
+    candidates = [(i, 0.0, cb) for i, cb in overlaps]
     mean_cw = float(np.mean([c[2][2] - c[2][0] for c in candidates]))
     if text_w < 1.35 * mean_cw:
         return False
 
-    # 按列边界比例切字符
+    # sticky 可解析时优先用解析结果作为各列文本，polygon 仍贴列界
+    cut_fracs = [
+        (candidates[j][2][2] - tb_box[0]) / text_w for j in range(len(candidates) - 1)
+    ]
+    sticky_parts = _parse_sticky_row_parts(
+        text, n_cols=len(candidates), cut_fracs=cut_fracs
+    )
+    if sticky_parts and len(sticky_parts) == len(candidates):
+        assigned = False
+        for si, (ci, _, cb) in enumerate(candidates):
+            part = sticky_parts[si].strip()
+            if not part:
+                continue
+            piece = dict(tb)
+            piece["text"] = part
+            xa = max(tb_box[0], cb[0])
+            xb = min(tb_box[2], cb[2])
+            if xb <= xa:
+                xa, xb = cb[0], cb[2]
+            piece["polygon"] = np.array(
+                [[xa, tb_box[1]], [xb, tb_box[1]], [xb, tb_box[3]], [xa, tb_box[3]]],
+                dtype=np.float64,
+            )
+            piece["top_left"] = (xa, tb_box[1])
+            cells[ci]["texts"].append(piece)
+            assigned = True
+        return assigned
+
+    # 按列边界比例切字符；切点落在数字串内时保留（186→1|86）
     cuts = [0]
     for j in range(len(candidates) - 1):
         boundary = candidates[j][2][2]
@@ -570,6 +785,7 @@ def _geometric_multi_col_split(
     for i in range(1, len(cuts)):
         if cuts[i] < cuts[i - 1]:
             cuts[i] = cuts[i - 1]
+    cuts = _snap_cuts_inside_digit_run(text, cuts)
 
     if _split_breaks_paired_marks(text, cuts):
         return False
@@ -855,9 +1071,10 @@ def assign_texts_to_cells(
     _rebuild_rects()
 
     for tb in text_boxes:
-        # 预切分已关闭：避免“无证据即切”把如表题/数字拆碎。
-        # 跨格切分仅通过 _try_split_across_cells()（需要 binary/墨迹沟/几何校验）进行。
-        for piece_tb in [tb]:
+        # 粘连行标预切：仅当重叠 ≥2 原子列时触发（有几何证据）。
+        sticky_pieces = _split_sticky_row_label(tb, cells)
+        piece_list = sticky_pieces if sticky_pieces else [tb]
+        for piece_tb in piece_list:
             text_shape = polygon_to_shapely(piece_tb["polygon"])
             centroid = text_shape.centroid
             center_pt = Point(centroid.x, centroid.y)
@@ -865,7 +1082,8 @@ def assign_texts_to_cells(
             n_before = len(cells)
             # ---- 跨格切分 ----
             split_ok = False
-            if split_cross_cell:
+            if split_cross_cell and sticky_pieces is None:
+                # sticky 已切开则不再二次跨列切，避免拆碎
                 split_ok = _try_split_across_cells(
                     piece_tb,
                     cells,
