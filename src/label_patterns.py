@@ -53,6 +53,33 @@ def are_independent_row_labels(texts: Sequence[str]) -> bool:
     return all(is_independent_row_label(t) for t in cleaned)
 
 
+_ROW_INDEX_RE = re.compile(r"^\d{1,3}$")
+
+
+def is_row_index_text(text: str) -> bool:
+    """单格是否像表体行序号（1–3 位纯数字）。"""
+    t = normalize_spaces(text)
+    return bool(t) and bool(_ROW_INDEX_RE.fullmatch(t))
+
+
+def is_index_column(
+    texts: Sequence[str],
+    *,
+    min_nonempty: int = 3,
+    min_ratio: float = 0.8,
+) -> bool:
+    """
+    列级判定：多数非空格为行序号 → 不应当「碎片幽灵列」删除/合并。
+
+    用于 drop_evidenceless_columns / merge_ghost_columns，避免窄序号列被吃掉。
+    """
+    nonempty = [str(t).strip() for t in texts if str(t or "").strip()]
+    if len(nonempty) < min_nonempty:
+        return False
+    n_idx = sum(1 for t in nonempty if is_row_index_text(t))
+    return (n_idx / len(nonempty)) >= min_ratio
+
+
 def split_value_grade(text: str) -> Optional[Tuple[str, str]]:
     """
     将「40A」「40 A」「100A+」拆成 (数值, 等级)。

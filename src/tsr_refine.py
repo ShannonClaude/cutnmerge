@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from .label_patterns import are_independent_row_labels
+from .label_patterns import are_independent_row_labels, is_index_column
 
 logger = logging.getLogger(__name__)
 
@@ -302,6 +302,10 @@ def merge_ghost_columns(
     for c in range(n_cols):
         narrow = widths[c] < min_width_ratio * median_w
         if not narrow:
+            ghost.append(False)
+            continue
+        # 整列多为行序号：保留（与 html drop_evidenceless 一致）
+        if is_index_column(col_texts[c]):
             ghost.append(False)
             continue
         if hits[c] == 0:
