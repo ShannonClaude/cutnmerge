@@ -379,9 +379,11 @@ def _extract_via_tsr(
         return {"html": free, "md": free}, []
 
     binary = binarize_otsu(image)
+    # 轻量路径也开跨列切分：只切 OCR 文本到已有原子列，不插线/不补列。
+    # col_seps / v_separators 仅激进路径提供，避免 _explode_colspan 改合并表头拓扑。
     col_seps = None
     v_separators = None
-    split_cross = False
+    split_cross = True
 
     if tsr_aggressive:
         from .grid_evidence import apply_grid_evidence_merge
@@ -403,7 +405,6 @@ def _extract_via_tsr(
                 key=lambda t: float(getattr(t, "confidence", 0.0) or 0.0),
             )
             v_separators = getattr(best, "v_separators", None)
-        split_cross = True
 
     cells, free_texts = assign_texts_to_cells(
         cells,
