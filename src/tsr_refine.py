@@ -677,8 +677,19 @@ def split_bad_colspans(
     return out
 
 
-def line_density_score(image: np.ndarray) -> float:
-    """粗略线密度：用于判断是否更像有线表。"""
+# 混合表：竖线明显、横线稀疏（专利实验表常见「有竖无线」）
+_HYBRID_V_MIN = 0.0035
+_HYBRID_H_MAX = 0.0045
+# 真正偏「全有线」时要求横线也够，不能只靠竖线把 dens 抬高
+_WIRED_H_MIN = 0.0040
+_WIRED_V_MIN = 0.0030
+# 欠切：格子相对 OCR 框过少（大格假高覆盖时仍能触发纠偏）
+_UNDERSEG_CELL_TO_BOX = 0.22
+_UNDERSEG_MIN_COLS_VS_BOXES = 40
+
+
+def line_density_axes(image: np.ndarray) -> Tuple[float, float]:
+    """返回 (h_dens, v_dens)：横/竖形态学开运算像素占比。"""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     binary = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 10
@@ -688,7 +699,123 @@ def line_density_score(image: np.ndarray) -> float:
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(h // 40, 10)))
     h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
     v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
-    return float(np.count_nonzero(h_lines) + np.count_nonzero(v_lines)) / float(h * w + 1)
+    area = float(h * w + 1)
+    return (
+        float(np.count_nonzero(h_lines)) / area,
+        float(np.count_nonzero(v_lines)) / area,
+    )
+
+
+def line_density_score(image: np.ndarray) -> float:
+    """粗略线密度（H+V 合计）；兼容旧调用。"""
+    h_dens, v_dens = line_density_axes(image)
+    return h_dens + v_dens
+
+
+def is_hybrid_line_table(h_dens: float, v_dens: float) -> bool:
+    """竖线多、横线少 → 混合表（有线 unet 易欠切列）。"""
+    if v_dens >= _HYBRID_V_MIN and h_dens <= _HYBRID_H_MAX:
+        return True
+    # 竖线显著多于横线（形态学横线常被文字抬高，用倍率兜底）
+    if v_dens >= _HYBRID_V_MIN and v_dens >= h_dens * 1.35:
+        return True
+    return False
+
+
+def looks_fully_wired(h_dens: float, v_dens: float) -> bool:
+    """横竖线都够密，才适合偏置到 wired。"""
+    return h_dens >= _WIRED_H_MIN and v_dens >= _WIRED_V_MIN
+
+
+def cell_grid_stats(cells: Sequence[Dict[str, Any]]) -> Tuple[int, int, int]:
+    """返回 (n_cols, n_rows, n_cells)。"""
+    if not cells:
+        return 0, 0, 0
+    row_seps, col_seps = _derive_seps(list(cells))
+    n_cols = max(0, len(col_seps) - 1)
+    n_rows = max(0, len(row_seps) - 1)
+    return n_cols, n_rows, len(cells)
+
+
+def looks_undersegmented(
+    cells: Sequence[Dict[str, Any]],
+    text_boxes: Sequence[Dict[str, Any]],
+) -> bool:
+    """格子相对 OCR 框过少，或中位格过宽 → 疑似欠切。"""
+    if not cells:
+        return True
+    n_boxes = len(text_boxes)
+    if not n_boxes:
+        return False
+    if len(cells) < max(8, int(n_boxes * _UNDERSEG_CELL_TO_BOX)):
+        return True
+    n_cols, _n_rows, _n = cell_grid_stats(cells)
+    if n_cols > 0 and n_cols < max(4, n_boxes // _UNDERSEG_MIN_COLS_VS_BOXES):
+        return True
+    widths = []
+    for c in cells:
+        x1, _y1, x2, _y2 = _cell_bbox(c)
+        widths.append(max(0.0, x2 - x1))
+    if widths and n_cols <= 14:
+        xs1 = [_cell_bbox(c)[0] for c in cells]
+        xs2 = [_cell_bbox(c)[2] for c in cells]
+        table_w = max(xs2) - min(xs1) + 1e-6
+        if float(np.median(widths)) > 0.16 * table_w:
+            return True
+    return False
+
+
+def looks_oversegmented(
+    cells: Sequence[Dict[str, Any]],
+    text_boxes: Sequence[Dict[str, Any]],
+) -> bool:
+    """列/行/格数相对 OCR 过多 → 过切（后处理易塌缩）。"""
+    if not cells or not text_boxes:
+        return False
+    n_boxes = len(text_boxes)
+    n_cols, n_rows, n = cell_grid_stats(cells)
+    if n_cols >= 36:
+        return True
+    if n_rows >= 48 and n_rows > max(24, n_boxes // 6):
+        return True
+    if n > n_boxes * 1.05 and (n_cols >= 28 or n_rows >= 40):
+        return True
+    return False
+
+
+def structure_quality_score(
+    cells: Sequence[Dict[str, Any]],
+    text_boxes: Sequence[Dict[str, Any]],
+) -> float:
+    """
+    结构可用性粗分（0~1）：兼顾覆盖率、格数相对 OCR、列/行是否离谱。
+    用于 wired↔lineless 选型，避免「列最多但过切」赢过可后处理的网格。
+    """
+    if not cells:
+        return 0.0
+    boxes = list(text_boxes or [])
+    n_boxes = max(len(boxes), 1)
+    n_cols, n_rows, n = cell_grid_stats(cells)
+    cov = coverage_score(list(cells), boxes) if boxes else 0.0
+
+    ratio = float(n) / float(n_boxes)
+    # 峰值约 0.45~0.7（有空格/合并格的表）
+    cell_term = float(np.exp(-((ratio - 0.55) ** 2) / (2 * 0.28**2)))
+
+    # 专利表常见 8~20 列
+    col_term = float(np.exp(-((float(n_cols) - 14.0) ** 2) / (2 * 7.0**2)))
+    row_target = max(10.0, float(n_boxes) / 16.0)
+    row_term = float(
+        np.exp(-((float(n_rows) - row_target) ** 2) / (2 * (row_target * 0.7) ** 2))
+    )
+
+    score = 0.28 * cov + 0.32 * cell_term + 0.25 * col_term + 0.15 * row_term
+    if looks_undersegmented(cells, boxes):
+        score *= 0.72
+    if looks_oversegmented(cells, boxes):
+        score *= 0.55
+    return float(max(0.0, min(1.0, score)))
+
 
 
 def coverage_score(
@@ -1671,11 +1798,20 @@ def explode_header_colspans_by_body(
     return reconstruct_header_cells(cells, boxes)
 
 
+def refine_tsr_cells_light(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """轻量后处理：仅去重叠，保留 TSR 拓扑（row/colspan 与多边形）。"""
+    if not cells:
+        return cells
+    return dedupe_overlapping_cells(cells)
+
+
 def refine_tsr_cells(
     cells: List[Dict[str, Any]],
     boxes: Sequence[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """TSR 结构后处理流水线。"""
+    """激进 TSR 结构后处理：幽灵列合并、拆 rowspan/colspan、双簇补列。"""
     if not cells:
         return cells
     cells = dedupe_overlapping_cells(cells)

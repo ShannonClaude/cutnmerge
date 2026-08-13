@@ -3,10 +3,11 @@
 
 用法:
     python main.py
-        # 默认：tsr 结构，写出 data/output/<同名>.html
+        # 默认：tsr 结构，写出 data/output/<同名>.html + 划线可视化
     python main.py --image data/input/demo.png
     python main.py --structure lines --debug
     python main.py --format both
+    python main.py --no-vis
     python main.py --no-cache
     python main.py --refresh-cache
 """
@@ -89,6 +90,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="仅 tsr：覆盖率过低时回退框线路径（默认关闭）",
     )
     parser.add_argument(
+        "--tsr-kind",
+        type=str,
+        default="auto",
+        choices=["auto", "wired", "lineless"],
+        help="仅 tsr：强制结构引擎 auto（默认，含混合表纠偏）/ wired / lineless",
+    )
+    parser.add_argument(
         "--no-deskew",
         action="store_true",
         help="关闭前置图像倾斜校正（Deskew），默认开启",
@@ -127,16 +135,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="写出网格叠加图到 data/debug/<stem>_grid.png",
     )
     parser.add_argument(
-        "--no-reocr",
+        "--no-vis",
         action="store_true",
-        help="关闭可疑单元格二次 OCR（默认开启）",
+        help="关闭表格划线可视化（默认会写出 <stem>_table_vis.png / _table_vis_logic.png）",
+    )
+    reocr_group = parser.add_mutually_exclusive_group()
+    reocr_group.add_argument(
+        "--reocr",
+        dest="reocr",
+        action="store_true",
+        help="开启可疑单元格二次 OCR（覆盖 .env；默认见 REOCR，通常关闭）",
+    )
+    reocr_group.add_argument(
+        "--no-reocr",
+        dest="reocr",
+        action="store_false",
+        help="关闭可疑单元格二次 OCR（覆盖 .env）",
     )
     parser.add_argument(
         "--reocr-max-cells",
         type=int,
-        default=24,
-        help="每张图最多对多少个可疑单元格做拼图二次 OCR，默认 24",
+        default=None,
+        help="每张图最多对多少个可疑单元格做拼图二次 OCR（默认见 REOCR_MAX_CELLS）",
     )
+    tsr_group = parser.add_mutually_exclusive_group()
+    tsr_group.add_argument(
+        "--tsr-aggressive",
+        dest="tsr_aggressive",
+        action="store_true",
+        help="启用激进结构后处理（补列/重建表头/横切；覆盖 .env TSR_AGGRESSIVE）",
+    )
+    tsr_group.add_argument(
+        "--tsr-light",
+        dest="tsr_aggressive",
+        action="store_false",
+        help="TSR-first 轻量路径：信任库拓扑（默认；覆盖 .env）",
+    )
+    parser.set_defaults(reocr=None, tsr_aggressive=None)
     return parser.parse_args(argv)
 
 
@@ -198,11 +233,17 @@ def process_one(
     debug: bool,
     reocr: bool,
     reocr_max_cells: int,
+    tsr_kind: str = "auto",
+    tsr_aggressive: bool = False,
+    save_vis: bool = True,
     lore_pipe=None,
     ocr_engine=None,
 ) -> None:
     """处理单张图片并按 format 写入。"""
     print(f"[info] 处理图像: {image_path}")
+    force = None if (tsr_kind or "auto").lower() == "auto" else tsr_kind
+    # 划线图默认与首个文本输出同目录；无输出路径时用 data/output
+    vis_dir = out_specs[0][1].parent if out_specs else DEFAULT_OUTPUT_DIR
     result = extract_table_output(
         str(image_path),
         ioa_threshold=ioa_threshold,
@@ -220,6 +261,10 @@ def process_one(
         debug_stem=image_path.stem,
         reocr=reocr,
         reocr_max_cells=reocr_max_cells,
+        tsr_kind=force,
+        tsr_aggressive=tsr_aggressive,
+        save_vis=save_vis,
+        vis_dir=vis_dir,
     )
 
     for key, out_path in out_specs:
@@ -237,6 +282,20 @@ def process_one(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    from src.config import get_settings
+
+    settings = get_settings()
+    reocr = settings.reocr if args.reocr is None else bool(args.reocr)
+    reocr_max_cells = (
+        settings.reocr_max_cells
+        if args.reocr_max_cells is None
+        else int(args.reocr_max_cells)
+    )
+    tsr_aggressive = (
+        settings.tsr_aggressive
+        if args.tsr_aggressive is None
+        else bool(args.tsr_aggressive)
+    )
 
     if args.image:
         image_path = Path(args.image)
@@ -259,7 +318,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"[info] 共 {len(images)} 张图片待处理 "
-        f"(structure={args.structure}, format={args.format})"
+        f"(structure={args.structure}, tsr_kind={args.tsr_kind}, "
+        f"tsr_aggressive={tsr_aggressive}, reocr={reocr}, format={args.format})"
     )
 
     from src.models import load_ocr
@@ -296,8 +356,11 @@ def main(argv: list[str] | None = None) -> int:
                 fallback_lines=args.fallback_lines,
                 orientation=args.orientation,
                 debug=args.debug,
-                reocr=not args.no_reocr,
-                reocr_max_cells=args.reocr_max_cells,
+                reocr=reocr,
+                reocr_max_cells=reocr_max_cells,
+                tsr_kind=args.tsr_kind,
+                tsr_aggressive=tsr_aggressive,
+                save_vis=not args.no_vis,
                 lore_pipe=lore,
                 ocr_engine=ocr,
             )
