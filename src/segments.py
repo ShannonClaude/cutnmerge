@@ -139,6 +139,8 @@ def find_row_segments(
     prev_y_bot: Optional[float] = None
     is_first_row = True
     header_tokens: set = set()
+    # 本段是否已出现表体行：未出现前，禁止用「像表头」切开（避免多级子表头误切）
+    segment_seen_data = False
 
     for rs, y_top, y_bot, row_cells in row_meta:
         joined = _row_joined_text(
@@ -151,23 +153,34 @@ def find_row_segments(
                 should_split = True
             elif (not is_first_row) and _HEADER_CAPTION_RE.search(joined):
                 should_split = True
-            elif (not is_first_row) and _SECTION_HEADER_RE.search(joined):
+            elif (
+                segment_seen_data
+                and (not is_first_row)
+                and _SECTION_HEADER_RE.search(joined)
+            ):
+                # 表体后再遇「聚合物/单体[」才切；表头带内的子表头不切
                 if not _DATA_ROW_RE.search(joined):
                     should_split = True
             elif (
-                (not is_first_row)
+                segment_seen_data
+                and (not is_first_row)
                 and header_tokens
                 and len(toks) >= 2
                 and _jaccard(toks, header_tokens) >= _HEADER_JACCARD_THRESH
             ):
+                # 同上：Jaccard 重复表头仅在已见过表体后生效
                 should_split = True
 
         if should_split and seg_start is not None and seg_end is not None:
-            segments.append((seg_start, seg_end))
+            # 钳制终点，避免与新段起始行重叠（父格 rowspan 会把 seg_end 扩到 rs）
+            clamped_end = min(seg_end, rs - 1)
+            if clamped_end >= seg_start:
+                segments.append((seg_start, clamped_end))
             seg_start = None
             seg_end = None
             is_first_row = True
             header_tokens = set()
+            segment_seen_data = False
 
         if is_first_row:
             header_tokens = toks
@@ -176,6 +189,8 @@ def find_row_segments(
         # 也覆盖本行起点（row_end 可能小于后续行）
         if seg_end < rs:
             seg_end = rs
+        if _DATA_ROW_RE.search(joined):
+            segment_seen_data = True
         prev_y_bot = y_bot
         is_first_row = False
 
