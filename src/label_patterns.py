@@ -26,6 +26,23 @@ _VALUE_GRADE_SPACED_RE = re.compile(
     r"^([<>]?\d+(?:\.\d+)?)\s+([AB]\+?)$",
     re.IGNORECASE,
 )
+# OCR 常把「40A」读成「A40」，「25A+」读成「25 +」
+_VALUE_GRADE_REVERSED_RE = re.compile(
+    r"^([AB]\+?)([<>]?\d{2,}(?:\.\d+)?)$",
+    re.IGNORECASE,
+)
+_VALUE_GRADE_TRAILING_PLUS_RE = re.compile(
+    r"^([<>]?\d+(?:\.\d+)?)\s*\+$",
+)
+
+_COMPONENT_HEADER_DONOR_RE = re.compile(
+    r"^\(([A-Za-z])(\d+)\)[\n/]+第(\d+)(\S+)$",
+    re.S,
+)
+_COMPONENT_HEADER_TARGET_RE = re.compile(
+    r"^\(([A-Za-z])(\d+)\)(?:[\n/]+第(\d+))?$",
+    re.S,
+)
 
 # iii-N 常见 OCR 误识
 _III_OCR_RE = re.compile(
@@ -90,11 +107,55 @@ def split_value_grade(text: str) -> Optional[Tuple[str, str]]:
     if not t or "\n" in t:
         return None
     m = _VALUE_GRADE_GLUED_RE.fullmatch(t) or _VALUE_GRADE_SPACED_RE.fullmatch(t)
-    if not m:
-        return None
-    grade = m.group(2)
-    grade = grade[0].upper() + grade[1:]
-    return m.group(1), grade
+    if m:
+        grade = m.group(2)
+        grade = grade[0].upper() + grade[1:]
+        return m.group(1), grade
+    m = _VALUE_GRADE_REVERSED_RE.fullmatch(t)
+    if m:
+        grade = m.group(1)
+        grade = grade[0].upper() + grade[1:]
+        return m.group(2), grade
+    m = _VALUE_GRADE_TRAILING_PLUS_RE.fullmatch(t)
+    if m:
+        return m.group(1), "A+"
+    return None
+
+
+def complete_truncated_component_header(text: str, donors: Sequence[str]) -> str:
+    """
+    同行表头「(A1)/第1树脂」补全截断的「(A2)」或「(A2)/第2」。
+    后缀取自完整 donor，不硬编码「树脂」。
+    """
+    t = (text or "").strip()
+    split_m = re.fullmatch(
+        r"^\(([A-Za-z])(\d+)\)[\n/]+第(\d+)[\n/]+(\S+)$",
+        t,
+        flags=re.S,
+    )
+    if split_m and split_m.group(2) == split_m.group(3):
+        t = (
+            f"({split_m.group(1)}{split_m.group(2)})\n"
+            f"第{split_m.group(2)}{split_m.group(4)}"
+        )
+    tm = _COMPONENT_HEADER_TARGET_RE.fullmatch(t)
+    if not tm:
+        return t
+    letter, num = tm.group(1), tm.group(2)
+    partial = tm.group(3)
+    if partial and partial != num:
+        return t
+    for donor in donors:
+        dm = _COMPONENT_HEADER_DONOR_RE.fullmatch((donor or "").strip())
+        if not dm:
+            continue
+        if dm.group(2) != dm.group(3):
+            continue
+        suffix = dm.group(4)
+        if not suffix:
+            continue
+        return f"({letter}{num})\n第{num}{suffix}"
+    return t
 
 
 def fix_iii_ocr(text: str) -> str:

@@ -21,12 +21,16 @@ from .geometry import compute_ioa, polygon_to_shapely
 from .label_patterns import (
     _CAPTION_CHUNK_RE,
     are_independent_row_labels,
+    complete_truncated_component_header,
     extract_independent_labels_from_joined,
     fix_iii_ocr,
     is_independent_row_label,
     normalize_spaces,
     split_value_grade,
 )
+
+_GRADE_ONLY_RE = re.compile(r"^[AB]\+?$", re.IGNORECASE)
+_NUM_ONLY_RE = re.compile(r"^[<>]?\d+(?:\.\d+)?$")
 
 # 格内动态行分组：与上一组平均 Y 的容差
 _ROW_Y_TOL_PX = 8.0
@@ -1184,8 +1188,33 @@ def assign_texts_to_cells(
                 cell["text"] = join_cell_texts(kept)
                 free_texts.extend(captions)
 
+    _apply_component_header_completion(cells)
     cells = unmerge_filled_label_rowspans(cells)
     return cells, free_texts
+
+
+def _apply_component_header_completion(cells: List[Dict[str, Any]]) -> None:
+    """同行完整「(A1)/第1树脂」补全截断的「(A2)」类表头。"""
+    rows: Dict[int, List[Dict[str, Any]]] = {}
+    for cell in cells:
+        rows.setdefault(int(cell.get("row_start") or 0), []).append(cell)
+    for row_cells in rows.values():
+        donors = [str(c.get("text") or "") for c in row_cells]
+        for cell in row_cells:
+            old = str(cell.get("text") or "")
+            new = complete_truncated_component_header(old, donors)
+            if new != old:
+                cell["text"] = new
+
+
+def _order_value_grade_parts(parts: List[str]) -> List[str]:
+    """叠放格 OCR 常把等级读在数值上方：A / 35 → 35 / A。"""
+    if len(parts) != 2:
+        return parts
+    a, b = parts[0].strip(), parts[1].strip()
+    if _GRADE_ONLY_RE.fullmatch(a) and _NUM_ONLY_RE.fullmatch(b):
+        return [b, a]
+    return parts
 
 
 def _derive_row_col_seps(
@@ -1446,4 +1475,5 @@ def join_cell_texts(
     # 仅当塌缩掉 ≥2 次重复时采用（避免误伤合法双行相同标签）
     if len(row_parts) - len(deduped) >= 2:
         row_parts = deduped
+    row_parts = _order_value_grade_parts(row_parts)
     return _normalize_dash_text("\n".join(row_parts))
