@@ -101,17 +101,13 @@ cp .env.example .env
 |------|------|------|
 | `PADDLEOCR_ACCESS_TOKEN` | AI Studio Token（**必填**） | — |
 | `PADDLEOCR_BASE_URL` | 自定义 API 地址 | 官方默认 |
-| `PADDLEOCR_TASK` | `ocr`（推荐，细粒度文本框）或 `doc_parsing` | `ocr` |
-| `PADDLEOCR_OCR_MODEL` | OCR 任务模型名 | `PP-OCRv6` |
-| `PADDLEOCR_VL_MODEL` | 版面解析模型名 | `PaddleOCR-VL-1.6` |
+| `PADDLEOCR_OCR_MODEL` | OCR 模型名 | `PP-OCRv6` |
 | `PADDLEOCR_REQUEST_TIMEOUT` | 请求超时（秒） | `300` |
 | `PADDLEOCR_POLL_TIMEOUT` | 轮询超时（秒） | `600` |
-| `PADDLEOCR_USE_*` / `PADDLEOCR_PRETTIFY_MARKDOWN` | 主要影响 `doc_parsing`，见 `.env.example` | — |
+| `PADDLEOCR_USE_DOC_ORIENTATION_CLASSIFY` / `USE_DOC_UNWARPING` / `USE_TEXTLINE_ORIENTATION` | OCR 方向/矫正开关 | `false` |
 | `REOCR` | 可疑单元格二次 OCR 总开关（费时/耗 API） | `false` |
 | `REOCR_MAX_CELLS` | 每张图最多二次 OCR 的单元格数 | `24` |
 | `TSR_AGGRESSIVE` | 激进结构后处理（补列/重建表头/横切表头）；`false` 表示信任 TableStructureRec 拓扑 | `false` |
-
-填格场景建议保持 `PADDLEOCR_TASK=ocr`，以拿到细粒度文本框。
 
 ## 四、使用说明（CLI）
 
@@ -353,17 +349,13 @@ cp .env.example .env
 |----------|-------------|---------|
 | `PADDLEOCR_ACCESS_TOKEN` | AI Studio Token (**required**) | — |
 | `PADDLEOCR_BASE_URL` | Custom API base URL | official default |
-| `PADDLEOCR_TASK` | `ocr` (recommended, fine-grained boxes) or `doc_parsing` | `ocr` |
-| `PADDLEOCR_OCR_MODEL` | OCR task model | `PP-OCRv6` |
-| `PADDLEOCR_VL_MODEL` | Layout-parsing model | `PaddleOCR-VL-1.6` |
+| `PADDLEOCR_OCR_MODEL` | OCR model | `PP-OCRv6` |
 | `PADDLEOCR_REQUEST_TIMEOUT` | Request timeout (s) | `300` |
 | `PADDLEOCR_POLL_TIMEOUT` | Poll timeout (s) | `600` |
-| `PADDLEOCR_USE_*` / `PADDLEOCR_PRETTIFY_MARKDOWN` | Mostly affect `doc_parsing`; see `.env.example` | — |
+| `PADDLEOCR_USE_DOC_ORIENTATION_CLASSIFY` / `USE_DOC_UNWARPING` / `USE_TEXTLINE_ORIENTATION` | OCR orientation / unwarping flags | `false` |
 | `REOCR` | Master switch for second-pass OCR on suspicious cells (slow / costs API quota) | `false` |
 | `REOCR_MAX_CELLS` | Max cells re-OCR'd per image | `24` |
 | `TSR_AGGRESSIVE` | Aggressive structure post-processing (fill columns / rebuild header / cross-line header); `false` = trust TableStructureRec topology | `false` |
-
-Keep `PADDLEOCR_TASK=ocr` for cell-filling scenarios to get fine-grained text boxes.
 
 ## 4. Usage (CLI)
 

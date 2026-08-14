@@ -35,9 +35,10 @@ def _image_bytes(image: Any) -> bytes:
 def cache_key_for_image(image: Any, *, extra: Optional[str] = None) -> str:
     """sha1(图片字节 + 任务/模型配置 [+ extra])。"""
     settings = get_settings()
+    # task/vl/layout/md_ignore 已从配置移除；字面量保持旧默认，避免缓存 key 失效。
     meta = (
-        f"task={settings.task}|ocr={settings.ocr_model}|vl={settings.vl_model}"
-        f"|layout={settings.use_layout_detection}"
+        f"task=ocr|ocr={settings.ocr_model}|vl=PaddleOCR-VL-1.6"
+        f"|layout=True"
         f"|orient={settings.use_doc_orientation_classify}"
         f"|unwarp={settings.use_doc_unwarping}"
         f"|textline={settings.use_textline_orientation}"
@@ -45,7 +46,7 @@ def cache_key_for_image(image: Any, *, extra: Optional[str] = None) -> str:
         f"|det_box={settings.text_det_box_thresh}"
         f"|det_unclip={settings.text_det_unclip_ratio}"
         f"|rec_score={settings.text_rec_score_thresh}"
-        f"|md_ignore={','.join(settings.markdown_ignore_labels)}"
+        f"|md_ignore="
     )
     if extra:
         meta += f"|{extra}"

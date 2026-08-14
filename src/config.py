@@ -39,12 +39,6 @@ def _as_optional_float(value: str | None) -> float | None:
     return float(value)
 
 
-def _as_csv_list(value: str | None) -> list[str]:
-    if value is None or value.strip() == "":
-        return []
-    return [item.strip() for item in value.split(",") if item.strip()]
-
-
 class Settings:
     """PaddleOCR 云端相关配置。"""
 
@@ -52,32 +46,18 @@ class Settings:
         load_env()
         self.access_token: str = (os.getenv("PADDLEOCR_ACCESS_TOKEN") or "").strip()
         self.base_url: str = (os.getenv("PADDLEOCR_BASE_URL") or "").strip()
-        # ocr | doc_parsing
-        self.task: str = (os.getenv("PADDLEOCR_TASK") or "ocr").strip().lower()
         self.ocr_model: str = (os.getenv("PADDLEOCR_OCR_MODEL") or "PP-OCRv6").strip()
-        self.vl_model: str = (
-            os.getenv("PADDLEOCR_VL_MODEL") or "PaddleOCR-VL-1.6"
-        ).strip()
         self.request_timeout: float = _as_float(
             os.getenv("PADDLEOCR_REQUEST_TIMEOUT"), 300.0
         )
         self.poll_timeout: float = _as_float(
             os.getenv("PADDLEOCR_POLL_TIMEOUT"), 600.0
         )
-        self.use_layout_detection: bool = _as_bool(
-            os.getenv("PADDLEOCR_USE_LAYOUT_DETECTION"), True
-        )
         self.use_doc_orientation_classify: bool = _as_bool(
             os.getenv("PADDLEOCR_USE_DOC_ORIENTATION_CLASSIFY"), False
         )
         self.use_doc_unwarping: bool = _as_bool(
             os.getenv("PADDLEOCR_USE_DOC_UNWARPING"), False
-        )
-        self.use_chart_recognition: bool = _as_bool(
-            os.getenv("PADDLEOCR_USE_CHART_RECOGNITION"), False
-        )
-        self.prettify_markdown: bool = _as_bool(
-            os.getenv("PADDLEOCR_PRETTIFY_MARKDOWN"), False
         )
         self.use_textline_orientation: bool = _as_bool(
             os.getenv("PADDLEOCR_USE_TEXTLINE_ORIENTATION"), False
@@ -93,9 +73,6 @@ class Settings:
         )
         self.text_rec_score_thresh: float | None = _as_optional_float(
             os.getenv("PADDLEOCR_TEXT_REC_SCORE_THRESH")
-        )
-        self.markdown_ignore_labels: list[str] = _as_csv_list(
-            os.getenv("PADDLEOCR_MARKDOWN_IGNORE_LABELS")
         )
         # 表格管线：二次 OCR / 激进结构后处理（默认均关闭，信任 TSR）
         self.reocr: bool = _as_bool(os.getenv("REOCR"), False)
