@@ -8,7 +8,7 @@
 
 # 中文版
 
-> 面向中国开发者。英文版见文末 [English Version](#english-version)。
+> 面向中国开发者。The English version is below [English Version](#english-version)。
 
 ## 一、模块区分
 
