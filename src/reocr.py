@@ -9,9 +9,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from .label_patterns import fix_iii_ocr, split_value_grade
+from .label_patterns import (
+    complete_truncated_component_header,
+    fix_iii_ocr,
+    split_value_grade,
+)
 from .matching import join_cell_texts, unmerge_filled_label_rowspans
 from .models import predict_texts
+from .ocr_post import _maybe_geometric_dash
 
 
 def _cell_bbox(cell: Dict[str, Any]) -> Tuple[int, int, int, int]:
@@ -123,6 +128,91 @@ def _column_template_skeletons(cells: Sequence[Dict[str, Any]]) -> Dict[int, str
     return templates
 
 
+def _cell_leftover_ink_ratio(binary: np.ndarray, cell: Dict[str, Any], inset: int = 3) -> float:
+    """单元格内、已归属文本框之外的前景占比。用于检出半识别。"""
+    x1, y1, x2, y2 = _cell_bbox(cell)
+    h, w = binary.shape[:2]
+    x1 = max(0, x1 + inset)
+    y1 = max(0, y1 + inset)
+    x2 = min(w, x2 - inset)
+    y2 = min(h, y2 - inset)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    roi = binary[y1:y2, x1:x2]
+    if roi.size == 0:
+        return 0.0
+    mask = roi.copy()
+    for tb in cell.get("texts") or []:
+        poly = np.asarray(tb.get("polygon"), dtype=np.float64).reshape(-1, 2)
+        if poly.size < 4:
+            continue
+        tx1 = int(np.floor(poly[:, 0].min())) - x1 - 2
+        ty1 = int(np.floor(poly[:, 1].min())) - y1 - 2
+        tx2 = int(np.ceil(poly[:, 0].max())) - x1 + 2
+        ty2 = int(np.ceil(poly[:, 1].max())) - y1 + 2
+        tx1 = max(0, tx1)
+        ty1 = max(0, ty1)
+        tx2 = min(mask.shape[1], tx2)
+        ty2 = min(mask.shape[0], ty2)
+        if tx2 > tx1 and ty2 > ty1:
+            mask[ty1:ty2, tx1:tx2] = 0
+    return float(np.count_nonzero(mask)) / float(max(roi.size, 1))
+
+
+def _looks_truncated_header(text: str) -> bool:
+    t = (text or "").strip()
+    return bool(re.fullmatch(r"\([A-Za-z]\d+\)(?:[\n/]+第\d+)?$", t, flags=re.S))
+
+
+def _apply_component_header_completion(cells: List[Dict[str, Any]]) -> None:
+    rows: dict[int, list[Dict[str, Any]]] = {}
+    for cell in cells:
+        rows.setdefault(int(cell.get("row_start") or 0), []).append(cell)
+    for row_cells in rows.values():
+        donors = [str(c.get("text") or "") for c in row_cells]
+        for cell in row_cells:
+            old = str(cell.get("text") or "")
+            new = complete_truncated_component_header(old, donors)
+            if new != old:
+                cell["text"] = new
+
+
+def _coerce_dash_column_ones(cells: List[Dict[str, Any]], binary: np.ndarray) -> None:
+    """破折号列里把孤立「1/l/I」按几何横线收成 '-'。"""
+    cols: dict[int, list[str]] = {}
+    for cell in cells:
+        cols.setdefault(int(cell.get("col_start") or 0), []).append(
+            str(cell.get("text") or "").strip()
+        )
+    dash_cols = {
+        col
+        for col, texts in cols.items()
+        if texts
+        and sum(1 for t in texts if t == "-") >= max(2, int(np.ceil(len(texts) * 0.4)))
+    }
+    if not dash_cols:
+        return
+    for cell in cells:
+        if int(cell.get("col_start") or 0) not in dash_cols:
+            continue
+        text = str(cell.get("text") or "").strip()
+        if text not in {"1", "l", "I", "一", "|", ""}:
+            continue
+        if text == "":
+            if _cell_ink_ratio(binary, cell) >= 0.01:
+                cell["text"] = "-"
+            continue
+        tbs = cell.get("texts") or []
+        if tbs:
+            dummy = dict(tbs[0])
+            dummy["text"] = text
+            fixed = _maybe_geometric_dash(dummy, text, binary=binary)
+            if fixed == "-":
+                cell["text"] = "-"
+                continue
+        cell["text"] = "-"
+
+
 def _looks_garbled_cjk(text: str) -> bool:
     """密表化学中文常见乱码启发式：短串内重复生僻字或无意义碎片。"""
     t = (text or "").strip()
@@ -159,6 +249,8 @@ def _suspicious_indices(cells: Sequence[Dict[str, Any]], binary: np.ndarray) -> 
         multiline = any(bool(tb.get("needs_reocr")) for tb in texts)
         vertical = any(bool(tb.get("maybe_vertical")) for tb in texts)
         empty_but_inky = not text and _cell_ink_ratio(binary, cell) >= 0.02
+        leftover_ink = bool(text) and _cell_leftover_ink_ratio(binary, cell) >= 0.02
+        truncated_header = _looks_truncated_header(text)
         numeric_mismatch = int(cell["col_start"]) in numeric_cols and text and not _looks_numeric(text)
 
         template_mismatch = False
@@ -180,6 +272,8 @@ def _suspicious_indices(cells: Sequence[Dict[str, Any]], binary: np.ndarray) -> 
             or multiline
             or vertical
             or empty_but_inky
+            or leftover_ink
+            or truncated_header
             or numeric_mismatch
             or template_mismatch
             or tall_narrow
@@ -372,7 +466,17 @@ def apply_reocr_to_cells(
         if not candidates:
             continue
 
-        new_score, new_text, new_tbs = max(candidates, key=lambda x: x[0])
+        leftover = _cell_leftover_ink_ratio(binary, cell) >= 0.02
+        truncated = _looks_truncated_header(old_text)
+        # 短串半识别（如「2」对「23A+」）才按更长文本取；长表头不因旋转多字被覆盖
+        incomplete = leftover and len(old_text) <= 8
+        prefer_longer = truncated or incomplete
+        if prefer_longer:
+            new_score, new_text, new_tbs = max(
+                candidates, key=lambda x: (len(x[1]), x[0])
+            )
+        else:
+            new_score, new_text, new_tbs = max(candidates, key=lambda x: x[0])
 
         # 表题/表外格不做二次覆盖
         if old_text and (
@@ -396,6 +500,11 @@ def apply_reocr_to_cells(
                 cell["text"] = new_text
             continue
 
+        if prefer_longer and len(new_text) > len(old_text) and new_score >= 0.35:
+            cell["texts"] = new_tbs
+            cell["text"] = new_text
+            continue
+
         if new_score < old_score + 0.05:
             continue
         if len(new_text) < 0.6 * max(1, len(old_text)):
@@ -408,6 +517,8 @@ def apply_reocr_to_cells(
         cell["texts"] = new_tbs
         cell["text"] = new_text
 
+    _apply_component_header_completion(cells)
+    _coerce_dash_column_ones(cells, binary)
     # 二次 OCR 后可能修好行标签，再拆一次错误 rowspan
     cells = unmerge_filled_label_rowspans(cells)
     return cells
