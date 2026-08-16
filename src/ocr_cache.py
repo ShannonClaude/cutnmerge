@@ -36,16 +36,21 @@ def cache_key_for_image(image: Any, *, extra: Optional[str] = None) -> str:
     """sha1(图片字节 + 任务/模型配置 [+ extra])。"""
     settings = get_settings()
     meta = (
-        f"task={settings.task}|ocr={settings.ocr_model}|vl={settings.vl_model}"
+        f"api=http_v2|task={settings.task}|ocr={settings.ocr_model}"
+        f"|vl={settings.vl_model}"
         f"|layout={settings.use_layout_detection}"
         f"|orient={settings.use_doc_orientation_classify}"
         f"|unwarp={settings.use_doc_unwarping}"
         f"|textline={settings.use_textline_orientation}"
+        f"|det_limit={settings.text_det_limit_type}:{settings.text_det_limit_side_len}"
         f"|det_thresh={settings.text_det_thresh}"
         f"|det_box={settings.text_det_box_thresh}"
         f"|det_unclip={settings.text_det_unclip_ratio}"
         f"|rec_score={settings.text_rec_score_thresh}"
         f"|md_ignore={','.join(settings.markdown_ignore_labels)}"
+        f"|pre_max={settings.preprocess_max_long_side}"
+        f"|pre_min_short={settings.preprocess_min_short_side}"
+        f"|pre_q={settings.preprocess_jpeg_quality}"
     )
     if extra:
         meta += f"|{extra}"

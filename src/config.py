@@ -52,7 +52,7 @@ class Settings:
         load_env()
         self.access_token: str = (os.getenv("PADDLEOCR_ACCESS_TOKEN") or "").strip()
         self.base_url: str = (os.getenv("PADDLEOCR_BASE_URL") or "").strip()
-        # ocr | doc_parsing
+        self.jobs_url: str = (os.getenv("PADDLEOCR_JOBS_URL") or "").strip()
         self.task: str = (os.getenv("PADDLEOCR_TASK") or "ocr").strip().lower()
         self.ocr_model: str = (os.getenv("PADDLEOCR_OCR_MODEL") or "PP-OCRv6").strip()
         self.vl_model: str = (
@@ -63,6 +63,22 @@ class Settings:
         )
         self.poll_timeout: float = _as_float(
             os.getenv("PADDLEOCR_POLL_TIMEOUT"), 600.0
+        )
+        self.preprocess_max_long_side: int = int(
+            _as_float(os.getenv("PADDLEOCR_PREPROCESS_MAX_LONG_SIDE"), 2200.0)
+        )
+        self.preprocess_jpeg_quality: int = int(
+            _as_float(os.getenv("PADDLEOCR_PREPROCESS_JPEG_QUALITY"), 90.0)
+        )
+        self.preprocess_min_short_side: int = int(
+            _as_float(os.getenv("PADDLEOCR_PREPROCESS_MIN_SHORT_SIDE"), 720.0)
+        )
+        self.save_ocr_artifacts: bool = _as_bool(
+            os.getenv("PADDLEOCR_SAVE_ARTIFACTS"), True
+        )
+        _art = (os.getenv("PADDLEOCR_ARTIFACT_DIR") or "").strip()
+        self.ocr_artifact_dir: Path = (
+            Path(_art) if _art else (ROOT / "data" / "ocr")
         )
         self.use_layout_detection: bool = _as_bool(
             os.getenv("PADDLEOCR_USE_LAYOUT_DETECTION"), True
@@ -82,6 +98,12 @@ class Settings:
         self.use_textline_orientation: bool = _as_bool(
             os.getenv("PADDLEOCR_USE_TEXTLINE_ORIENTATION"), False
         )
+        _limit_type = (os.getenv("PADDLEOCR_TEXT_DET_LIMIT_TYPE") or "").strip().lower()
+        self.text_det_limit_type: str | None = _limit_type or None
+        _limit_side = (os.getenv("PADDLEOCR_TEXT_DET_LIMIT_SIDE_LEN") or "").strip()
+        self.text_det_limit_side_len: int | None = (
+            int(float(_limit_side)) if _limit_side else None
+        )
         self.text_det_thresh: float | None = _as_optional_float(
             os.getenv("PADDLEOCR_TEXT_DET_THRESH")
         )
@@ -97,7 +119,6 @@ class Settings:
         self.markdown_ignore_labels: list[str] = _as_csv_list(
             os.getenv("PADDLEOCR_MARKDOWN_IGNORE_LABELS")
         )
-        # 表格管线：二次 OCR / 激进结构后处理（默认均关闭，信任 TSR）
         self.reocr: bool = _as_bool(os.getenv("REOCR"), False)
         self.reocr_max_cells: int = int(
             _as_float(os.getenv("REOCR_MAX_CELLS"), 24.0)
