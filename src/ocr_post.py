@@ -181,6 +181,80 @@ def _tb_roi(binary: np.ndarray, tb: Dict[str, Any]) -> np.ndarray:
     return binary[y1:y2, x1:x2]
 
 
+def _has_horizontal_ink_band(
+    binary: np.ndarray,
+    tb: Dict[str, Any],
+) -> bool:
+    """框内墨迹是否像居中横带（破折号特征）。"""
+    roi = _tb_roi(binary, tb)
+    if roi.size == 0:
+        return False
+    fg = (roi > 0).astype(np.uint8)
+    if fg.size == 0 or int(fg.sum()) == 0:
+        return False
+    rows = fg.sum(axis=1).astype(np.float64)
+    cols = fg.sum(axis=0).astype(np.float64)
+    row_thresh = max(1.0, 0.18 * fg.shape[1])
+    hot_rows = np.flatnonzero(rows >= row_thresh)
+    if hot_rows.size == 0:
+        return False
+    band_top = int(hot_rows[0])
+    band_bottom = int(hot_rows[-1])
+    band_h = band_bottom - band_top + 1
+    band_center = (band_top + band_bottom) / 2.0
+    roi_center = (fg.shape[0] - 1) / 2.0
+    col_thresh = max(1.0, 0.10 * fg.shape[0])
+    hot_cols = np.flatnonzero(cols >= col_thresh)
+    if hot_cols.size == 0:
+        return False
+    span_w = int(hot_cols[-1] - hot_cols[0] + 1)
+    return (
+        band_h <= max(1, int(round(fg.shape[0] * 0.35)))
+        and abs(band_center - roi_center) <= max(1.5, 0.22 * fg.shape[0])
+        and span_w >= max(6, int(round(fg.shape[1] * 0.45)))
+    )
+
+
+def _maybe_tiny_one_to_dash(
+    tb: Dict[str, Any],
+    text: str,
+    *,
+    median_box_h: float,
+    binary: Optional[np.ndarray] = None,
+) -> str:
+    """
+    「—」被 OCR 成极小偏扁的 1/|/l 时改回 '-'。
+
+    极小框（短边<10）仅靠尺寸；稍大时再要求横带墨迹。
+    """
+    t = (text or "").strip()
+    if t not in {"1", "l", "I", "|", "丨"}:
+        return text
+    if median_box_h <= 0:
+        return text
+    w, h = _tb_wh(tb)
+    if h <= 0:
+        return text
+    if h > 0.35 * median_box_h:
+        return text
+    if w / h < 1.10:
+        return text
+    if max(w, h) >= 10.0 and binary is not None:
+        if not _has_horizontal_ink_band(binary, tb):
+            return text
+    return "-"
+
+
+def _strip_leading_pipe_digits(text: str) -> str:
+    """去掉表格竖线噪点：'|93'→'93'；'比较例 8|93'→'比较例 8 93'。"""
+    t = (text or "").strip()
+    m = re.fullmatch(r"\|+(\d+)", t)
+    if m:
+        return m.group(1)
+    t2 = re.sub(r"\|+(\d+)", r" \1", t)
+    return re.sub(r"\s+", " ", t2).strip()
+
+
 def _maybe_geometric_dash(
     tb: Dict[str, Any],
     text: str,
@@ -190,14 +264,20 @@ def _maybe_geometric_dash(
     """
     单字符横笔画 → '-'。
 
-    覆盖「一」等 OCR 常见误识；对明确破折号候选放宽宽高比。
+    覆盖「一」等 OCR 常见误识；绝不把 ASCII 字母（如等级 A/B）改成破折号。
     """
     t = (text or "").strip()
     if len(t) != 1:
         return text
-    # 已是破折号类
     if t in {"-", "—", "–", "−", "ー", "―", "─", "－", "~", "～", "¬"}:
         return "-"
+    if t.isascii() and t.isalpha():
+        return text
+
+    is_cjk_dash_like = t == "一"
+    is_candidate = bool(_DASH_CANDIDATE_RE.match(t)) or is_cjk_dash_like
+    if not is_candidate:
+        return text
 
     if binary is None:
         w, h = _tb_wh(tb)
@@ -212,35 +292,7 @@ def _maybe_geometric_dash(
             return "-"
         return text
 
-    roi = _tb_roi(binary, tb)
-    if roi.size == 0:
-        return text
-    fg = (roi > 0).astype(np.uint8)
-    if fg.size == 0 or int(fg.sum()) == 0:
-        return text
-
-    rows = fg.sum(axis=1).astype(np.float64)
-    cols = fg.sum(axis=0).astype(np.float64)
-    row_thresh = max(1.0, 0.18 * fg.shape[1])
-    hot_rows = np.flatnonzero(rows >= row_thresh)
-    if hot_rows.size == 0:
-        return text
-    band_top = int(hot_rows[0])
-    band_bottom = int(hot_rows[-1])
-    band_h = band_bottom - band_top + 1
-    band_center = (band_top + band_bottom) / 2.0
-    roi_center = (fg.shape[0] - 1) / 2.0
-    col_thresh = max(1.0, 0.10 * fg.shape[0])
-    hot_cols = np.flatnonzero(cols >= col_thresh)
-    if hot_cols.size == 0:
-        return text
-    span_w = int(hot_cols[-1] - hot_cols[0] + 1)
-
-    if (
-        band_h <= max(1, int(round(fg.shape[0] * 0.35)))
-        and abs(band_center - roi_center) <= max(1.5, 0.22 * fg.shape[0])
-        and span_w >= max(6, int(round(fg.shape[1] * 0.45)))
-    ):
+    if _has_horizontal_ink_band(binary, tb):
         return "-"
     return text
 
@@ -387,6 +439,10 @@ def postprocess_text_boxes(
         score = float(tb.get("score") if tb.get("score") is not None else 1.0)
         norm = normalize_ocr_text(raw)
         norm = _maybe_geometric_dash(tb, norm, binary=binary)
+        norm = _maybe_tiny_one_to_dash(
+            tb, norm, median_box_h=median_box_h, binary=binary
+        )
+        norm = _strip_leading_pipe_digits(norm)
         ink = inks[i] if binary is not None else None
         fg_pixels = None
         largest_cc = None

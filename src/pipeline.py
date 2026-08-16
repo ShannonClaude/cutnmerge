@@ -494,6 +494,7 @@ def extract_table_output(
         use_cache=use_cache,
         refresh_cache=refresh_cache,
         cache_extra=cache_extra,
+        artifact_stem=stem,
     )
 
     orient_angle = provisional_orient
