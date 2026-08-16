@@ -2,13 +2,13 @@
 
 复杂表格解耦提取：**结构识别**与 **OCR 文本** 分离处理，再按 IoA（交叠面积比）将文本归属到单元格，默认输出 **HTML**（保留 `rowspan`/`colspan`）。
 
-适用于有框线/弱框线的专利表、实验参数表等截图。默认使用 RapidAI TableStructureRec（有线/无线分流）做结构，并经拓扑后处理与网格证据校验；`--structure lines` / `lore` 可切换结构来源。文本一律走 PaddleOCR 云端 API，结果可本地缓存以免重复消耗额度。
+适用于有框线/弱框线的专利表、实验参数表等截图。默认使用 RapidAI TableStructureRec（有线/无线分流）做结构，并经拓扑后处理与网格证据校验；`--structure lines` / `lore` 可切换结构来源。文本一律走 PaddleOCR 云端 API（本地预处理后上传、坐标映回原图），结果可本地缓存以免重复消耗额度，OCR 产物（json/csv/标注图）默认落盘 `data/ocr/`。
 
 ---
 
 # 中文版
 
-> 面向中国开发者。英文版见文末 [English Version](#english-version)。
+> 面向中国开发者。The English version is below [English Version](#english-version)。
 
 ## 一、模块区分
 
@@ -18,7 +18,7 @@
 |------|------|
 | `main.py` | CLI 入口：参数解析、扫描 `data/input/`、批量调用 pipeline、按 `--format` 写结果 |
 | `src/pipeline.py` | 主流程编排：方向归正 → 去偏斜 → 结构识别 → OCR → 网格证据校验 → IoA 填格 → 输出 |
-| `src/config.py` | 从项目根目录加载 `.env`（AI Studio Token、模型名、超时、REOCR/TSR_AGGRESSIVE 开关） |
+| `src/config.py` | 从项目根目录加载 `.env`（AI Studio Token、模型名、超时、上传预处理/检测参数、REOCR/TSR_AGGRESSIVE 开关） |
 
 ### 2. 预处理（Orientation / Deskew）
 
@@ -35,7 +35,7 @@
 | `src/tsr_refine.py` | TSR 拓扑后处理：去重叠、幽灵列合并、错误 row/colspan 拆分、子行切分/容器格抑制 |
 | `src/grid_evidence.py` | **网格证据校验层**（TSR 路径核心）：在文本归属前，用“线证据 + 空白走廊证据”修正错分行/列边界，防止表头折行被切行、幽灵行列错位 |
 | `src/grid_fusion.py` | 将 TSR 拓扑与框线派生的网格分隔线融合（补回 TSR 漏掉的行/列边界） |
-| `src/models.py` | 模型加载与推断：ModelScope LORE 表格结构识别（`--structure lore`）+ 云端 PaddleOCR |
+| `src/models.py` | 模型加载与推断：ModelScope LORE 表格结构识别（`--structure lore`） |
 | `src/refine.py` | 框线网格（lines 路径）后处理：按 OCR 文本聚类补列、拆错误纵向合并 |
 
 > `--structure auto` 已废弃，行为等价于 `tsr`。
@@ -44,7 +44,8 @@
 
 | 文件 | 职责 |
 |------|------|
-| `src/models.py` | 云端 PP-OCR 请求（异步轮询、错误重试），命中 `data/cache/` 则跳过 |
+| `src/cloud_ocr.py` | **云端 OCR 全流程**：本地预处理（去透明合成、矮图短边放大、长边钳制、JPEG 编码）→ HTTP 提交 → 轮询 → 下载 JSONL → 解析文本框 → 坐标映回原图；重试/限速；产物（json/csv/标注图/API 原图）落盘 |
+| `src/models.py` | `predict_texts`：云端 OCR 封装（调 `cloud_ocr.run_cloud_ocr`，命中 `data/cache/` 跳过、刷新覆盖） |
 | `src/ocr_cache.py` | 本地缓存：按图片内容 hash + 模型配置落盘，避免重复消耗云端额度 |
 | `src/ocr_post.py` | OCR 文本后处理：符号规范化（全半角、空格）与基于墨迹证据的幻觉清理 |
 | `src/reocr.py` | 可疑单元格二次 OCR：将多个可疑格子拼成一张图一次性重识别（`--reocr` / `REOCR`） |
@@ -101,12 +102,24 @@ cp .env.example .env
 |------|------|------|
 | `PADDLEOCR_ACCESS_TOKEN` | AI Studio Token（**必填**） | — |
 | `PADDLEOCR_BASE_URL` | 自定义 API 地址 | 官方默认 |
-| `PADDLEOCR_TASK` | `ocr`（推荐，细粒度文本框）或 `doc_parsing` | `ocr` |
+| `PADDLEOCR_TASK` | `ocr`（当前云端路径仅支持 `ocr`，细粒度文本框供 IoA 填格；`doc_parsing` 已不再支持） | `ocr` |
 | `PADDLEOCR_OCR_MODEL` | OCR 任务模型名 | `PP-OCRv6` |
 | `PADDLEOCR_VL_MODEL` | 版面解析模型名 | `PaddleOCR-VL-1.6` |
 | `PADDLEOCR_REQUEST_TIMEOUT` | 请求超时（秒） | `300` |
 | `PADDLEOCR_POLL_TIMEOUT` | 轮询超时（秒） | `600` |
-| `PADDLEOCR_USE_*` / `PADDLEOCR_PRETTIFY_MARKDOWN` | 主要影响 `doc_parsing`，见 `.env.example` | — |
+| `PADDLEOCR_JOBS_URL` | 自定义 OCR job API 地址 | 官方默认 |
+| `PADDLEOCR_PREPROCESS_MAX_LONG_SIDE` | 上传前本地预处理：长边钳制上限 | `2200` |
+| `PADDLEOCR_PREPROCESS_MIN_SHORT_SIDE` | 上传前本地预处理：矮图短边放大下限（利于小字召回） | `720` |
+| `PADDLEOCR_PREPROCESS_JPEG_QUALITY` | 上传 JPEG 质量 | `90` |
+| `PADDLEOCR_SAVE_ARTIFACTS` | OCR 产物（json/csv/标注图/API 原图）落盘开关 | `true` |
+| `PADDLEOCR_ARTIFACT_DIR` | 产物目录 | `data/ocr/` |
+| `PADDLEOCR_TEXT_DET_LIMIT_TYPE` | 检测边长模式 `min`/`max`（留空不传）；`min` 且投影长边超云端上限(~4000)时自动钳制 | — |
+| `PADDLEOCR_TEXT_DET_LIMIT_SIDE_LEN` | 检测边长阈值 | — |
+| `PADDLEOCR_TEXT_DET_THRESH` / `PADDLEOCR_TEXT_DET_BOX_THRESH` / `PADDLEOCR_TEXT_DET_UNCLIP_RATIO` | 文本检测阈值参数 | — |
+| `PADDLEOCR_TEXT_REC_SCORE_THRESH` | 文本识别置信度阈值 | — |
+| `PADDLEOCR_MARKDOWN_IGNORE_LABELS` | 忽略的版面标签（逗号分隔） | — |
+| `PADDLEOCR_USE_DOC_ORIENTATION_CLASSIFY` / `PADDLEOCR_USE_DOC_UNWARPING` / `PADDLEOCR_USE_TEXTLINE_ORIENTATION` | 随请求上传的检测开关（方向分类/去卷曲/文本行方向） | `false` |
+| `PADDLEOCR_USE_LAYOUT_DETECTION` / `PADDLEOCR_USE_CHART_RECOGNITION` / `PADDLEOCR_PRETTIFY_MARKDOWN` | doc_parsing（VL）遗留开关，当前 HTTP 路径不生效 | — |
 | `REOCR` | 可疑单元格二次 OCR 总开关（费时/耗 API） | `false` |
 | `REOCR_MAX_CELLS` | 每张图最多二次 OCR 的单元格数 | `24` |
 | `TSR_AGGRESSIVE` | 激进结构后处理（补列/重建表头/横切表头）；`false` 表示信任 TableStructureRec 拓扑 | `false` |
@@ -185,6 +198,7 @@ cutnmerge/
 │   ├── input/           # 待处理图片
 │   ├── output/          # HTML / Markdown 结果
 │   ├── cache/           # OCR 本地缓存（gitignore）
+│   ├── ocr/             # OCR 产物：json/csv/标注图（gitignore）
 │   └── debug/           # --debug 叠加图（gitignore）
 └── src/
     ├── pipeline.py      # 主流程
@@ -195,7 +209,8 @@ cutnmerge/
     ├── grid_evidence.py # 网格证据校验（线证据 + 空白走廊）
     ├── grid_fusion.py   # TSR 拓扑 × 框线分隔线融合
     ├── refine.py        # 框线网格后处理
-    ├── models.py        # LORE + 云端 OCR
+    ├── models.py        # LORE 结构识别 + predict_texts 封装
+    ├── cloud_ocr.py     # 云端 OCR 全流程（预处理/提交/轮询/解析）
     ├── reocr.py         # 可疑单元格拼图二次 OCR
     ├── ocr_post.py      # OCR 规范化与幻觉清理
     ├── ocr_cache.py     # OCR 本地缓存
@@ -231,7 +246,7 @@ print(out["html"])
 |------|-----|
 | ModelScope LORE | `modelscope`、`torch` 等 |
 | TableStructureRec | `wired_table_rec`、`lineless_table_rec`、`table_cls` |
-| 云端 OCR | `paddleocr`（官方客户端，无需本地 PaddlePaddle） |
+| 云端 OCR | `paddleocr`（官方客户端，无需本地 PaddlePaddle）、`requests`（HTTP 提交/轮询） |
 | 图像 / 几何 | `opencv-python`、`numpy`、`shapely` |
 | 配置 | `python-dotenv` |
 
@@ -270,7 +285,7 @@ print(out["html"])
 |------|----------------|
 | `main.py` | CLI entry: argument parsing, batch scan of `data/input/`, calls pipeline, writes results per `--format` |
 | `src/pipeline.py` | Orchestrates the full flow: orientation → deskew → structure → OCR → grid evidence check → IoA matching → output |
-| `src/config.py` | Loads `.env` from the project root (token, model names, timeouts, REOCR/TSR_AGGRESSIVE flags) |
+| `src/config.py` | Loads `.env` from the project root (token, model names, timeouts, upload-preprocess / detection params, REOCR/TSR_AGGRESSIVE flags) |
 
 ### Preprocessing (Orientation / Deskew)
 
@@ -287,7 +302,7 @@ print(out["html"])
 | `src/tsr_refine.py` | TSR topology post-processing: overlap removal, ghost-column merge, wrong row/colspan splitting, sub-row splitting / container-cell suppression |
 | `src/grid_evidence.py` | **Grid evidence validation** (core of the TSR path): before text matching, fixes wrong row/column boundaries using "line evidence + blank-corridor evidence" — prevents header wrapping from being split into rows and ghost row/column misalignment |
 | `src/grid_fusion.py` | Fuses TSR topology with line-derived grid separators (recovers row/column boundaries TSR missed) |
-| `src/models.py` | Model loading & inference: ModelScope LORE table structure recognition (`--structure lore`) + cloud PaddleOCR |
+| `src/models.py` | Model loading & inference: ModelScope LORE table structure recognition (`--structure lore`) |
 | `src/refine.py` | Line-grid post-processing: adds missing columns by OCR text clustering, splits wrong vertical merges |
 
 > `--structure auto` is deprecated; it behaves identically to `tsr`.
@@ -296,7 +311,8 @@ print(out["html"])
 
 | File | Responsibility |
 |------|----------------|
-| `src/models.py` | Cloud PP-OCR requests (async polling, retry); skips when `data/cache/` hits |
+| `src/cloud_ocr.py` | **Full cloud OCR flow**: local preprocessing (alpha compositing, short-side upscale, long-side clamp, JPEG) → HTTP submit → poll → JSONL download → box parsing → coordinates mapped back to the original image; retry/rate-limiting; artifacts (json/csv/annotated/API image) written to disk |
+| `src/models.py` | `predict_texts`: cloud OCR wrapper (calls `cloud_ocr.run_cloud_ocr`; skips on `data/cache/` hit, refreshes and overwrites) |
 | `src/ocr_cache.py` | Local cache keyed by image content hash + model config, avoids burning cloud quota |
 | `src/ocr_post.py` | OCR text normalization (full/half-width, spaces) and ink-density-based hallucination cleanup |
 | `src/reocr.py` | Second-pass OCR for suspicious cells: packs them into one montage image for a single re-recognition (`--reocr` / `REOCR`) |
@@ -353,12 +369,24 @@ cp .env.example .env
 |----------|-------------|---------|
 | `PADDLEOCR_ACCESS_TOKEN` | AI Studio Token (**required**) | — |
 | `PADDLEOCR_BASE_URL` | Custom API base URL | official default |
-| `PADDLEOCR_TASK` | `ocr` (recommended, fine-grained boxes) or `doc_parsing` | `ocr` |
+| `PADDLEOCR_TASK` | `ocr` (the cloud path only supports `ocr` — fine-grained boxes for IoA filling; `doc_parsing` is no longer supported) | `ocr` |
 | `PADDLEOCR_OCR_MODEL` | OCR task model | `PP-OCRv6` |
 | `PADDLEOCR_VL_MODEL` | Layout-parsing model | `PaddleOCR-VL-1.6` |
 | `PADDLEOCR_REQUEST_TIMEOUT` | Request timeout (s) | `300` |
 | `PADDLEOCR_POLL_TIMEOUT` | Poll timeout (s) | `600` |
-| `PADDLEOCR_USE_*` / `PADDLEOCR_PRETTIFY_MARKDOWN` | Mostly affect `doc_parsing`; see `.env.example` | — |
+| `PADDLEOCR_JOBS_URL` | Custom OCR job API URL | official default |
+| `PADDLEOCR_PREPROCESS_MAX_LONG_SIDE` | Pre-upload preprocessing: long-side clamp | `2200` |
+| `PADDLEOCR_PREPROCESS_MIN_SHORT_SIDE` | Pre-upload preprocessing: short-side upscale floor for short images (better small-text recall) | `720` |
+| `PADDLEOCR_PREPROCESS_JPEG_QUALITY` | Upload JPEG quality | `90` |
+| `PADDLEOCR_SAVE_ARTIFACTS` | Master switch for writing OCR artifacts (json/csv/annotated/API image) | `true` |
+| `PADDLEOCR_ARTIFACT_DIR` | Artifact directory | `data/ocr/` |
+| `PADDLEOCR_TEXT_DET_LIMIT_TYPE` | Detection side mode `min`/`max` (empty = not sent); with `min`, auto-clamps if the projected long side would hit the cloud limit (~4000) | — |
+| `PADDLEOCR_TEXT_DET_LIMIT_SIDE_LEN` | Detection side length | — |
+| `PADDLEOCR_TEXT_DET_THRESH` / `PADDLEOCR_TEXT_DET_BOX_THRESH` / `PADDLEOCR_TEXT_DET_UNCLIP_RATIO` | Text-detection thresholds | — |
+| `PADDLEOCR_TEXT_REC_SCORE_THRESH` | Text-recognition score threshold | — |
+| `PADDLEOCR_MARKDOWN_IGNORE_LABELS` | Layout labels to ignore (comma-separated) | — |
+| `PADDLEOCR_USE_DOC_ORIENTATION_CLASSIFY` / `PADDLEOCR_USE_DOC_UNWARPING` / `PADDLEOCR_USE_TEXTLINE_ORIENTATION` | Detection toggles sent with the request (orientation / unwarping / textline orientation) | `false` |
+| `PADDLEOCR_USE_LAYOUT_DETECTION` / `PADDLEOCR_USE_CHART_RECOGNITION` / `PADDLEOCR_PRETTIFY_MARKDOWN` | Leftovers from the doc_parsing (VL) path; no effect on the current HTTP path | — |
 | `REOCR` | Master switch for second-pass OCR on suspicious cells (slow / costs API quota) | `false` |
 | `REOCR_MAX_CELLS` | Max cells re-OCR'd per image | `24` |
 | `TSR_AGGRESSIVE` | Aggressive structure post-processing (fill columns / rebuild header / cross-line header); `false` = trust TableStructureRec topology | `false` |
@@ -437,6 +465,7 @@ cutnmerge/
 │   ├── input/           # images to process
 │   ├── output/          # HTML / Markdown results
 │   ├── cache/           # local OCR cache (gitignored)
+│   ├── ocr/             # OCR artifacts: json/csv/annotated images (gitignored)
 │   └── debug/           # --debug overlay images (gitignored)
 └── src/
     ├── pipeline.py      # main pipeline
@@ -447,7 +476,8 @@ cutnmerge/
     ├── grid_evidence.py # grid evidence validation (line + blank corridor)
     ├── grid_fusion.py   # TSR topology × line-separator fusion
     ├── refine.py        # line-grid post-processing
-    ├── models.py        # LORE + cloud OCR
+    ├── models.py        # LORE structure + predict_texts wrapper
+    ├── cloud_ocr.py     # cloud OCR flow (preprocess/submit/poll/parse)
     ├── reocr.py         # montage second-pass OCR
     ├── ocr_post.py      # OCR normalization & hallucination cleanup
     ├── ocr_cache.py     # local OCR cache
@@ -483,7 +513,7 @@ The entry point loads the project-root `.env` via `src.config.load_env()`.
 |---------|----------|
 | ModelScope LORE | `modelscope`, `torch`, etc. |
 | TableStructureRec | `wired_table_rec`, `lineless_table_rec`, `table_cls` |
-| Cloud OCR | `paddleocr` (official client; no local PaddlePaddle needed) |
+| Cloud OCR | `paddleocr` (official client; no local PaddlePaddle needed), `requests` (HTTP submit/poll) |
 | Image / geometry | `opencv-python`, `numpy`, `shapely` |
 | Config | `python-dotenv` |
 
