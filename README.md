@@ -124,8 +124,6 @@ cp .env.example .env
 | `REOCR_MAX_CELLS` | 每张图最多二次 OCR 的单元格数 | `24` |
 | `TSR_AGGRESSIVE` | 激进结构后处理（补列/重建表头/横切表头）；`false` 表示信任 TableStructureRec 拓扑 | `false` |
 
-填格场景建议保持 `PADDLEOCR_TASK=ocr`，以拿到细粒度文本框。
-
 ## 四、使用说明（CLI）
 
 将表格图片放入 `data/input/`（支持 png / jpg / jpeg / bmp / tif / tiff / webp）：
@@ -390,8 +388,6 @@ cp .env.example .env
 | `REOCR` | Master switch for second-pass OCR on suspicious cells (slow / costs API quota) | `false` |
 | `REOCR_MAX_CELLS` | Max cells re-OCR'd per image | `24` |
 | `TSR_AGGRESSIVE` | Aggressive structure post-processing (fill columns / rebuild header / cross-line header); `false` = trust TableStructureRec topology | `false` |
-
-Keep `PADDLEOCR_TASK=ocr` for cell-filling scenarios to get fine-grained text boxes.
 
 ## 4. Usage (CLI)
 

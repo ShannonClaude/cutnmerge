@@ -1,4 +1,4 @@
-"""模型加载与推断：读光 LORE 表格结构识别 + 云端 PaddleOCR-VL 文本提取。
+"""模型加载与推断：读光 LORE 表格结构识别 + 云端 PaddleOCR 文本提取。
 
 【Phase 1 重构说明】
 LORE（Logical Location Regression Network）模型的推理结果并不只是单元格的
@@ -632,18 +632,11 @@ def _append_text_box(
 
 
 def _parse_pruned_result_to_text_boxes(pruned: Any) -> List[Dict[str, Any]]:
-    """
-    从云端 VL / OCR 的 prunedResult 中提取带坐标的文本块。
-
-    优先顺序：
-    1. OCR 细粒度：rec_texts + rec_polys / dt_polys / rec_boxes
-    2. VL 版面块：parsing_res_list 中的 block_content + block_bbox
-    """
+    """从云端 OCR 的 prunedResult 中提取带坐标的文本块。"""
     text_boxes: List[Dict[str, Any]] = []
     if not isinstance(pruned, dict):
         return text_boxes
 
-    # ---- 1) OCR 线级结果（若服务端一并返回）----
     texts = pruned.get("rec_texts")
     polys = (
         pruned.get("rec_polys")
@@ -659,75 +652,18 @@ def _parse_pruned_result_to_text_boxes(pruned: Any) -> List[Dict[str, Any]]:
             score = float(scores[i]) if i < len(scores) else 1.0
             if box is not None:
                 _append_text_box(text_boxes, text, box, score)
-        if text_boxes:
-            return text_boxes
-
-    # ---- 2) VL 版面解析块 ----
-    parsing_list = pruned.get("parsing_res_list") or pruned.get("parsingResList") or []
-    if isinstance(parsing_list, (list, tuple)):
-        for block in parsing_list:
-            if not isinstance(block, dict):
-                continue
-            label = str(
-                block.get("block_label")
-                or block.get("blockLabel")
-                or block.get("label")
-                or ""
-            ).lower()
-            # 跳过纯图/页眉页脚等无文本块（仍保留 text/table/title 等）
-            if label in {"image", "figure", "chart", "seal", "header", "footer", "number"}:
-                continue
-            content = (
-                block.get("block_content")
-                or block.get("blockContent")
-                or block.get("content")
-                or ""
-            )
-            bbox = (
-                block.get("block_polygon_points")
-                or block.get("blockPolygonPoints")
-                or block.get("block_bbox")
-                or block.get("blockBbox")
-                or block.get("bbox")
-            )
-            if bbox is None:
-                continue
-            # 表格块内容可能是整表 HTML/Markdown；仍作为一块文本供 IoA 使用
-            _append_text_box(text_boxes, content, bbox, 1.0)
-
     return text_boxes
 
 
 def _parse_cloud_result_to_text_boxes(result: Any) -> List[Dict[str, Any]]:
-    """解析 PaddleOCRClient.parse_document / ocr 返回对象。"""
+    """解析 PaddleOCRClient.ocr 返回对象。"""
     text_boxes: List[Dict[str, Any]] = []
     pages = getattr(result, "pages", None) or []
     for page in pages:
         pruned = getattr(page, "pruned_result", None)
         if pruned is None and isinstance(getattr(page, "raw", None), dict):
             pruned = page.raw.get("prunedResult") or page.raw.get("pruned_result")
-        page_boxes = _parse_pruned_result_to_text_boxes(pruned)
-        if page_boxes:
-            text_boxes.extend(page_boxes)
-            continue
-
-        # 无坐标时的降级：把 markdown 按行拆成「无框」文本（IoA 会归入游离文本）
-        md = getattr(page, "markdown_text", None) or ""
-        if md and str(md).strip():
-            for line in str(md).splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                text_boxes.append(
-                    {
-                        "polygon": np.array(
-                            [[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float64
-                        ),
-                        "text": line,
-                        "score": 0.0,
-                        "top_left": (0.0, 0.0),
-                    }
-                )
+        text_boxes.extend(_parse_pruned_result_to_text_boxes(pruned))
     return text_boxes
 
 
