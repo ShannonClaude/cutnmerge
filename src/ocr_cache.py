@@ -35,7 +35,6 @@ def _image_bytes(image: Any) -> bytes:
 def cache_key_for_image(image: Any, *, extra: Optional[str] = None) -> str:
     """sha1(图片字节 + 任务/模型配置 [+ extra])。"""
     settings = get_settings()
-    # task/vl/layout/md_ignore 已从配置移除；字面量保持旧默认，避免缓存 key 失效。
     meta = (
         f"api=http_v2|task={settings.task}|ocr={settings.ocr_model}"
         f"|vl={settings.vl_model}"

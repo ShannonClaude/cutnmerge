@@ -39,6 +39,13 @@ def _as_optional_float(value: str | None) -> float | None:
     return float(value)
 
 
+def _as_csv_list(value: str | None) -> list[str]:
+    """逗号分隔字符串 → 列表；空值返回 []。"""
+    if value is None or value.strip() == "":
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
 class Settings:
     """PaddleOCR 云端相关配置。"""
 
@@ -49,6 +56,9 @@ class Settings:
         self.jobs_url: str = (os.getenv("PADDLEOCR_JOBS_URL") or "").strip()
         self.task: str = (os.getenv("PADDLEOCR_TASK") or "ocr").strip().lower()
         self.ocr_model: str = (os.getenv("PADDLEOCR_OCR_MODEL") or "PP-OCRv6").strip()
+        self.vl_model: str = (
+            os.getenv("PADDLEOCR_VL_MODEL") or "PaddleOCR-VL-1.6"
+        ).strip()
         self.request_timeout: float = _as_float(
             os.getenv("PADDLEOCR_REQUEST_TIMEOUT"), 300.0
         )
