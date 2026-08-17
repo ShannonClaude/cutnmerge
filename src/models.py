@@ -116,28 +116,25 @@ def load_lore_model():
     ) from last_err
 
 
+class CloudOcrEngine:
+    """HTTP 云端 OCR 占位对象（兼容 pipeline 的 ocr_engine 传参）。"""
+
+    def __repr__(self) -> str:  # noqa: D401
+        return "CloudOcrEngine(http_v2)"
+
+
 def load_ocr():
     """
-    加载 PaddleOCR 官方云端客户端（不跑本地推理）。
+    初始化云端 OCR（HTTP 提交/轮询/下载，对齐 source/ppocr_batch.py）。
 
-    Token / 模型名等均从项目根目录 .env 读取。
+    Token / 模型名等均从项目根目录 .env 读取；启动时校验 Token。
     """
     global _ocr_client
     if _ocr_client is not None:
         return _ocr_client
 
-    from paddleocr import PaddleOCRClient
-
-    settings = get_settings()
-    kwargs: Dict[str, Any] = {
-        "token": settings.require_token(),
-        "request_timeout": settings.request_timeout,
-        "poll_timeout": settings.poll_timeout,
-    }
-    if settings.base_url:
-        kwargs["base_url"] = settings.base_url
-
-    _ocr_client = PaddleOCRClient(**kwargs)
+    get_settings().require_token()
+    _ocr_client = CloudOcrEngine()
     return _ocr_client
 
 
@@ -677,52 +674,51 @@ def predict_texts(
     use_cache: bool = True,
     refresh_cache: bool = False,
     cache_extra: Optional[str] = None,
+    save_artifacts: Optional[bool] = None,
+    artifact_stem: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    使用云端 PaddleOCR 提取整图文本块（含检测坐标）。
+    使用云端 PaddleOCR（HTTP）提取整图文本块（含检测坐标）。
 
-    调用 PP-OCRv5/v6，返回细粒度文本框供 IoA 填格。
-    use_cache：命中 data/cache/ 则跳过云端；refresh_cache 强制重拉并覆盖。
+    - 本地预处理后上传；坐标映回原图，供结构（原图）IoA 填格
+    - use_cache：命中 data/cache/ 则跳过云端；refresh_cache 强制重拉并覆盖
 
     Returns:
-        文本块列表，每项含 polygon / text / score / top_left(x,y)
+        文本块列表，每项含 polygon / text / score / top_left(x,y)（原图坐标）
     """
-    from paddleocr import OCROptions
+    from pathlib import Path
 
+    from .cloud_ocr import run_cloud_ocr
     from .ocr_cache import load_ocr_cache, save_ocr_cache
+
+    if ocr_engine is None:
+        load_ocr()
 
     if use_cache and not refresh_cache:
         cached = load_ocr_cache(image, extra=cache_extra)
         if cached is not None:
             return cached
 
-    client = ocr_engine or load_ocr()
     settings = get_settings()
-    file_path, tmp_path = _ensure_image_file(image)
+    do_artifacts = (
+        settings.save_ocr_artifacts if save_artifacts is None else bool(save_artifacts)
+    )
+    stem = artifact_stem
+    filename = "image.jpg"
+    if stem is None and isinstance(image, str):
+        stem = Path(image).stem
+        filename = Path(image).name
+        if not filename.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")):
+            filename = f"{stem}.jpg"
 
-    try:
-        options = OCROptions(
-            use_doc_orientation_classify=settings.use_doc_orientation_classify,
-            use_doc_unwarping=settings.use_doc_unwarping,
-            use_textline_orientation=settings.use_textline_orientation,
-            text_det_thresh=settings.text_det_thresh,
-            text_det_box_thresh=settings.text_det_box_thresh,
-            text_det_unclip_ratio=settings.text_det_unclip_ratio,
-            text_rec_score_thresh=settings.text_rec_score_thresh,
-        )
-        result = client.ocr(
-            file_path=file_path,
-            model=settings.ocr_model,
-            options=options,
-        )
-    finally:
-        if tmp_path and os.path.isfile(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    text_boxes = run_cloud_ocr(
+        image,
+        filename=filename,
+        save_artifacts=do_artifacts and bool(stem),
+        artifact_stem=stem,
+        artifact_dir=settings.ocr_artifact_dir,
+    )
 
-    text_boxes = _parse_cloud_result_to_text_boxes(result)
     if use_cache or refresh_cache:
         try:
             save_ocr_cache(image, text_boxes, extra=cache_extra)

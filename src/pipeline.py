@@ -1,7 +1,7 @@
 """解耦表格提取主流程：结构识别与 OCR 文本分离后再融合。
 
 默认 TableStructureRec（tsr）+ 云端 OCR + IoA；输出 HTML（保留 rowspan/colspan），
-可选 Markdown。OCR 结果可本地缓存。
+末尾经 html2md 转 Markdown，并写出两张彩色可视化图。OCR 结果可本地缓存。
 """
 
 from __future__ import annotations
@@ -14,8 +14,9 @@ from typing import Any, Dict, List, Optional, Union
 import cv2
 import numpy as np
 
-from .formatter import build_markdown_output, format_free_texts
+from .formatter import format_free_texts
 from .grid_fusion import fuse_tsr_with_lines
+from .html2md import html_to_markdown
 from .html_formatter import build_html_output
 from .lines import (
     DetectedTable,
@@ -159,20 +160,14 @@ def _render_outputs(
     *,
     compress_empty_cols: bool,
 ) -> Dict[str, str]:
-    """同时生成 html / md。"""
+    """生成 HTML；Markdown 在 pipeline 末尾由 html2md 统一转换。"""
     html = build_html_output(
         cells,
         free_texts,
         split_subtables=True,
         compress_empty=compress_empty_cols,
     )
-    md = build_markdown_output(
-        cells,
-        free_texts,
-        split_subtables=True,
-        compress_empty_cols=compress_empty_cols,
-    )
-    return {"html": html or "", "md": md or ""}
+    return {"html": html or "", "md": ""}
 
 
 def _extract_via_lines(
@@ -190,15 +185,16 @@ def _extract_via_lines(
     """框线路径：检测多表 → refine 补列/拆合并 → 逐表归属 → 拼接输出。"""
     tables = detect_tables(image, confidence_thresh=_LINES_CONF_THRESH)
     if not tables:
-        free = format_free_texts(text_boxes)
-        return {"html": free, "md": free}, [], text_boxes, []
+        outs = _render_outputs(
+            [], text_boxes, compress_empty_cols=compress_empty_cols
+        )
+        return outs, [], text_boxes, []
 
     binary = binarize_otsu(image)
     tables = [refine_table(t, text_boxes) for t in tables]
 
     bboxes = [t.bbox for t in tables]
     html_parts: List[str] = []
-    md_parts: List[str] = []
     remaining = list(text_boxes)
 
     for table in tables:
@@ -238,8 +234,6 @@ def _extract_via_lines(
         )
         if outs["html"]:
             html_parts.append(outs["html"])
-        if outs["md"]:
-            md_parts.append(outs["md"])
 
     outside = []
     for tb in remaining:
@@ -251,7 +245,6 @@ def _extract_via_lines(
 
     prefix = format_free_texts(outside)
     html_body = "\n\n".join(html_parts)
-    md_body = "\n\n".join(md_parts)
     # lines 路径的游离前缀也包成 HTML 段落，避免裸文本与 <table> 混排
     import html as html_lib
 
@@ -264,11 +257,7 @@ def _extract_via_lines(
         html = prefix_html + "\n\n" + html_body
     else:
         html = prefix_html or html_body or ""
-    if prefix and md_body:
-        md = prefix + "\n\n" + md_body
-    else:
-        md = prefix or md_body or ""
-    return {"html": html, "md": md}, tables, outside, text_boxes
+    return {"html": html, "md": ""}, tables, outside, text_boxes
 
 
 def _extract_via_lore(
@@ -288,8 +277,10 @@ def _extract_via_lore(
     lore = lore_pipe or load_lore_model()
     cells = predict_cells(image, lore_pipe=lore)
     if not cells:
-        free = format_free_texts(text_boxes)
-        return {"html": free, "md": free}, []
+        outs = _render_outputs(
+            [], text_boxes, compress_empty_cols=compress_empty_cols
+        )
+        return outs, []
     cells, free_texts = assign_texts_to_cells(
         cells,
         text_boxes,
@@ -377,12 +368,15 @@ def _extract_via_tsr(
         return outs, tables
 
     if not cells:
-        free = format_free_texts(text_boxes)
-        return {"html": free, "md": free}, []
+        outs = _render_outputs(
+            [], text_boxes, compress_empty_cols=compress_empty_cols
+        )
+        return outs, []
 
     binary = binarize_otsu(image)
     # 轻量路径也开跨列切分：只切 OCR 文本到已有原子列，不插线/不补列。
-    # col_seps / v_separators 仅激进路径提供，避免 _explode_colspan 改合并表头拓扑。
+    # col_seps：light/aggressive 均可用于按列界切开粘连 OCR；v_separators 仅激进路径。
+    # _explode_colspan 只在目标格 colspan>1 时触发，比率类 rowspan 表头不受影响。
     col_seps = None
     v_separators = None
     split_cross = True
@@ -410,8 +404,12 @@ def _extract_via_tsr(
     else:
         # 默认路径：仅表头带按列横线连通性局部恢复 rowspan（不改列、不开激进融合）
         from .hline_repair import repair_rowspans_by_hline_gaps
+        from .tsr_refine import _derive_seps as _derive_seps_local
 
         cells = repair_rowspans_by_hline_gaps(cells, binary, text_boxes)
+        _row_seps, col_seps_list = _derive_seps_local(cells)
+        if len(col_seps_list) >= 3:
+            col_seps = col_seps_list
 
     cells, free_texts = assign_texts_to_cells(
         cells,
@@ -469,6 +467,7 @@ def extract_table_output(
     Returns:
         {"html": str, "md": str, "structure": str, "orientation": int,
          "vis_paths": list[str]}
+        md 由最终 HTML 经 html2md 转换；vis_paths 为两张彩色可视化图路径。
     """
     image = _load_image(image_path)
     stem = debug_stem
@@ -494,6 +493,7 @@ def extract_table_output(
         use_cache=use_cache,
         refresh_cache=refresh_cache,
         cache_extra=cache_extra,
+        artifact_stem=stem,
     )
 
     orient_angle = provisional_orient
@@ -619,13 +619,18 @@ def extract_table_output(
         logger.info("debug 叠加图已写入: %s", out_path)
         print(f"[info] debug 叠加图: {out_path}")
 
-    if not outputs.get("html") and not outputs.get("md"):
-        free = format_free_texts(text_boxes)
-        outputs = {"html": free, "md": free}
+    if not outputs.get("html"):
+        outputs = _render_outputs(
+            [], text_boxes, compress_empty_cols=compress_empty_cols
+        )
+
+    # Pipeline 末尾：HTML → Markdown（html2md）
+    html = outputs.get("html") or ""
+    md = html_to_markdown(html) if html.strip() else ""
 
     return {
-        "html": outputs.get("html") or "",
-        "md": outputs.get("md") or "",
+        "html": html,
+        "md": md,
         "structure": structure,
         "orientation": int(orient_angle),
         "vis_paths": vis_paths,
