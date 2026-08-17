@@ -3,6 +3,7 @@
 复杂表格解耦提取：**结构识别**与 **OCR 文本** 分离处理，再按 IoA（交叠面积比）将文本归属到单元格，默认输出 **HTML**（保留 `rowspan`/`colspan`）。
 
 适用于有框线/弱框线的专利表、实验参数表等截图。默认使用 RapidAI TableStructureRec（有线/无线分流）做结构，并经拓扑后处理与网格证据校验；`--structure lines` / `lore` 可切换结构来源。文本一律走 PaddleOCR 云端 API（本地预处理后上传、坐标映回原图），结果可本地缓存以免重复消耗额度，OCR
+
 产物（json/csv/标注图）默认落盘 `data/ocr/`。
 
 ---
