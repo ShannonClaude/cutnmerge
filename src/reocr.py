@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+_CJK_CHAR_RE = re.compile(r"[\u3400-\u9fff]")
 
 from .label_patterns import (
     complete_truncated_component_header,
@@ -521,4 +526,195 @@ def apply_reocr_to_cells(
     _coerce_dash_column_ones(cells, binary)
     # 二次 OCR 后可能修好行标签，再拆一次错误 rowspan
     cells = unmerge_filled_label_rowspans(cells)
+    return cells
+
+
+def _inset_xyxy(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    *,
+    min_px: int = 4,
+    frac: float = 0.12,
+) -> Tuple[int, int, int, int]:
+    """Shrink a bbox to drop grid-line ink on the borders."""
+    w = max(x2 - x1, 0)
+    h = max(y2 - y1, 0)
+    dx = min(max(min_px, int(round(w * frac))), max(0, w // 3))
+    dy = min(max(min_px, int(round(h * frac))), max(0, h // 3))
+    return x1 + dx, y1 + dy, x2 - dx, y2 - dy
+
+
+def _interior_ink_ratio(binary: np.ndarray, cell: Dict[str, Any]) -> float:
+    x1, y1, x2, y2 = _cell_bbox(cell)
+    ix1, iy1, ix2, iy2 = _inset_xyxy(x1, y1, x2, y2)
+    h, w = binary.shape[:2]
+    ix1 = max(0, ix1)
+    iy1 = max(0, iy1)
+    ix2 = min(w, ix2)
+    iy2 = min(h, iy2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    roi = binary[iy1:iy2, ix1:ix2]
+    return float(np.count_nonzero(roi)) / float(max(roi.size, 1))
+
+
+def _compact_header_text(text: str) -> str:
+    return re.sub(r"\s+", "", text or "").strip()
+
+
+def _looks_like_vertical_header_text(text: str, score: float) -> bool:
+    """Short CJK header; reject digits/codes/border noise."""
+    if score < 0.6:
+        return False
+    compact = _compact_header_text(text)
+    if not (2 <= len(compact) <= 8):
+        return False
+    cjk_n = len(_CJK_CHAR_RE.findall(compact))
+    if cjk_n < max(2, int(round(0.6 * len(compact)))):
+        return False
+    non_cjk = sum(1 for ch in compact if not _CJK_CHAR_RE.fullmatch(ch) and ch not in "()（）[]【】")
+    if non_cjk >= max(2, len(compact) - 1):
+        return False
+    if re.fullmatch(r"[\d.\-+\s|丨lI]+", compact):
+        return False
+    return True
+
+
+def _neighbor_texts(
+    cells: Sequence[Dict[str, Any]], cell: Dict[str, Any]
+) -> List[str]:
+    rs = int(cell["row_start"])
+    cs = int(cell["col_start"])
+    out: List[str] = []
+    for other in cells:
+        if other is cell:
+            continue
+        if int(other["row_start"]) != rs:
+            continue
+        ocs = int(other["col_start"])
+        if ocs in {cs - 1, cs + 1}:
+            t = _compact_header_text(str(other.get("text") or ""))
+            if t:
+                out.append(t)
+    return out
+
+
+def recover_empty_vertical_headers(
+    image: np.ndarray,
+    cells: List[Dict[str, Any]],
+    *,
+    binary: np.ndarray,
+    ocr_engine=None,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
+    max_cells: int = 8,
+) -> List[Dict[str, Any]]:
+    """
+    定点补检：表头带空格 + 内缩后仍有墨迹 + 窄高 → 旋转 90/270° OCR。
+
+    真正空白的表头（只有框线）内缩后墨迹≈0，不发请求。
+    """
+    if not cells or image is None or binary is None:
+        return cells
+
+    header_hi = 1
+    candidates: List[int] = []
+    for i, cell in enumerate(cells):
+        if int(cell.get("row_start") or 0) > header_hi:
+            continue
+        if max(int(cell.get("col_span") or 1), 1) != 1:
+            continue
+        if str(cell.get("text") or "").strip():
+            continue
+        x1, y1, x2, y2 = _cell_bbox(cell)
+        ix1, iy1, ix2, iy2 = _inset_xyxy(x1, y1, x2, y2)
+        iw, ih = max(ix2 - ix1, 1), max(iy2 - iy1, 1)
+        if ih < 36 or ih < 1.8 * iw:
+            continue
+        if _interior_ink_ratio(binary, cell) < 0.04:
+            continue
+        candidates.append(i)
+        if len(candidates) >= max_cells:
+            break
+
+    if not candidates:
+        return cells
+
+    slots: List[Tuple[int, int]] = []  # (cell_idx, rot)
+    crops: List[np.ndarray] = []
+    for idx in candidates:
+        crop, _bbox = _crop_cell(image, cells[idx], pad=2)
+        if crop.size == 0:
+            continue
+        # 再内缩一圈，减少框线进 OCR
+        ch, cw = crop.shape[:2]
+        mx = min(max(3, cw // 8), max(0, cw // 3))
+        my = min(max(3, ch // 8), max(0, ch // 3))
+        inner = crop[my : max(my + 1, ch - my), mx : max(mx + 1, cw - mx)]
+        if inner.size == 0:
+            inner = crop
+        for rot in (90, 270):
+            if rot == 90:
+                rotated = cv2.rotate(inner, cv2.ROTATE_90_CLOCKWISE)
+            else:
+                rotated = cv2.rotate(inner, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            crops.append(rotated)
+            slots.append((idx, rot))
+
+    if not crops:
+        return cells
+
+    canvas, rects, _scales = _pack_crops(crops, target_h=96, gap=20, max_width=1600)
+    cache_extra = "vheader=" + hashlib.sha1(
+        np.ascontiguousarray(canvas).tobytes()
+    ).hexdigest()[:16]
+    tbs = predict_texts(
+        canvas,
+        ocr_engine=ocr_engine,
+        use_cache=use_cache,
+        refresh_cache=refresh_cache,
+        cache_extra=cache_extra,
+    )
+
+    by_cell: Dict[int, List[Tuple[float, str, List[Dict[str, Any]]]]] = {}
+    for (cell_idx, _rot), rect in zip(slots, rects):
+        hit = _boxes_in_rect(tbs, rect)
+        if not hit:
+            continue
+        text = join_cell_texts(hit).strip()
+        if not text:
+            continue
+        score = _avg_score(hit)
+        by_cell.setdefault(cell_idx, []).append((score, text, hit))
+
+    filled = 0
+    for idx, opts in by_cell.items():
+        cell = cells[idx]
+        neighbors = set(_neighbor_texts(cells, cell))
+        accepted: List[Tuple[float, str, List[Dict[str, Any]]]] = []
+        for score, text, hit in opts:
+            if not _looks_like_vertical_header_text(text, score):
+                continue
+            if _compact_header_text(text) in neighbors:
+                continue
+            accepted.append((score, text, hit))
+        if not accepted:
+            continue
+        best_score, best_text, best_tbs = max(accepted, key=lambda x: (x[0], len(x[1])))
+        cell["texts"] = best_tbs
+        cell["text"] = best_text
+        filled += 1
+        logger.info(
+            "竖排空表头补回 col=%s: %r (score=%.3f)",
+            cell.get("col_start"),
+            best_text,
+            best_score,
+        )
+
+    if filled:
+        logger.info("竖排空表头补检: candidates=%d filled=%d", len(candidates), filled)
+    else:
+        logger.info("竖排空表头补检: candidates=%d filled=0", len(candidates))
     return cells

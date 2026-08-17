@@ -29,7 +29,7 @@ from .matching import assign_texts_to_cells
 from .models import load_lore_model, load_ocr, predict_cells, predict_texts
 from .ocr_post import postprocess_text_boxes
 from .orient import apply_orientation_axis, ensure_upright_axis, maybe_flip_180_by_ocr
-from .reocr import apply_reocr_to_cells
+from .reocr import apply_reocr_to_cells, recover_empty_vertical_headers
 from .refine import refine_table
 from .tsr import (
     cells_to_debug_table,
@@ -214,6 +214,14 @@ def _extract_via_lines(
             col_seps=table.col_seps,
             v_separators=table.v_separators,
         )
+        cells = recover_empty_vertical_headers(
+            image,
+            cells,
+            binary=binary,
+            ocr_engine=ocr_engine,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+        )
         if reocr:
             cells = apply_reocr_to_cells(
                 image,
@@ -294,6 +302,15 @@ def _extract_via_lore(
         split_cross_cell=True,
         table_bboxes=None,
         binary=binarize_otsu(image),
+    )
+    lore_binary = binarize_otsu(image)
+    cells = recover_empty_vertical_headers(
+        image,
+        cells,
+        binary=lore_binary,
+        ocr_engine=ocr_engine,
+        use_cache=use_cache,
+        refresh_cache=refresh_cache,
     )
     if reocr:
         cells = apply_reocr_to_cells(
@@ -471,6 +488,14 @@ def _extract_via_tsr(
         binary=binary,
         col_seps=col_seps,
         v_separators=v_separators,
+    )
+    cells = recover_empty_vertical_headers(
+        image,
+        cells,
+        binary=binary,
+        ocr_engine=ocr_engine,
+        use_cache=use_cache,
+        refresh_cache=refresh_cache,
     )
     if reocr:
         cells = apply_reocr_to_cells(
