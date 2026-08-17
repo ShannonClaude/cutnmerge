@@ -1,6 +1,6 @@
 # cutnmerge
 
-复杂表格解耦提取：**结构识别**与 **OCR 文本** 分离处理，再按 IoA（交叠面积比）将文本归属到单元格，默认输出 **HTML**（保留 `rowspan`/`colspan`）。
+复杂表格解耦提取：**结构识别**与 **OCR 文本** 分离处理，再按 IoA（交叠面积比）将文本归属到单元格，默认输出 **HTML**（保留 `rowspan`/`colspan`）+ **Markdown**（由最终 HTML 转换）。
 
 适用于有框线/弱框线的专利表、实验参数表等截图。默认使用 RapidAI TableStructureRec（有线/无线分流）做结构，并经拓扑后处理与网格证据校验；`--structure lines` / `lore` 可切换结构来源。文本一律走 PaddleOCR 云端 API（本地预处理后上传、坐标映回原图），结果可本地缓存以免重复消耗额度，OCR 产物（json/csv/标注图）默认落盘 `data/ocr/`。
 
@@ -59,7 +59,8 @@
 | `src/matching.py` | IoA 文本归属：跨列切分、行标签粘连拆分；多格命中取面积最小；单元格内文本排序拼接 |
 | `src/segments.py` | 子表行段切分（多级表头不误切、表体后重复表头仍切），供结构修复与渲染共用 |
 | `src/hline_repair.py` | 表头带假横切修复：按列检测横线墨迹，局部恢复 rowspan |
-| `src/formatter.py` | 基于逻辑拓扑的 **Markdown** 表格生成（合并单元格 Unrolling + 多子表拆分） |
+| `src/formatter.py` | 表格外自由文本格式化（主流程 Markdown 已改由 html2md 从最终 HTML 转换） |
+| `src/html2md.py` | 最终 **HTML → Markdown** 转换（BeautifulSoup 解析合并单元格、表头深度） |
 | `src/html_formatter.py` | 基于逻辑拓扑的 **HTML** 表格生成（保留 `rowspan`/`colspan`） |
 
 ### 6. 工具与测试（`tools/`）
@@ -69,7 +70,7 @@
 | `tools/regress.py` | 回归统计：cells / coverage / 丢字数（与 `data/debug/_regress_baseline.txt` 基线比对） |
 | `tools/inspect_grid.py` | 网格结构检查（调试用） |
 | `tools/run_hline_verify.py` | 在 P96/P97/P98/P109/P135 上跑 pipeline 并打印 HTML 检查摘要 |
-| `tools/test_*.py` | 单元/回归测试：hline_repair、窄序号列保留、行段切分、sticky 行标粘连切分 |
+| `tools/test_*.py` | 单元/回归测试：hline_repair、窄序号列保留、OCR 文本修复、行段切分、sticky 行标粘连切分 |
 
 ## 二、安装与环境
 
@@ -104,7 +105,6 @@ cp .env.example .env
 | `PADDLEOCR_BASE_URL` | 自定义 API 地址 | 官方默认 |
 | `PADDLEOCR_TASK` | `ocr`（当前云端路径仅支持 `ocr`，细粒度文本框供 IoA 填格；`doc_parsing` 已不再支持） | `ocr` |
 | `PADDLEOCR_OCR_MODEL` | OCR 任务模型名 | `PP-OCRv6` |
-| `PADDLEOCR_VL_MODEL` | 版面解析模型名 | `PaddleOCR-VL-1.6` |
 | `PADDLEOCR_REQUEST_TIMEOUT` | 请求超时（秒） | `300` |
 | `PADDLEOCR_POLL_TIMEOUT` | 轮询超时（秒） | `600` |
 | `PADDLEOCR_JOBS_URL` | 自定义 OCR job API 地址 | 官方默认 |
@@ -129,17 +129,17 @@ cp .env.example .env
 将表格图片放入 `data/input/`（支持 png / jpg / jpeg / bmp / tif / tiff / webp）：
 
 ```bash
-# 批量：扫描 data/input/，写出 data/output/<同名>.html
+# 批量：扫描 data/input/，写出 data/output/<同名>.html + .md + 两张彩图
 python main.py
 
 # 单图
 python main.py --image data/input/demo.png
 python main.py --image data/input/demo.png --output data/output/demo.html
 
-# 输出格式
-python main.py --format html    # 默认，保留 rowspan/colspan
-python main.py --format md
-python main.py --format both
+# 输出格式（默认 both：html + md，md 由最终 HTML 经 html2md 转换）
+python main.py --format both    # 默认：html + md
+python main.py --format html    # 仅 html，保留 rowspan/colspan
+python main.py --format md      # 仅 md
 
 # 结构来源（模块区分见上文）
 python main.py --structure tsr     # 默认 TableStructureRec（有线/无线分流 + 拓扑后处理 + 网格证据校验）
@@ -156,6 +156,7 @@ python main.py --tsr-aggressive   # 激进后处理：补列/重建表头/横切
 # 可疑单元格二次 OCR（费时/耗 API）
 python main.py --reocr
 python main.py --reocr --reocr-max-cells 12
+python main.py --no-reocr                # 显式关闭（覆盖 .env REOCR）
 
 # 建议用同一批失败样例对比结构来源
 python main.py --structure lines --debug
@@ -170,7 +171,7 @@ python main.py --no-cache                    # 禁用 OCR 缓存，每次请求�
 python main.py --refresh-cache               # 强制重拉 OCR 并覆盖缓存
 python main.py --keep-empty-cols             # 保留整列为空的列（默认压缩删除）
 python main.py --debug                       # 网格叠加图写到 data/debug/
-python main.py --no-vis                      # 关闭表格划线可视化（默认写 *_table_vis.png）
+python main.py --no-vis                      # 关闭表格划线可视化（默认写 *_table_vis.png / *_table_vis_logic.png）
 ```
 
 回归统计：
@@ -217,7 +218,8 @@ cutnmerge/
     ├── segments.py      # 子表行段切分
     ├── hline_repair.py  # 表头假横切修复
     ├── label_patterns.py# 行标签/数值模式
-    ├── formatter.py     # Markdown 组装
+    ├── formatter.py     # 表格外自由文本格式化
+    ├── html2md.py       # HTML → Markdown 转换
     ├── html_formatter.py# HTML（rowspan/colspan）
     └── config.py        # .env 配置
 ```
@@ -324,7 +326,8 @@ print(out["html"])
 | `src/matching.py` | IoA text assignment: cross-column splits, row-label sticking splits; multi-cell hits take the smallest area; sorts text inside cells |
 | `src/segments.py` | Sub-table row-segment splitting (multi-level headers not wrongly cut; repeated headers after body still split); shared by repair and rendering |
 | `src/hline_repair.py` | Fake header cross-line repair: detects horizontal ink per column, locally restores `rowspan` |
-| `src/formatter.py` | Logical-topology **Markdown** generation (merged-cell unrolling + multi-subtable splitting) |
+| `src/formatter.py` | Free-text formatting (text outside tables; the pipeline's Markdown is now produced by html2md from the final HTML) |
+| `src/html2md.py` | Final **HTML → Markdown** conversion (BeautifulSoup: merged cells, header depth) |
 | `src/html_formatter.py` | Logical-topology **HTML** generation (preserves `rowspan`/`colspan`) |
 
 ### Tools & Tests (`tools/`)
@@ -334,7 +337,7 @@ print(out["html"])
 | `tools/regress.py` | Regression stats: cells / coverage / dropped chars, diffed against the `data/debug/_regress_baseline.txt` baseline |
 | `tools/inspect_grid.py` | Grid-structure inspection (debugging) |
 | `tools/run_hline_verify.py` | Runs the pipeline on P96/P97/P98/P109/P135 and prints a short HTML check summary |
-| `tools/test_*.py` | Unit/regression tests: hline_repair, narrow index-column preservation, row-segment splitting, sticky row-label splitting |
+| `tools/test_*.py` | Unit/regression tests: hline_repair, narrow index-column preservation, OCR text-fix, row-segment splitting, sticky row-label splitting |
 
 ## 2. Installation & Environment
 
@@ -369,7 +372,6 @@ cp .env.example .env
 | `PADDLEOCR_BASE_URL` | Custom API base URL | official default |
 | `PADDLEOCR_TASK` | `ocr` (the cloud path only supports `ocr` — fine-grained boxes for IoA filling; `doc_parsing` is no longer supported) | `ocr` |
 | `PADDLEOCR_OCR_MODEL` | OCR task model | `PP-OCRv6` |
-| `PADDLEOCR_VL_MODEL` | Layout-parsing model | `PaddleOCR-VL-1.6` |
 | `PADDLEOCR_REQUEST_TIMEOUT` | Request timeout (s) | `300` |
 | `PADDLEOCR_POLL_TIMEOUT` | Poll timeout (s) | `600` |
 | `PADDLEOCR_JOBS_URL` | Custom OCR job API URL | official default |
@@ -394,17 +396,17 @@ cp .env.example .env
 Put table images into `data/input/` (png / jpg / jpeg / bmp / tif / tiff / webp):
 
 ```bash
-# Batch: scan data/input/, write data/output/<same-name>.html
+# Batch: scan data/input/, write data/output/<same-name>.html + .md + two colored visualizations
 python main.py
 
 # Single image
 python main.py --image data/input/demo.png
 python main.py --image data/input/demo.png --output data/output/demo.html
 
-# Output format
-python main.py --format html    # default, preserves rowspan/colspan
-python main.py --format md
-python main.py --format both
+# Output format (default both: html + md; md is converted from the final HTML by html2md)
+python main.py --format both    # default: html + md
+python main.py --format html    # html only, preserves rowspan/colspan
+python main.py --format md      # md only
 
 # Structure source (see Module Map above)
 python main.py --structure tsr     # default: TableStructureRec (wired/lineless + topology + grid evidence)
@@ -421,6 +423,7 @@ python main.py --tsr-aggressive   # aggressive: fill columns / rebuild header / 
 # Second-pass OCR for suspicious cells (slow / costs API quota)
 python main.py --reocr
 python main.py --reocr --reocr-max-cells 12
+python main.py --no-reocr                # explicitly disable (overrides .env REOCR)
 
 # Compare structure sources on the same failing samples
 python main.py --structure lines --debug
@@ -435,7 +438,7 @@ python main.py --no-cache                    # disable OCR cache, always hit the
 python main.py --refresh-cache               # force re-OCR and overwrite cache
 python main.py --keep-empty-cols             # keep fully-empty columns (dropped by default)
 python main.py --debug                       # write grid overlay images to data/debug/
-python main.py --no-vis                      # disable table-line visualization (default writes *_table_vis.png)
+python main.py --no-vis                      # disable table-line visualization (default writes *_table_vis.png / *_table_vis_logic.png)
 ```
 
 Regression stats:
@@ -482,7 +485,8 @@ cutnmerge/
     ├── segments.py      # sub-table row segmentation
     ├── hline_repair.py  # header fake-cross-line repair
     ├── label_patterns.py# row-label / numeric patterns
-    ├── formatter.py     # Markdown assembly
+    ├── formatter.py     # free-text formatting (outside tables)
+    ├── html2md.py       # HTML → Markdown conversion
     ├── html_formatter.py# HTML (rowspan/colspan)
     └── config.py        # .env config
 ```
