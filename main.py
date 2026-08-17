@@ -3,10 +3,10 @@
 
 用法:
     python main.py
-        # 默认：tsr 结构，写出 data/output/<同名>.html + 划线可视化
+        # 默认：tsr 结构，写出 data/output/<同名>.html + .md + 两张彩图
     python main.py --image data/input/demo.png
     python main.py --structure lines --debug
-    python main.py --format both
+    python main.py --format html
     python main.py --no-vis
     python main.py --no-cache
     python main.py --refresh-cache
@@ -49,7 +49,7 @@ def list_input_images(input_dir: Path = DEFAULT_INPUT_DIR) -> List[Path]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="结构与文本解耦的复杂表格提取（默认 TSR + 云端 OCR + IoA → HTML）",
+        description="结构与文本解耦的复杂表格提取（默认 TSR + 云端 OCR + IoA → HTML/MD + 彩图）",
     )
     parser.add_argument(
         "--image",
@@ -67,9 +67,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--format",
         type=str,
-        default="html",
+        default="both",
         choices=["html", "md", "both"],
-        help="输出格式：html（默认，保留 rowspan/colspan）/ md / both",
+        help="输出格式：both（默认，html+md）/ html / md；md 由 html2md 从 html 转换",
     )
     parser.add_argument(
         "--ioa-threshold",

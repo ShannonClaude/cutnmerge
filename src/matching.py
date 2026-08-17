@@ -584,6 +584,23 @@ def _col_index_for_slot(slot: Tuple[float, float], col_seps: Sequence[float]) ->
     return -1
 
 
+def _row_tol_for_cell(
+    cb: Tuple[float, float, float, float],
+    cell: Optional[Dict[str, Any]] = None,
+    *,
+    frac: float = 0.55,
+) -> float:
+    """
+    文本与单元格是否同行的 Y 容差。
+
+    rowspan>1 的高表头格：中心偏中部，表头上/下带 OCR 行仍应命中，故按高度比例放宽。
+    """
+    h = max(cb[3] - cb[1], 1.0)
+    rs = max(int((cell or {}).get("row_span") or 1), 1)
+    use_frac = 0.65 if rs > 1 else frac
+    return max(12.0, h * use_frac)
+
+
 def _overlapping_atomic_cols(
     tb: Dict[str, Any],
     cells: List[Dict[str, Any]],
@@ -594,13 +611,12 @@ def _overlapping_atomic_cols(
     cy = (tb_box[1] + tb_box[3]) / 2.0
     out: List[Tuple[int, Tuple[float, float, float, float]]] = []
     for i, cell in enumerate(cells):
-        if max(int(cell.get("row_span") or 1), 1) > 1:
-            continue
+        # 允许 rowspan>1（比率类竖向合并表头）；跳过横向合并格
         if max(int(cell.get("col_span") or 1), 1) > 1:
             continue
         cb = _cell_bbox(cell)
         cell_cy = (cb[1] + cb[3]) / 2.0
-        row_tol = max(12.0, (cb[3] - cb[1]) * 0.55)
+        row_tol = _row_tol_for_cell(cb, cell)
         if abs(cell_cy - cy) > row_tol:
             continue
         xo = _x_overlap(tb_box, cb)
@@ -879,13 +895,12 @@ def _try_split_across_cells(
         slots = []
         cell_targets = []
         for i, cell in enumerate(cells):
-            if max(int(cell.get("row_span") or 1), 1) > 1:
-                continue
+            # 允许 rowspan>1 表头作为切分目标；跳过横向合并格
             if max(int(cell.get("col_span") or 1), 1) > 1:
                 continue
             cb = _cell_bbox(cell)
             cell_cy = (cb[1] + cb[3]) / 2.0
-            row_tol = max(12.0, (cb[3] - cb[1]) * 0.6)
+            row_tol = _row_tol_for_cell(cb, cell, frac=0.6)
             if abs(cell_cy - cy) > row_tol:
                 continue
             cell_w = max(cb[2] - cb[0], 1.0)
@@ -906,7 +921,7 @@ def _try_split_across_cells(
             for i, cell in enumerate(cells):
                 cb = _cell_bbox(cell)
                 cell_cy = (cb[1] + cb[3]) / 2.0
-                row_tol = max(12.0, (cb[3] - cb[1]) * 0.6)
+                row_tol = _row_tol_for_cell(cb, cell, frac=0.6)
                 if abs(cell_cy - cy) > row_tol:
                     continue
                 if cb[0] - 2 <= mid <= cb[2] + 2:
@@ -934,46 +949,75 @@ def _try_split_across_cells(
         return False
 
     ink, abs_x0, box_h, pitch = _ink_profile(binary, tb_box)
-    if ink.size == 0:
-        return False
     char_pitch = max(4.0, text_w / max(len(text), 1))
-    med_gap = _empty_run_median(ink, box_h)
     # 宽间隙：约 0.55 字宽；重复标签可走窄间隙例外
     wide_need = max(4.0, 0.55 * char_pitch)
 
     snapped: List[float] = []
     run_widths: List[float] = []
-    for j in range(len(slots) - 1):
-        boundary = slots[j][1]
-        hit = _boundary_has_ink_gutter(boundary, ink, abs_x0, box_h, char_pitch)
-        if hit is None:
-            hit = _boundary_has_ink_gutter(slots[j + 1][0], ink, abs_x0, box_h, char_pitch)
-        if hit is None:
-            return False
-        snap, run_w = hit
-        snapped.append(snap)
-        run_widths.append(run_w)
+    use_geom_fallback = False
 
-    cut_indices = [_x_to_char_index(text, (sx - tb_box[0]) / text_w) for sx in snapped]
-    cuts = [0] + cut_indices + [len(text)]
-    for i in range(1, len(cuts)):
-        if cuts[i] < cuts[i - 1]:
-            cuts[i] = cuts[i - 1]
-
-    if _split_breaks_paired_marks(text, cuts):
-        return False
-
-    all_wide = all(w >= wide_need for w in run_widths)
-    compact = re.sub(r"\s+", "", text)
-    is_repeat = _looks_like_repeated_header_units(text)
-    fits = _pieces_match_slot_widths(text, cuts, slots)
-    if all_wide:
-        # 非重复标签还须列宽比例匹配，避免「基团的|化合物」这类误切
-        if not is_repeat and not fits:
+    if ink.size == 0:
+        # 无墨水剖面时：仅 col_seps 槽位允许按列界比例切
+        use_geom_fallback = col_seps is not None and len(slots) >= 2
+        if not use_geom_fallback:
             return False
     else:
-        if not (is_repeat and fits):
+        for j in range(len(slots) - 1):
+            boundary = slots[j][1]
+            hit = _boundary_has_ink_gutter(boundary, ink, abs_x0, box_h, char_pitch)
+            if hit is None:
+                hit = _boundary_has_ink_gutter(
+                    slots[j + 1][0], ink, abs_x0, box_h, char_pitch
+                )
+            if hit is None:
+                # 密表头粘连框常无字间宽沟：有 col_seps 时按列界几何切分兜底
+                use_geom_fallback = col_seps is not None and len(slots) >= 2
+                if not use_geom_fallback:
+                    return False
+                snapped = []
+                run_widths = []
+                break
+            snap, run_w = hit
+            snapped.append(snap)
+            run_widths.append(run_w)
+
+    if use_geom_fallback:
+        snapped = [slots[j][1] for j in range(len(slots) - 1)]
+        cut_indices = [
+            _x_to_char_index(text, (sx - tb_box[0]) / text_w) for sx in snapped
+        ]
+        cuts = [0] + cut_indices + [len(text)]
+        for i in range(1, len(cuts)):
+            if cuts[i] < cuts[i - 1]:
+                cuts[i] = cuts[i - 1]
+        if _split_breaks_paired_marks(text, cuts):
             return False
+        if not _pieces_match_slot_widths(text, cuts, slots):
+            return False
+    else:
+        cut_indices = [
+            _x_to_char_index(text, (sx - tb_box[0]) / text_w) for sx in snapped
+        ]
+        cuts = [0] + cut_indices + [len(text)]
+        for i in range(1, len(cuts)):
+            if cuts[i] < cuts[i - 1]:
+                cuts[i] = cuts[i - 1]
+
+        if _split_breaks_paired_marks(text, cuts):
+            return False
+
+        all_wide = all(w >= wide_need for w in run_widths)
+        is_repeat = _looks_like_repeated_header_units(text)
+        fits = _pieces_match_slot_widths(text, cuts, slots)
+        if all_wide:
+            # 非重复标签还须列宽比例匹配，避免「基团的|化合物」这类误切
+            if not is_repeat and not fits:
+                return False
+        else:
+            if not (is_repeat and fits):
+                return False
+
     for i in range(len(slots)):
         part = text[cuts[i] : cuts[i + 1]].strip()
         slot_w = slots[i][1] - slots[i][0]
