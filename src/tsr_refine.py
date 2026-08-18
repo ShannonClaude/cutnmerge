@@ -778,9 +778,9 @@ def looks_oversegmented(
         return False
     n_boxes = len(text_boxes)
     n_cols, n_rows, n = cell_grid_stats(cells)
-    if n_cols >= 36:
+    if n_cols >= 32:
         return True
-    if n_rows >= 48 and n_rows > max(24, n_boxes // 6):
+    if n_rows >= 32 and n_rows > max(16, n_boxes // 6):
         return True
     if n > n_boxes * 1.05 and (n_cols >= 28 or n_rows >= 40):
         return True
@@ -1809,6 +1809,27 @@ def refine_tsr_cells_light(
     if not cells:
         return cells
     return dedupe_overlapping_cells(cells)
+
+
+def logic_conflict_ratio(cells: Sequence[Dict[str, Any]]) -> float:
+    """逻辑网格位置重叠比例：重叠位置数 / 总覆盖位置数（0 表示完整无重叠的合法网格）。"""
+    if not cells:
+        return 0.0
+    occupied: set = set()
+    conflicts = 0
+    total = 0
+    for c in cells:
+        rs, re_ = int(c["row_start"]), int(c["row_end"])
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        for r in range(rs, re_ + 1):
+            for col in range(cs, ce + 1):
+                total += 1
+                key = (r, col)
+                if key in occupied:
+                    conflicts += 1
+                else:
+                    occupied.add(key)
+    return conflicts / max(total, 1)
 
 
 _MONOMER_PARENT_RE = re.compile(r"单体\s*[\[［]")

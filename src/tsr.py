@@ -306,12 +306,13 @@ def _pick_finer_grid(
         logger.info("TSR 选用 %s（覆盖率更优）", alt_label)
         return alt
 
-    # 列更细且未过切：允许覆盖率略低
+    # 列更细且未过切：允许覆盖率略低，但结构质量不能明显更差
     cov_slack = 0.10 if (hybrid or pri_under) else 0.05
     if (
         a_cols >= p_cols + 2
         and not alt_over
         and score_a >= score_p - cov_slack
+        and q_a >= q_p - 0.04
     ):
         logger.info(
             "TSR 选用 %s（列更细: %d→%d, cov %.3f→%.3f）",
@@ -327,6 +328,7 @@ def _pick_finer_grid(
         and a_cols > p_cols
         and not alt_over
         and score_a >= score_p - cov_slack
+        and q_a >= q_p - 0.04
     ):
         logger.info(
             "TSR 选用 %s（hybrid/欠切 列粒度: %d→%d）",

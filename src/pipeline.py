@@ -29,7 +29,7 @@ from .matching import assign_texts_to_cells
 from .models import load_lore_model, load_ocr, predict_cells, predict_texts
 from .ocr_post import postprocess_text_boxes
 from .orient import apply_orientation_axis, ensure_upright_axis, maybe_flip_180_by_ocr
-from .reocr import apply_reocr_to_cells
+from .reocr import apply_reocr_to_cells, recover_empty_vertical_headers
 from .refine import refine_table
 from .tsr import (
     cells_to_debug_table,
@@ -39,6 +39,7 @@ from .tsr import (
 )
 from .tsr_refine import (
     coverage_score,
+    logic_conflict_ratio,
     reconstruct_header_cells,
     refine_tsr_cells,
     refine_tsr_cells_light,
@@ -53,6 +54,8 @@ DEFAULT_OUTPUT_DIR = ROOT / "data" / "output"
 
 # auto 模式下框线网格最低置信度（仅 --structure lines/auto 的旧路径）
 _LINES_CONF_THRESH = 0.35
+# 轻量路径逻辑格重叠比例过高时，自动升级到 aggressive + 线融合
+_LIGHT_ESCALATE_CONFLICT_RATIO = 0.02
 
 
 def _imread_unicode(path: str) -> np.ndarray:
@@ -98,7 +101,10 @@ def _hough_skew_angle(gray: np.ndarray, max_angle: float) -> Optional[float]:
 
     angles = []
     for line in lines:
-        x1, y1, x2, y2 = line[0]
+        pts = np.asarray(line).reshape(-1)
+        if pts.size < 4:
+            continue
+        x1, y1, x2, y2 = (int(pts[0]), int(pts[1]), int(pts[2]), int(pts[3]))
         if x2 == x1 and y2 == y1:
             continue
         angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
@@ -208,6 +214,14 @@ def _extract_via_lines(
             col_seps=table.col_seps,
             v_separators=table.v_separators,
         )
+        cells = recover_empty_vertical_headers(
+            image,
+            cells,
+            binary=binary,
+            ocr_engine=ocr_engine,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+        )
         if reocr:
             cells = apply_reocr_to_cells(
                 image,
@@ -289,6 +303,15 @@ def _extract_via_lore(
         table_bboxes=None,
         binary=binarize_otsu(image),
     )
+    lore_binary = binarize_otsu(image)
+    cells = recover_empty_vertical_headers(
+        image,
+        cells,
+        binary=lore_binary,
+        ocr_engine=ocr_engine,
+        use_cache=use_cache,
+        refresh_cache=refresh_cache,
+    )
     if reocr:
         cells = apply_reocr_to_cells(
             image,
@@ -330,6 +353,7 @@ def _extract_via_tsr(
         image, text_boxes=text_boxes, force_kind=force_kind
     )
     line_tables: list = []
+    escalated_from_light = False
     if cells:
         if tsr_aggressive:
             cells = refine_tsr_cells(cells, text_boxes)
@@ -339,9 +363,40 @@ def _extract_via_tsr(
             if line_tables:
                 cells = fuse_tsr_with_lines(cells, line_tables)
         else:
-            cells = refine_tsr_cells_light(cells)
-            cells = repair_monomer_parent_spans(cells, text_boxes)
-            logger.info("TSR-first 轻量路径：跳过激进 refine / 线融合；已尝试单体父格对齐")
+            light_cells = refine_tsr_cells_light(cells)
+            light_cells = repair_monomer_parent_spans(light_cells, text_boxes)
+            conflict_ratio = logic_conflict_ratio(light_cells)
+            if conflict_ratio > _LIGHT_ESCALATE_CONFLICT_RATIO:
+                logger.info(
+                    "TSR-light 逻辑格重叠比例过高(%.3f)，自动升级 aggressive 融合",
+                    conflict_ratio,
+                )
+                agg_cells = refine_tsr_cells(cells, text_boxes)
+                probe_lines = detect_tables(
+                    image, confidence_thresh=0.0, text_boxes=text_boxes
+                )
+                fused = (
+                    fuse_tsr_with_lines(agg_cells, probe_lines)
+                    if probe_lines
+                    else agg_cells
+                )
+                fused_ratio = logic_conflict_ratio(fused)
+                if fused_ratio < conflict_ratio:
+                    cells = fused
+                    line_tables = probe_lines
+                    escalated_from_light = True
+                    logger.info(
+                        "TSR-light 已升级融合: conflict %.3f → %.3f",
+                        conflict_ratio,
+                        fused_ratio,
+                    )
+                else:
+                    cells = light_cells
+            else:
+                cells = light_cells
+                logger.info(
+                    "TSR-first 轻量路径：跳过激进 refine / 线融合；已尝试单体父格对齐"
+                )
 
     cov = coverage_score(cells, text_boxes) if cells else 0.0
     # 覆盖率偏低或格子过少时回退（竖排表头等场景常出现「有格但几乎填不进」）
@@ -401,6 +456,19 @@ def _extract_via_tsr(
                 key=lambda t: float(getattr(t, "confidence", 0.0) or 0.0),
             )
             v_separators = getattr(best, "v_separators", None)
+    elif escalated_from_light:
+        # 融合后的网格已无逻辑重叠；不再重建表头（会把多级表头压成过少列）。
+        from .tsr_refine import _derive_seps as _derive_seps_local
+
+        _row_seps, col_seps_list = _derive_seps_local(cells)
+        if len(col_seps_list) >= 3:
+            col_seps = col_seps_list
+        if line_tables:
+            best = max(
+                line_tables,
+                key=lambda t: float(getattr(t, "confidence", 0.0) or 0.0),
+            )
+            v_separators = getattr(best, "v_separators", None)
     else:
         # 默认路径：仅表头带按列横线连通性局部恢复 rowspan（不改列、不开激进融合）
         from .hline_repair import repair_rowspans_by_hline_gaps
@@ -420,6 +488,14 @@ def _extract_via_tsr(
         binary=binary,
         col_seps=col_seps,
         v_separators=v_separators,
+    )
+    cells = recover_empty_vertical_headers(
+        image,
+        cells,
+        binary=binary,
+        ocr_engine=ocr_engine,
+        use_cache=use_cache,
+        refresh_cache=refresh_cache,
     )
     if reocr:
         cells = apply_reocr_to_cells(

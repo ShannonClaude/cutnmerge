@@ -246,12 +246,14 @@ def _maybe_tiny_one_to_dash(
 
 
 def _strip_leading_pipe_digits(text: str) -> str:
-    """去掉表格竖线噪点：'|93'→'93'；'比较例 8|93'→'比较例 8 93'。"""
+    """去掉表格竖线噪点：'|93'→'93'；'比较例 8|93'→'比较例 8 93'；'37|Bk-2'→'37 Bk-2'。"""
     t = (text or "").strip()
-    m = re.fullmatch(r"\|+(\d+)", t)
+    if not t:
+        return t
+    m = re.fullmatch(r"\|+(.+)", t)
     if m:
         return m.group(1)
-    t2 = re.sub(r"\|+(\d+)", r" \1", t)
+    t2 = re.sub(r"\|+", " ", t)
     return re.sub(r"\s+", " ", t2).strip()
 
 
