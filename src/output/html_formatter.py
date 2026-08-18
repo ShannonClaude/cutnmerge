@@ -308,8 +308,17 @@ def drop_evidenceless_columns(cells: List[Dict[str, Any]], *, narrow_ratio: floa
             any_text and all(_is_frag(t) for t in texts)
         )
         spans_cross = any(int(c.get("col_span") or 1) > 1 for c in covered_cells)
-        if spans_cross and any(not _is_frag(t) for t in texts):
-            continue
+        if spans_cross:
+            atomic_texts = [
+                str(c.get("text") or "").strip()
+                for c in covered_cells
+                if int(c.get("col_span") or 1) == 1
+            ]
+            if any(not _is_frag(t) for t in atomic_texts):
+                continue
+            if not atomic_texts:
+                dropped.add(col)
+                continue
 
         # 该列的窄宽度判断：取其原子 cell 的宽度中位数
         widths: List[float] = []
@@ -482,6 +491,105 @@ def drop_noise_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    合并表头中：上方有“实文本”的单行格，且正下方同列范围是空/碎片文本的单行格。
+
+    目标修复：诸如 P100X888 的“分散液”表头被切成两层的情况。
+    """
+    if not cells:
+        return cells
+
+    # 仅在“疑似表头区域”做修复：table 内如果没有任何 rowspan>1 的格，说明不存在多行表头
+    header_cutoff = -1
+    for c in cells:
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        if re > rs:
+            header_cutoff = max(header_cutoff, re)
+    if header_cutoff < 1:
+        return cells
+
+    def _is_frag_or_empty(text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return True
+        compact = "".join(t.split())
+        return len(compact) <= 2 or compact in {"-", "—", "_"}
+
+    # 用 (row_start, col_start, col_end) 精确匹配“正下方同列范围”的格
+    # （注意：某些表头“空格”在 TSR/cells 中可能根本不存在，此时 renderer 会输出空 <td>。）
+    by_key: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+    for c in cells:
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        if rs == re:  # 只在 atomic row 内尝试“向下合并”
+            by_key[(rs, cs, ce)] = c
+
+    # 判断某个“(next_row, column_range)”区域是否被任何非空 cell 占用
+    def _occupied_by_nonempty(next_row: int, cs: int, ce: int) -> bool:
+        for c in cells:
+            rs, re = int(c["row_start"]), int(c["row_end"])
+            cols_s, cols_e = int(c["col_start"]), int(c["col_end"])
+            if not (rs <= next_row <= re):
+                continue
+            # c 的列范围至少覆盖目标列范围
+            if not (cols_s <= cs and cols_e >= ce):
+                continue
+            if str(c.get("text") or "").strip():
+                return True
+        return False
+
+    dropped_ids: Set[int] = set()
+    out: List[Dict[str, Any]] = []
+    for upper in cells:
+        if id(upper) in dropped_ids:
+            continue
+
+        ur = int(upper["row_start"])
+        ue = int(upper["row_end"])
+        uc_s = int(upper["col_start"])
+        uc_e = int(upper["col_end"])
+        upper_text = str(upper.get("text") or "").strip()
+
+        # 只合并 header_cutoff 内、且上方格为单行格的情况
+        if ue != ur:
+            out.append(upper)
+            continue
+        if ur > header_cutoff - 1:
+            out.append(upper)
+            continue
+        # 只处理单列表头：避免把诸如“组成[质量%]”(colspan>1) 的大格也错误向下延展
+        if uc_s != uc_e:
+            out.append(upper)
+            continue
+        if not upper_text or _is_frag_or_empty(upper_text):
+            out.append(upper)
+            continue
+
+        lower = by_key.get((ue + 1, uc_s, uc_e))
+        if lower is None:
+            # 下方没有 cell 对象时，renderer 会输出空 td；若没有任何非空 cell 占用该区域，则直接扩展 upper rowspan
+            next_row = ue + 1
+            if not _occupied_by_nonempty(next_row, uc_s, uc_e):
+                upper["row_end"] = next_row
+                upper["row_span"] = int(upper["row_end"]) - int(upper["row_start"]) + 1
+            out.append(upper)
+            continue
+
+        lower_text = str(lower.get("text") or "")
+        if not _is_frag_or_empty(lower_text):
+            out.append(upper)
+            continue
+
+        # 合并：把 lower 的行范围并入 upper，丢弃 lower
+        upper["row_end"] = int(lower["row_end"])
+        upper["row_span"] = int(upper["row_end"]) - int(upper["row_start"]) + 1
+        dropped_ids.add(id(lower))
+        out.append(upper)
+
+    return out
+
+
 def _escape_cell_text(text: str) -> str:
     t = (text or "").strip()
     if not t:
@@ -513,6 +621,7 @@ def cells_to_html_table(
     if compress_empty:
         work = compress_empty_logic_columns(work)
         work = compress_empty_logic_rows(work)
+    work = _merge_header_empty_below(work)
     if not work:
         return ""
 

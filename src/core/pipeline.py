@@ -444,6 +444,9 @@ def _extract_via_tsr(
             line_tables=line_tables,
         )
         cells = reconstruct_header_cells(cells, text_boxes)
+        from ..structure.hline_repair import repair_colspans_by_vline_gaps
+
+        cells = repair_colspans_by_vline_gaps(cells, binary, text_boxes)
         from ..structure.tsr_refine import _derive_seps as _derive_seps_local
 
         _row_seps, col_seps_list = _derive_seps_local(cells)
@@ -470,10 +473,14 @@ def _extract_via_tsr(
             v_separators = getattr(best, "v_separators", None)
     else:
         # 默认路径：仅表头带按列横线连通性局部恢复 rowspan（不改列、不开激进融合）
-        from ..structure.hline_repair import repair_rowspans_by_hline_gaps
+        from ..structure.hline_repair import (
+            repair_colspans_by_vline_gaps,
+            repair_rowspans_by_hline_gaps,
+        )
         from ..structure.tsr_refine import _derive_seps as _derive_seps_local
 
         cells = repair_rowspans_by_hline_gaps(cells, binary, text_boxes)
+        cells = repair_colspans_by_vline_gaps(cells, binary, text_boxes)
         _row_seps, col_seps_list = _derive_seps_local(cells)
         if len(col_seps_list) >= 3:
             col_seps = col_seps_list

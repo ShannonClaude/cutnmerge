@@ -1,7 +1,7 @@
-"""表头带假横切修复：按列检测横线墨迹，局部恢复 rowspan。
+"""表头带假横切/竖切修复：按列检测横/竖线墨迹，局部恢复 rowspan/colspan。
 
-仅处理「首个表体行之前」的行界；不改列拓扑。
-合并条件：本列横线弱 +（空/碎片/sliver 或 OCR 竖跨该界）。
+- rowspan：仅处理「首个表体行之前」的行界；合并条件为横线弱 + 碎片/sliver/OCR 跨界/同列折行。
+- colspan：仅处理表头行内相邻原子格；表头竖线弱且表体竖线强时合并（表体竖线穿入表头）。
 """
 
 from __future__ import annotations
@@ -13,12 +13,25 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from .tsr_refine import _cell_bbox, _derive_seps, _rebuild_polygon, _refresh_spans
+from .tsr_refine import (
+    _cell_bbox,
+    dedupe_overlapping_cells,
+    _derive_seps,
+    _rebuild_polygon,
+    _refresh_spans,
+)
 
 logger = logging.getLogger(__name__)
 
 _DATA_ROW_RE = re.compile(
     r"(合成例|实施例|実施例|比較例|比较例|对照例|参考例)"
+)
+_PARENT_HDR_RE = re.compile(r"(单体\s*[\[［]|聚合物)")
+_CJK_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]"
+)
+_SUBHEADER_TAIL_RE = re.compile(
+    r"(衍生物|化合物|单体|封端剂|硅烷|当量|比率|低聚物|\)|）)$"
 )
 
 
@@ -83,6 +96,69 @@ def _hline_coverage_ratio(
     if col_hit.size == 0:
         return 1.0
     return float(np.mean(col_hit))
+
+
+def _vline_coverage_ratio(
+    binary: np.ndarray,
+    x: float,
+    y1: float,
+    y2: float,
+    *,
+    tol: float = 4.0,
+) -> float:
+    """
+    y1..y2 区间内、x 附近的「竖线」覆盖率（经竖直形态学）。
+    失败时偏保守返回 1.0（视为有线，不合并）。
+    """
+    if binary is None or binary.size == 0:
+        return 1.0
+    h, w = binary.shape[:2]
+    xa = max(0, int(round(x - tol)))
+    xb = min(w, int(round(x + tol + 1)))
+    ya = max(0, int(round(y1)))
+    yb = min(h, int(round(y2)))
+    if yb <= ya or xb <= xa + 2:
+        return 1.0
+    band = binary[ya:yb, xa:xb]
+    bh = int(band.shape[0])
+    kw = max(9, min(bh // 3, bh))
+    if kw < 3:
+        return float(np.mean(band > 0))
+    ker = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kw))
+    vmask = cv2.morphologyEx(band, cv2.MORPH_OPEN, ker, iterations=1)
+    row_hit = np.any(vmask > 0, axis=1)
+    if row_hit.size == 0:
+        return 1.0
+    return float(np.mean(row_hit))
+
+
+def _substantive_cjk_label(text: str) -> bool:
+    """表头子标签是否像完整的一列标题（而非折行碎片）。"""
+    t = _compact(text)
+    if len(t) < 5 or not _CJK_RE.search(t):
+        return False
+    if len(t) >= 12:
+        return True
+    return bool(_SUBHEADER_TAIL_RE.search(t))
+
+
+def _looks_like_two_independent_subheaders(left_text: str, right_text: str) -> bool:
+    """两侧 OCR 都像独立子表头时，禁止 colspan 合并。"""
+    return _substantive_cjk_label(left_text) and _substantive_cjk_label(right_text)
+
+
+def _same_column_wrap(
+    upper: Dict[str, Any],
+    lower: Dict[str, Any],
+    *,
+    min_ratio: float = 0.75,
+) -> bool:
+    ux1, _uy1, ux2, _uy2 = _cell_bbox(upper)
+    lx1, _ly1, lx2, _ly2 = _cell_bbox(lower)
+    overlap = min(ux2, lx2) - max(ux1, lx1)
+    uw = max(ux2 - ux1, 1.0)
+    lw = max(lx2 - lx1, 1.0)
+    return overlap / min(uw, lw) >= min_ratio
 
 
 def _ocr_texts_in_bbox(
@@ -165,6 +241,24 @@ def _merge_pair(
     merged["row_end"] = max(int(upper["row_end"]), int(lower["row_end"]))
     merged["col_start"] = min(int(upper["col_start"]), int(lower["col_start"]))
     merged["col_end"] = max(int(upper["col_end"]), int(lower["col_end"]))
+    _refresh_spans(merged)
+    merged["polygon"] = _rebuild_polygon(x1, y1, x2, y2)
+    return merged
+
+
+def _merge_horizontal_pair(
+    left: Dict[str, Any],
+    right: Dict[str, Any],
+) -> Dict[str, Any]:
+    lx1, ly1, lx2, ly2 = _cell_bbox(left)
+    rx1, ry1, rx2, ry2 = _cell_bbox(right)
+    x1, y1 = min(lx1, rx1), min(ly1, ry1)
+    x2, y2 = max(lx2, rx2), max(ly2, ry2)
+    merged = dict(left)
+    merged["row_start"] = int(left["row_start"])
+    merged["row_end"] = int(left["row_end"])
+    merged["col_start"] = min(int(left["col_start"]), int(right["col_start"]))
+    merged["col_end"] = max(int(left["col_end"]), int(right["col_end"]))
     _refresh_spans(merged)
     merged["polygon"] = _rebuild_polygon(x1, y1, x2, y2)
     return merged
@@ -260,7 +354,18 @@ def repair_rowspans_by_hline_gaps(
                 text_boxes, y, xa, xb, strip_half=strip_half
             )
 
-            # 弱墨迹已满足；双方都是短碎片时也合并（真·两级表头旁列通常有完整横线）
+            wrap_merge = False
+            if (
+                not u_frag
+                and not l_frag
+                and _substantive_cjk_label(u_joined)
+                and _substantive_cjk_label(l_joined)
+                and _same_column_wrap(upper, lower)
+                and not _PARENT_HDR_RE.search(u_joined)
+                and not _PARENT_HDR_RE.search(l_joined)
+            ):
+                wrap_merge = True
+
             evidence = (
                 (u_frag and not l_frag)
                 or (l_frag and not u_frag)
@@ -268,6 +373,7 @@ def repair_rowspans_by_hline_gaps(
                 or u_sliver
                 or l_sliver
                 or crosses
+                or wrap_merge
             )
             if not evidence:
                 continue
@@ -278,7 +384,7 @@ def repair_rowspans_by_hline_gaps(
             to_add.append(merged)
             merges += 1
             logger.debug(
-                "hline_repair: merge col=%s rows=%d+%d ink=%.2f frag=(%s,%s) cross=%s",
+                "hline_repair: merge col=%s rows=%d+%d ink=%.2f frag=(%s,%s) cross=%s wrap=%s",
                 key,
                 upper_row,
                 lower_row,
@@ -286,6 +392,7 @@ def repair_rowspans_by_hline_gaps(
                 u_frag,
                 l_frag,
                 crosses,
+                wrap_merge,
             )
 
         if to_drop:
@@ -299,4 +406,163 @@ def repair_rowspans_by_hline_gaps(
             body_row,
             max_boundary - 1,
         )
+    return work
+
+
+def repair_colspans_by_vline_gaps(
+    cells: List[Dict[str, Any]],
+    binary: np.ndarray,
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
+    *,
+    tol: float = 4.0,
+    header_max_vline: float = 0.15,
+    body_min_vline: float = 0.40,
+) -> List[Dict[str, Any]]:
+    """
+    表头带内：若列界在表头 Y 带竖线弱、在表体 Y 带竖线强，则合并相邻表头格为 colspan。
+
+    只改表头 col_* 与 polygon；表体列结构不动。
+    """
+    if not cells or binary is None or binary.size == 0:
+        return cells
+
+    text_boxes = list(text_boxes or [])
+    row_seps, col_seps = _derive_seps(cells)
+    if len(row_seps) < 3 or len(col_seps) < 3:
+        return cells
+
+    n_rows = len(row_seps) - 1
+    body_row = _first_body_row_index(cells, text_boxes, row_seps)
+    body_row = min(max(body_row, 1), n_rows - 1)
+    if body_row <= 0:
+        return cells
+
+    body_y1 = float(row_seps[body_row])
+    body_y2 = float(row_seps[min(body_row + 2, n_rows)])
+
+    work = [dict(c) for c in cells]
+    merges = 0
+
+    for header_row in range(body_row):
+        for col_boundary in range(len(col_seps) - 2, 0, -1):
+            left_col = col_boundary - 1
+            right_col = col_boundary
+            left_idx = None
+            right_idx = None
+            for idx, cell in enumerate(work):
+                rs, re = int(cell["row_start"]), int(cell["row_end"])
+                cs, ce = int(cell["col_start"]), int(cell["col_end"])
+                if rs != re or rs != header_row:
+                    continue
+                if max(int(cell.get("col_span") or 1), 1) != 1:
+                    continue
+                if cs == ce == left_col:
+                    left_idx = idx
+                elif cs == ce == right_col:
+                    right_idx = idx
+            if left_idx is None or right_idx is None:
+                continue
+
+            left, right = work[left_idx], work[right_idx]
+            lx1, ly1, lx2, ly2 = _cell_bbox(left)
+            rx1, ry1, rx2, ry2 = _cell_bbox(right)
+            x = float(col_seps[col_boundary])
+
+            header_v = _vline_coverage_ratio(binary, x, ly1, ly2, tol=tol)
+            if header_v >= header_max_vline:
+                continue
+
+            body_v = _vline_coverage_ratio(binary, x, body_y1, body_y2, tol=tol)
+            if body_v < body_min_vline:
+                continue
+
+            l_texts = _ocr_texts_in_bbox(text_boxes, (lx1, ly1, lx2, ly2))
+            r_texts = _ocr_texts_in_bbox(text_boxes, (rx1, ry1, rx2, ry2))
+            if _looks_like_two_independent_subheaders(
+                " ".join(l_texts), " ".join(r_texts)
+            ):
+                continue
+
+            merged = _merge_horizontal_pair(left, right)
+            work[left_idx] = merged
+            work.pop(right_idx)
+            merges += 1
+            logger.debug(
+                "vline_repair: merge header row=%d cols %d+%d hv=%.2f bv=%.2f",
+                header_row,
+                left_col,
+                right_col,
+                header_v,
+                body_v,
+            )
+
+    # --- Second pass: absorb empty header cells into left non-empty neighbor ---
+    # Handles cases where a multi-colspan cell (e.g. colspan=5) sits next to
+    # empty cells that should be part of the same parent header span.
+    changed = True
+    while changed:
+        changed = False
+        for header_row in range(body_row):
+            row_cells = [
+                (idx, c)
+                for idx, c in enumerate(work)
+                if int(c["row_start"]) == int(c["row_end"]) == header_row
+            ]
+            row_cells.sort(key=lambda t: int(t[1]["col_start"]))
+            for ci in range(len(row_cells) - 1):
+                l_idx, left = row_cells[ci]
+                r_idx, right = row_cells[ci + 1]
+                if int(left["col_end"]) + 1 != int(right["col_start"]):
+                    continue
+                r_texts = _ocr_texts_in_bbox(
+                    text_boxes, _cell_bbox(right)
+                )
+                if any(t.strip() for t in r_texts):
+                    continue
+                l_texts = _ocr_texts_in_bbox(
+                    text_boxes, _cell_bbox(left)
+                )
+                if not any(t.strip() for t in l_texts):
+                    continue
+                col_boundary = int(right["col_start"])
+                if col_boundary < 1 or col_boundary >= len(col_seps):
+                    continue
+                x = float(col_seps[col_boundary])
+                lx1, ly1, lx2, ly2 = _cell_bbox(left)
+                header_v = _vline_coverage_ratio(
+                    binary, x, ly1, ly2, tol=tol
+                )
+                if header_v >= header_max_vline:
+                    continue
+                body_v = _vline_coverage_ratio(
+                    binary, x, body_y1, body_y2, tol=tol
+                )
+                if body_v < body_min_vline:
+                    continue
+                merged = _merge_horizontal_pair(left, right)
+                work[l_idx] = merged
+                work.pop(r_idx)
+                merges += 1
+                changed = True
+                logger.debug(
+                    "vline_repair(pass2): absorb empty into left "
+                    "row=%d cols %d..%d+%d hv=%.2f bv=%.2f",
+                    header_row,
+                    int(left["col_start"]),
+                    int(left["col_end"]),
+                    int(right["col_start"]),
+                    header_v,
+                    body_v,
+                )
+                break
+            if changed:
+                break
+
+    if merges:
+        logger.info(
+            "vline_repair: 合并 %d 对表头 colspan (body_row=%d)",
+            merges,
+            body_row,
+        )
+        work = dedupe_overlapping_cells(work)
     return work
