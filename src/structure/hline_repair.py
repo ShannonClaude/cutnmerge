@@ -496,6 +496,68 @@ def repair_colspans_by_vline_gaps(
                 body_v,
             )
 
+    # --- Second pass: absorb empty header cells into left non-empty neighbor ---
+    # Handles cases where a multi-colspan cell (e.g. colspan=5) sits next to
+    # empty cells that should be part of the same parent header span.
+    changed = True
+    while changed:
+        changed = False
+        for header_row in range(body_row):
+            row_cells = [
+                (idx, c)
+                for idx, c in enumerate(work)
+                if int(c["row_start"]) == int(c["row_end"]) == header_row
+            ]
+            row_cells.sort(key=lambda t: int(t[1]["col_start"]))
+            for ci in range(len(row_cells) - 1):
+                l_idx, left = row_cells[ci]
+                r_idx, right = row_cells[ci + 1]
+                if int(left["col_end"]) + 1 != int(right["col_start"]):
+                    continue
+                r_texts = _ocr_texts_in_bbox(
+                    text_boxes, _cell_bbox(right)
+                )
+                if any(t.strip() for t in r_texts):
+                    continue
+                l_texts = _ocr_texts_in_bbox(
+                    text_boxes, _cell_bbox(left)
+                )
+                if not any(t.strip() for t in l_texts):
+                    continue
+                col_boundary = int(right["col_start"])
+                if col_boundary < 1 or col_boundary >= len(col_seps):
+                    continue
+                x = float(col_seps[col_boundary])
+                lx1, ly1, lx2, ly2 = _cell_bbox(left)
+                header_v = _vline_coverage_ratio(
+                    binary, x, ly1, ly2, tol=tol
+                )
+                if header_v >= header_max_vline:
+                    continue
+                body_v = _vline_coverage_ratio(
+                    binary, x, body_y1, body_y2, tol=tol
+                )
+                if body_v < body_min_vline:
+                    continue
+                merged = _merge_horizontal_pair(left, right)
+                work[l_idx] = merged
+                work.pop(r_idx)
+                merges += 1
+                changed = True
+                logger.debug(
+                    "vline_repair(pass2): absorb empty into left "
+                    "row=%d cols %d..%d+%d hv=%.2f bv=%.2f",
+                    header_row,
+                    int(left["col_start"]),
+                    int(left["col_end"]),
+                    int(right["col_start"]),
+                    header_v,
+                    body_v,
+                )
+                break
+            if changed:
+                break
+
     if merges:
         logger.info(
             "vline_repair: 合并 %d 对表头 colspan (body_row=%d)",
