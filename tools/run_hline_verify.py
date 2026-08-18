@@ -60,11 +60,18 @@ def main() -> None:
             print("P96 has text", hit, "snippet_has_rowspan", 'rowspan="2"' in snippet)
             print(snippet.replace("\n", " ")[:180])
         elif key == "P97X876":
+            has_biamino = "双氨基酚" in html
+            bad_split = bool(re.search(r"<td>二羟基</td>\s*<td>二胺", html))
+            colspan2 = bool(re.search(r'colspan="2"[^>]*>[^<]*双氨基酚', html)) or (
+                "双氨基酚" in html and 'colspan="2"' in html
+            )
             print(
-                "P97 polymer",
-                "聚合物" in html,
-                "split_1_2",
-                bool(re.search(r"<td>1</td>\s*</tr>\s*<tr>\s*<td>2</td>", html)),
+                "P97 biamino",
+                has_biamino,
+                "bad_split",
+                bad_split,
+                "colspan2",
+                colspan2,
             )
         elif key == "P98X878":
             n = html.count("单体[摩尔比]")

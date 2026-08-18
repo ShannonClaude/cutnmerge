@@ -15,6 +15,8 @@ sys.path.insert(0, str(ROOT))
 
 from src.structure.hline_repair import (  # noqa: E402
     _hline_coverage_ratio,
+    _vline_coverage_ratio,
+    repair_colspans_by_vline_gaps,
     repair_rowspans_by_hline_gaps,
 )
 
@@ -54,6 +56,12 @@ def _draw_hline(binary, y, x1, x2, thickness=2):
     y0 = max(0, y - thickness // 2)
     y1 = min(binary.shape[0], y0 + thickness)
     binary[y0:y1, x1:x2] = 255
+
+
+def _draw_vline(binary, x, y1, y2, thickness=2):
+    x0 = max(0, x - thickness // 2)
+    x1 = min(binary.shape[1], x0 + thickness)
+    binary[y1:y2, x0:x1] = 255
 
 
 def test_gap_merges_header_pair():
@@ -147,11 +155,94 @@ def test_hline_coverage_detects_line():
     assert _hline_coverage_ratio(binary, 20, 10, 110, tol=2) < 0.4
 
 
+def test_vline_colspan_merges_when_body_has_line():
+    """表头无竖线、表体有竖线 → 合并相邻表头 colspan。"""
+    binary = _blank(h=220, w=320)
+    # 竖线须落在列界 col_seps[1]≈150 处
+    _draw_vline(binary, 150, 120, 200, thickness=3)
+    cells = [
+        _cell(10, 10, 145, 55, 0, 0, 0),
+        _cell(155, 10, 290, 55, 0, 0, 1),
+        _cell(10, 60, 145, 110, 1, 1, 0, ce=0),
+        _cell(155, 60, 290, 110, 1, 1, 1, ce=1),
+        _cell(10, 120, 145, 170, 2, 2, 0),
+        _cell(155, 120, 290, 170, 2, 2, 1),
+    ]
+    boxes = [
+        _tb("二羟基", 20, 65, 80, 105),
+        _tb("二胺及其衍生物", 170, 65, 280, 105),
+        _tb("BAHF(95)", 20, 125, 120, 165),
+        _tb("SiDA(5)", 170, 125, 260, 165),
+        _tb("合成例8", 20, 125, 100, 165),
+    ]
+    out = repair_colspans_by_vline_gaps(cells, binary, boxes)
+    merged = [
+        c
+        for c in out
+        if int(c["row_start"]) == 1 and int(c.get("col_span") or 1) >= 2
+    ]
+    assert merged, f"expected colspan merge, got {[(c['row_start'], c['col_start'], c['col_end']) for c in out]}"
+
+
+def test_vline_keeps_true_dual_subheaders():
+    """真·双子表头（两侧都完整）→ 不合并。"""
+    binary = _blank(h=220, w=320)
+    _draw_vline(binary, 150, 120, 200, thickness=3)
+    cells = [
+        _cell(10, 60, 145, 110, 1, 1, 0),
+        _cell(155, 60, 290, 110, 1, 1, 1),
+        _cell(10, 120, 145, 170, 2, 2, 0),
+        _cell(155, 120, 290, 170, 2, 2, 1),
+    ]
+    boxes = [
+        _tb("四羧酸及其衍生物", 15, 65, 135, 105),
+        _tb("二胺及其衍生物", 165, 65, 285, 105),
+        _tb("合成例8", 20, 125, 100, 165),
+    ]
+    out = repair_colspans_by_vline_gaps(cells, binary, boxes)
+    row1 = [c for c in out if int(c["row_start"]) == 1]
+    assert len(row1) == 2, row1
+    assert all(int(c.get("col_span") or 1) == 1 for c in row1)
+
+
+def test_wrap_rowspan_merge_substantive_cjk():
+    """同列折行长中文表头 → rowspan 合并。"""
+    binary = _blank(h=200, w=200)
+    cells = [
+        _cell(20, 10, 180, 48, 0, 0, 1),
+        _cell(20, 52, 180, 95, 1, 1, 1),
+        _cell(20, 110, 180, 150, 2, 2, 1),
+    ]
+    boxes = [
+        _tb("双氨基酚化合物及其衍生物", 30, 15, 170, 45),
+        _tb("二羟基二胺及其衍生物", 30, 55, 170, 90),
+        _tb("合成例8", 30, 115, 120, 145),
+    ]
+    out = repair_rowspans_by_hline_gaps(cells, binary, boxes)
+    merged = [
+        c
+        for c in out
+        if int(c["col_start"]) == 1 and int(c.get("row_span") or 1) >= 2
+    ]
+    assert merged, out
+
+
+def test_vline_coverage_detects_line():
+    binary = _blank(80, 120)
+    _draw_vline(binary, 60, 10, 70, thickness=2)
+    assert _vline_coverage_ratio(binary, 60, 10, 70, tol=3) >= 0.4
+    assert _vline_coverage_ratio(binary, 20, 10, 25, tol=3) < 0.4
+
+
 def main():
     test_hline_coverage_detects_line()
+    test_vline_coverage_detects_line()
     test_gap_merges_header_pair()
     test_strong_hline_keeps_split()
     test_body_boundary_not_touched()
+    test_vline_colspan_merges_when_body_has_line()
+    test_vline_keeps_true_dual_subheaders()
+    test_wrap_rowspan_merge_substantive_cjk()
     print("ok")
 
 

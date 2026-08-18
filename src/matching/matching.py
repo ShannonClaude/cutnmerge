@@ -85,6 +85,26 @@ def _looks_like_repeated_header_units(text: str) -> bool:
         if _sk_prefix(m.group(1)) != first:
             return False
     return True
+
+
+def _should_block_geom_header_split(text: str) -> bool:
+    """
+    单段中文表头不应走 geom fallback 按 col_seps 硬切或 explode colspan。
+
+    重复单元（种类1种类2）与 CODE(数字) 多段仍允许切分。
+    """
+    compact = re.sub(r"\s+", "", text or "")
+    if len(compact) < 4:
+        return False
+    if _looks_like_repeated_header_units(text):
+        return False
+    if re.search(r"[A-Za-z]\s*\(\s*\d+", compact):
+        return False
+    if re.search(r"[A-Za-z]\d+", compact) and len(re.findall(r"[A-Za-z]+\d+", compact)) >= 2:
+        return False
+    return bool(_CJK_RE.search(compact))
+
+
 # 行标签粘连：比较例1 86 Bk-1 → 切成多段（须配合多列几何门槛，禁止裸剥首位）
 _ROW_LABEL_HEAD_RE = re.compile(
     r"^(实[施試]例|実[施試]例|実施例|比較例|比较例|合成例|对照例|参考例)"
@@ -964,6 +984,8 @@ def _try_split_across_cells(
     if ink.size == 0:
         # 无墨水剖面时：仅 col_seps 槽位允许按列界比例切
         use_geom_fallback = col_seps is not None and len(slots) >= 2
+        if use_geom_fallback and _should_block_geom_header_split(text):
+            return False
         if not use_geom_fallback:
             return False
     else:
@@ -977,6 +999,8 @@ def _try_split_across_cells(
             if hit is None:
                 # 密表头粘连框常无字间宽沟：有 col_seps 时按列界几何切分兜底
                 use_geom_fallback = col_seps is not None and len(slots) >= 2
+                if use_geom_fallback and _should_block_geom_header_split(text):
+                    return False
                 if not use_geom_fallback:
                     return False
                 snapped = []
@@ -987,6 +1011,8 @@ def _try_split_across_cells(
             run_widths.append(run_w)
 
     if use_geom_fallback:
+        if _should_block_geom_header_split(text):
+            return False
         snapped = [slots[j][1] for j in range(len(slots) - 1)]
         cut_indices = [
             _x_to_char_index(text, (sx - tb_box[0]) / text_w) for sx in snapped
@@ -1029,7 +1055,7 @@ def _try_split_across_cells(
             return False
 
     # 若多个 slot 落到同一合并格，按 col_seps 拆开该格
-    if col_seps is not None:
+    if col_seps is not None and not _should_block_geom_header_split(text):
         unique_targets = {t for t in cell_targets if t is not None}
         for t in list(unique_targets):
             if max(int(cells[t].get("col_span") or 1), 1) <= 1:
