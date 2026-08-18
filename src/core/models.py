@@ -688,8 +688,8 @@ def predict_texts(
     """
     from pathlib import Path
 
-    from .cloud_ocr import run_cloud_ocr
-    from .ocr_cache import load_ocr_cache, save_ocr_cache
+    from ..ocr.cloud_ocr import run_cloud_ocr
+    from ..ocr.ocr_cache import load_ocr_cache, save_ocr_cache
 
     if ocr_engine is None:
         load_ocr()

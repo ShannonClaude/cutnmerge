@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from .label_patterns import are_independent_row_labels, is_index_column
+from ..utils.label_patterns import are_independent_row_labels, is_index_column
 
 logger = logging.getLogger(__name__)
 
@@ -1354,7 +1354,7 @@ def reconstruct_header_cells(
     if not boxes:
         return cells
 
-    from .segments import find_row_segments
+    from ..utils.segments import find_row_segments
 
     row_seps, col_seps = _derive_seps(cells)
     if len(col_seps) < 3 or len(row_seps) < 2:
@@ -1886,7 +1886,7 @@ def repair_monomer_parent_spans(
     if not boxes:
         return cells
 
-    from .segments import find_row_segments
+    from ..utils.segments import find_row_segments
 
     work = [dict(c) for c in cells]
     row_seps, col_seps = _derive_seps(work)

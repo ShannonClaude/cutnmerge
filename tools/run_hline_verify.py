@@ -9,11 +9,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.config import load_env
+from src.core.config import load_env
 
 load_env()
 
-from src.pipeline import extract_table_output  # noqa: E402
+from src.core.pipeline import extract_table_output  # noqa: E402
 
 KEYS = ["P96X874", "P97X876", "P98X878", "P109X1086", "P135X957"]
 

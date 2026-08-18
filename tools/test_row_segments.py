@@ -13,7 +13,7 @@ from typing import Any, Dict, List
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.segments import find_row_segments  # noqa: E402
+from src.utils.segments import find_row_segments  # noqa: E402
 
 
 def _cell(

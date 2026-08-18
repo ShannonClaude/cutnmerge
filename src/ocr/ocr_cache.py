@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from .config import ROOT, get_settings
+from ..core.config import ROOT, get_settings
 
 logger = logging.getLogger(__name__)
 

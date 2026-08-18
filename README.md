@@ -12,56 +12,55 @@
 
 ## 一、模块区分
 
-### 1. 入口与主流程
+### 1. 入口与主流程（`src/core`）
 
 | 文件 | 职责 |
 |------|------|
 | `main.py` | CLI 入口：参数解析、扫描 `data/input/`、批量调用 pipeline、按 `--format` 写结果 |
-| `src/pipeline.py` | 主流程编排：方向归正 → 去偏斜 → 结构识别 → OCR → 网格证据校验 → IoA 填格 → 输出 |
-| `src/config.py` | 从项目根目录加载 `.env`（AI Studio Token、模型名、超时、上传预处理/检测参数、REOCR/TSR_AGGRESSIVE 开关） |
+| `src/core/pipeline.py` | 主流程编排：方向归正 → 去偏斜 → 结构识别 → OCR → 网格证据校验 → IoA 填格 → 输出 |
+| `src/core/config.py` | 从项目根目录加载 `.env`（AI Studio Token、模型名、超时、上传预处理/检测参数、REOCR/TSR_AGGRESSIVE 开关） |
+| `src/core/models.py` | 模型加载与推断：ModelScope LORE（`--structure lore`）+ `predict_texts` 云端 OCR 封装 |
 
-### 2. 预处理（Orientation / Deskew）
-
-| 文件 | 职责 |
-|------|------|
-| `src/orient.py` | 方向归正：投影剖面定轴向（0/90/270），OCR 置信度消歧 180° |
-| `src/lines.py` | 框线网格重建：基于 OpenCV 检测水平/竖分隔线（Separator），供 `lines` 结构模式与证据校验共用 |
-
-### 3. 结构识别（Structure）— 三选一，`--structure` 指定
+### 2. 预处理（`src/preprocess`）
 
 | 文件 | 职责 |
 |------|------|
-| `src/tsr.py` | **默认** TableStructureRec：`table_cls` 有线/无线分流 → `tsr_refine` 取单元格框与逻辑拓扑；`need_ocr=False`，OCR 仍走云端 |
-| `src/tsr_refine.py` | TSR 拓扑后处理：去重叠、幽灵列合并、错误 row/colspan 拆分、子行切分/容器格抑制 |
-| `src/grid_evidence.py` | **网格证据校验层**（TSR 路径核心）：在文本归属前，用“线证据 + 空白走廊证据”修正错分行/列边界，防止表头折行被切行、幽灵行列错位 |
-| `src/grid_fusion.py` | 将 TSR 拓扑与框线派生的网格分隔线融合（补回 TSR 漏掉的行/列边界） |
-| `src/models.py` | 模型加载与推断：ModelScope LORE 表格结构识别（`--structure lore`） |
-| `src/refine.py` | 框线网格（lines 路径）后处理：按 OCR 文本聚类补列、拆错误纵向合并 |
+| `src/preprocess/orient.py` | 方向归正：投影剖面定轴向（0/90/270），OCR 置信度消歧 180° |
+
+### 3. 结构识别（`src/structure`）— 三选一，`--structure` 指定
+
+| 文件 | 职责 |
+|------|------|
+| `src/structure/tsr.py` | **默认** TableStructureRec：`table_cls` 有线/无线分流 → `tsr_refine` 取单元格框与逻辑拓扑；`need_ocr=False`，OCR 仍走云端 |
+| `src/structure/tsr_refine.py` | TSR 拓扑后处理：去重叠、幽灵列合并、错误 row/colspan 拆分、子行切分/容器格抑制 |
+| `src/structure/grid_evidence.py` | **网格证据校验层**（TSR 路径核心）：在文本归属前，用“线证据 + 空白走廊证据”修正错分行/列边界，防止表头折行被切行、幽灵行列错位 |
+| `src/structure/grid_fusion.py` | 将 TSR 拓扑与框线派生的网格分隔线融合（补回 TSR 漏掉的行/列边界） |
+| `src/structure/lines.py` | 框线网格重建：基于 OpenCV 检测水平/竖分隔线（Separator），供 `lines` 结构模式与证据校验共用 |
+| `src/structure/refine.py` | 框线网格（lines 路径）后处理：按 OCR 文本聚类补列、拆错误纵向合并 |
+| `src/structure/hline_repair.py` | 表头带假横切修复：按列检测横线墨迹，局部恢复 rowspan |
 
 > `--structure auto` 已废弃，行为等价于 `tsr`。
 
-### 4. OCR 与文本后处理
+### 4. OCR 与文本后处理（`src/ocr`）
 
 | 文件 | 职责 |
 |------|------|
-| `src/cloud_ocr.py` | **云端 OCR 全流程**：本地预处理（去透明合成、矮图短边放大、长边钳制、JPEG 编码）→ HTTP 提交 → 轮询 → 下载 JSONL → 解析文本框 → 坐标映回原图；重试/限速；产物（json/csv/标注图/API 原图）落盘 |
-| `src/models.py` | `predict_texts`：云端 OCR 封装（调 `cloud_ocr.run_cloud_ocr`，命中 `data/cache/` 跳过、刷新覆盖） |
-| `src/ocr_cache.py` | 本地缓存：按图片内容 hash + 模型配置落盘，避免重复消耗云端额度 |
-| `src/ocr_post.py` | OCR 文本后处理：符号规范化（全半角、空格）与基于墨迹证据的幻觉清理 |
-| `src/reocr.py` | 可疑单元格二次 OCR：将多个可疑格子拼成一张图一次性重识别（`--reocr` / `REOCR`） |
-| `src/label_patterns.py` | 行标签/数值等级等通用文本模式，结构拆分与 OCR 后处理共用 |
+| `src/ocr/cloud_ocr.py` | **云端 OCR 全流程**：本地预处理（去透明合成、矮图短边放大、长边钳制、JPEG 编码）→ HTTP 提交 → 轮询 → 下载 JSONL → 解析文本框 → 坐标映回原图；重试/限速；产物（json/csv/标注图/API 原图）落盘 |
+| `src/ocr/ocr_cache.py` | 本地缓存：按图片内容 hash + 模型配置落盘，避免重复消耗云端额度 |
+| `src/ocr/ocr_post.py` | OCR 文本后处理：符号规范化（全半角、空格）与基于墨迹证据的幻觉清理 |
+| `src/ocr/reocr.py` | 可疑单元格二次 OCR：将多个可疑格子拼成一张图一次性重识别（`--reocr` / `REOCR`） |
 
-### 5. 匹配与输出
+### 5. 匹配、输出与共用工具
 
 | 文件 | 职责 |
 |------|------|
-| `src/geometry.py` | 坐标几何工具：多边形转换、IoA 计算 |
-| `src/matching.py` | IoA 文本归属：跨列切分、行标签粘连拆分；多格命中取面积最小；单元格内文本排序拼接 |
-| `src/segments.py` | 子表行段切分（多级表头不误切、表体后重复表头仍切），供结构修复与渲染共用 |
-| `src/hline_repair.py` | 表头带假横切修复：按列检测横线墨迹，局部恢复 rowspan |
-| `src/formatter.py` | 表格外自由文本格式化（主流程 Markdown 已改由 html2md 从最终 HTML 转换） |
-| `src/html2md.py` | 最终 **HTML → Markdown** 转换（BeautifulSoup 解析合并单元格、表头深度） |
-| `src/html_formatter.py` | 基于逻辑拓扑的 **HTML** 表格生成（保留 `rowspan`/`colspan`） |
+| `src/matching/matching.py` | IoA 文本归属：跨列切分、行标签粘连拆分；多格命中取面积最小；单元格内文本排序拼接 |
+| `src/output/formatter.py` | 表格外自由文本格式化（主流程 Markdown 已改由 html2md 从最终 HTML 转换） |
+| `src/output/html2md.py` | 最终 **HTML → Markdown** 转换（BeautifulSoup 解析合并单元格、表头深度） |
+| `src/output/html_formatter.py` | 基于逻辑拓扑的 **HTML** 表格生成（保留 `rowspan`/`colspan`） |
+| `src/utils/geometry.py` | 坐标几何工具：多边形转换、IoA 计算 |
+| `src/utils/segments.py` | 子表行段切分（多级表头不误切、表体后重复表头仍切），供结构修复与渲染共用 |
+| `src/utils/label_patterns.py` | 行标签/数值等级等通用文本模式，结构拆分与 OCR 后处理共用 |
 
 ### 6. 工具与测试（`tools/`）
 
@@ -200,34 +199,41 @@ cutnmerge/
 │   ├── ocr/             # OCR 产物：json/csv/标注图（gitignore）
 │   └── debug/           # --debug 叠加图（gitignore）
 └── src/
-    ├── pipeline.py      # 主流程
-    ├── orient.py        # 方向归正（90/180）
-    ├── lines.py         # 框线网格
-    ├── tsr.py           # TableStructureRec 结构
-    ├── tsr_refine.py    # TSR 拓扑后处理
-    ├── grid_evidence.py # 网格证据校验（线证据 + 空白走廊）
-    ├── grid_fusion.py   # TSR 拓扑 × 框线分隔线融合
-    ├── refine.py        # 框线网格后处理
-    ├── models.py        # LORE 结构识别 + predict_texts 封装
-    ├── cloud_ocr.py     # 云端 OCR 全流程（预处理/提交/轮询/解析）
-    ├── reocr.py         # 可疑单元格拼图二次 OCR
-    ├── ocr_post.py      # OCR 规范化与幻觉清理
-    ├── ocr_cache.py     # OCR 本地缓存
-    ├── matching.py      # IoA 填格
-    ├── geometry.py      # IoA / 多边形几何
-    ├── segments.py      # 子表行段切分
-    ├── hline_repair.py  # 表头假横切修复
-    ├── label_patterns.py# 行标签/数值模式
-    ├── formatter.py     # 表格外自由文本格式化
-    ├── html2md.py       # HTML → Markdown 转换
-    ├── html_formatter.py# HTML（rowspan/colspan）
-    └── config.py        # .env 配置
+    ├── core/            # 编排、配置、模型加载
+    │   ├── pipeline.py
+    │   ├── config.py
+    │   └── models.py
+    ├── preprocess/      # 方向归正
+    │   └── orient.py
+    ├── structure/       # 表格拓扑
+    │   ├── tsr.py
+    │   ├── tsr_refine.py
+    │   ├── grid_evidence.py
+    │   ├── grid_fusion.py
+    │   ├── lines.py
+    │   ├── refine.py
+    │   └── hline_repair.py
+    ├── ocr/             # 云端 OCR 与文本后处理
+    │   ├── cloud_ocr.py
+    │   ├── ocr_cache.py
+    │   ├── ocr_post.py
+    │   └── reocr.py
+    ├── matching/        # IoA 填格
+    │   └── matching.py
+    ├── output/          # HTML / Markdown 渲染
+    │   ├── formatter.py
+    │   ├── html2md.py
+    │   └── html_formatter.py
+    └── utils/           # 几何、文本模式、行段切分
+        ├── geometry.py
+        ├── label_patterns.py
+        └── segments.py
 ```
 
 ## 六、代码调用
 
 ```python
-from src.pipeline import extract_table_output
+from src.core.pipeline import extract_table_output
 
 out = extract_table_output(
     "data/input/demo.png",
@@ -238,7 +244,7 @@ print(out["html"])
 # out["md"] 为展开式 Markdown（可选）
 ```
 
-入口会通过 `src.config.load_env()` 加载项目根目录 `.env`。
+入口会通过 `src.core.config.load_env()` 加载项目根目录 `.env`。
 
 ## 七、依赖说明
 
@@ -279,56 +285,55 @@ print(out["html"])
 
 ## 1. Module Map
 
-### Entry & Main Pipeline
+### Entry & Main Pipeline (`src/core`)
 
 | File | Responsibility |
 |------|----------------|
 | `main.py` | CLI entry: argument parsing, batch scan of `data/input/`, calls pipeline, writes results per `--format` |
-| `src/pipeline.py` | Orchestrates the full flow: orientation → deskew → structure → OCR → grid evidence check → IoA matching → output |
-| `src/config.py` | Loads `.env` from the project root (token, model names, timeouts, upload-preprocess / detection params, REOCR/TSR_AGGRESSIVE flags) |
+| `src/core/pipeline.py` | Orchestrates the full flow: orientation → deskew → structure → OCR → grid evidence check → IoA matching → output |
+| `src/core/config.py` | Loads `.env` from the project root (token, model names, timeouts, upload-preprocess / detection params, REOCR/TSR_AGGRESSIVE flags) |
+| `src/core/models.py` | Model loading & inference: ModelScope LORE (`--structure lore`) + `predict_texts` cloud OCR wrapper |
 
-### Preprocessing (Orientation / Deskew)
-
-| File | Responsibility |
-|------|----------------|
-| `src/orient.py` | Orientation normalization: projection profile picks axis (0/90/270), OCR confidence disambiguates 180° |
-| `src/lines.py` | Line-grid reconstruction: OpenCV-based detection of horizontal/vertical separators; shared by `lines` structure mode and evidence checking |
-
-### Structure Recognition — choose one via `--structure`
+### Preprocessing (`src/preprocess`)
 
 | File | Responsibility |
 |------|----------------|
-| `src/tsr.py` | **Default** TableStructureRec: `table_cls` wired/lineless split → cell boxes + logical topology via `tsr_refine`; `need_ocr=False`, OCR still goes to the cloud |
-| `src/tsr_refine.py` | TSR topology post-processing: overlap removal, ghost-column merge, wrong row/colspan splitting, sub-row splitting / container-cell suppression |
-| `src/grid_evidence.py` | **Grid evidence validation** (core of the TSR path): before text matching, fixes wrong row/column boundaries using "line evidence + blank-corridor evidence" — prevents header wrapping from being split into rows and ghost row/column misalignment |
-| `src/grid_fusion.py` | Fuses TSR topology with line-derived grid separators (recovers row/column boundaries TSR missed) |
-| `src/models.py` | Model loading & inference: ModelScope LORE table structure recognition (`--structure lore`) |
-| `src/refine.py` | Line-grid post-processing: adds missing columns by OCR text clustering, splits wrong vertical merges |
+| `src/preprocess/orient.py` | Orientation normalization: projection profile picks axis (0/90/270), OCR confidence disambiguates 180° |
+
+### Structure Recognition (`src/structure`) — choose one via `--structure`
+
+| File | Responsibility |
+|------|----------------|
+| `src/structure/tsr.py` | **Default** TableStructureRec: `table_cls` wired/lineless split → cell boxes + logical topology via `tsr_refine`; `need_ocr=False`, OCR still goes to the cloud |
+| `src/structure/tsr_refine.py` | TSR topology post-processing: overlap removal, ghost-column merge, wrong row/colspan splitting, sub-row splitting / container-cell suppression |
+| `src/structure/grid_evidence.py` | **Grid evidence validation** (core of the TSR path): before text matching, fixes wrong row/column boundaries using "line evidence + blank-corridor evidence" — prevents header wrapping from being split into rows and ghost row/column misalignment |
+| `src/structure/grid_fusion.py` | Fuses TSR topology with line-derived grid separators (recovers row/column boundaries TSR missed) |
+| `src/structure/lines.py` | Line-grid reconstruction: OpenCV-based detection of horizontal/vertical separators; shared by `lines` structure mode and evidence checking |
+| `src/structure/refine.py` | Line-grid post-processing: adds missing columns by OCR text clustering, splits wrong vertical merges |
+| `src/structure/hline_repair.py` | Fake header cross-line repair: detects horizontal ink per column, locally restores `rowspan` |
 
 > `--structure auto` is deprecated; it behaves identically to `tsr`.
 
-### OCR & Text Post-Processing
+### OCR & Text Post-Processing (`src/ocr`)
 
 | File | Responsibility |
 |------|----------------|
-| `src/cloud_ocr.py` | **Full cloud OCR flow**: local preprocessing (alpha compositing, short-side upscale, long-side clamp, JPEG) → HTTP submit → poll → JSONL download → box parsing → coordinates mapped back to the original image; retry/rate-limiting; artifacts (json/csv/annotated/API image) written to disk |
-| `src/models.py` | `predict_texts`: cloud OCR wrapper (calls `cloud_ocr.run_cloud_ocr`; skips on `data/cache/` hit, refreshes and overwrites) |
-| `src/ocr_cache.py` | Local cache keyed by image content hash + model config, avoids burning cloud quota |
-| `src/ocr_post.py` | OCR text normalization (full/half-width, spaces) and ink-density-based hallucination cleanup |
-| `src/reocr.py` | Second-pass OCR for suspicious cells: packs them into one montage image for a single re-recognition (`--reocr` / `REOCR`) |
-| `src/label_patterns.py` | Generic text patterns (row labels, numeric grades) shared by structure splitting and OCR post-processing |
+| `src/ocr/cloud_ocr.py` | **Full cloud OCR flow**: local preprocessing (alpha compositing, short-side upscale, long-side clamp, JPEG) → HTTP submit → poll → JSONL download → box parsing → coordinates mapped back to the original image; retry/rate-limiting; artifacts (json/csv/annotated/API image) written to disk |
+| `src/ocr/ocr_cache.py` | Local cache keyed by image content hash + model config, avoids burning cloud quota |
+| `src/ocr/ocr_post.py` | OCR text normalization (full/half-width, spaces) and ink-density-based hallucination cleanup |
+| `src/ocr/reocr.py` | Second-pass OCR for suspicious cells: packs them into one montage image for a single re-recognition (`--reocr` / `REOCR`) |
 
-### Matching & Output
+### Matching, Output & Shared Utils
 
 | File | Responsibility |
 |------|----------------|
-| `src/geometry.py` | Coordinate geometry utilities: polygon conversion, IoA computation |
-| `src/matching.py` | IoA text assignment: cross-column splits, row-label sticking splits; multi-cell hits take the smallest area; sorts text inside cells |
-| `src/segments.py` | Sub-table row-segment splitting (multi-level headers not wrongly cut; repeated headers after body still split); shared by repair and rendering |
-| `src/hline_repair.py` | Fake header cross-line repair: detects horizontal ink per column, locally restores `rowspan` |
-| `src/formatter.py` | Free-text formatting (text outside tables; the pipeline's Markdown is now produced by html2md from the final HTML) |
-| `src/html2md.py` | Final **HTML → Markdown** conversion (BeautifulSoup: merged cells, header depth) |
-| `src/html_formatter.py` | Logical-topology **HTML** generation (preserves `rowspan`/`colspan`) |
+| `src/matching/matching.py` | IoA text assignment: cross-column splits, row-label sticking splits; multi-cell hits take the smallest area; sorts text inside cells |
+| `src/output/formatter.py` | Free-text formatting (text outside tables; the pipeline's Markdown is now produced by html2md from the final HTML) |
+| `src/output/html2md.py` | Final **HTML → Markdown** conversion (BeautifulSoup: merged cells, header depth) |
+| `src/output/html_formatter.py` | Logical-topology **HTML** generation (preserves `rowspan`/`colspan`) |
+| `src/utils/geometry.py` | Coordinate geometry utilities: polygon conversion, IoA computation |
+| `src/utils/segments.py` | Sub-table row-segment splitting (multi-level headers not wrongly cut; repeated headers after body still split); shared by repair and rendering |
+| `src/utils/label_patterns.py` | Generic text patterns (row labels, numeric grades) shared by structure splitting and OCR post-processing |
 
 ### Tools & Tests (`tools/`)
 
@@ -467,34 +472,41 @@ cutnmerge/
 │   ├── ocr/             # OCR artifacts: json/csv/annotated images (gitignored)
 │   └── debug/           # --debug overlay images (gitignored)
 └── src/
-    ├── pipeline.py      # main pipeline
-    ├── orient.py        # orientation (90/180)
-    ├── lines.py         # line grid
-    ├── tsr.py           # TableStructureRec structure
-    ├── tsr_refine.py    # TSR topology post-processing
-    ├── grid_evidence.py # grid evidence validation (line + blank corridor)
-    ├── grid_fusion.py   # TSR topology × line-separator fusion
-    ├── refine.py        # line-grid post-processing
-    ├── models.py        # LORE structure + predict_texts wrapper
-    ├── cloud_ocr.py     # cloud OCR flow (preprocess/submit/poll/parse)
-    ├── reocr.py         # montage second-pass OCR
-    ├── ocr_post.py      # OCR normalization & hallucination cleanup
-    ├── ocr_cache.py     # local OCR cache
-    ├── matching.py      # IoA cell filling
-    ├── geometry.py      # IoA / polygon geometry
-    ├── segments.py      # sub-table row segmentation
-    ├── hline_repair.py  # header fake-cross-line repair
-    ├── label_patterns.py# row-label / numeric patterns
-    ├── formatter.py     # free-text formatting (outside tables)
-    ├── html2md.py       # HTML → Markdown conversion
-    ├── html_formatter.py# HTML (rowspan/colspan)
-    └── config.py        # .env config
+    ├── core/            # orchestration, config, model loading
+    │   ├── pipeline.py
+    │   ├── config.py
+    │   └── models.py
+    ├── preprocess/      # orientation
+    │   └── orient.py
+    ├── structure/       # table topology
+    │   ├── tsr.py
+    │   ├── tsr_refine.py
+    │   ├── grid_evidence.py
+    │   ├── grid_fusion.py
+    │   ├── lines.py
+    │   ├── refine.py
+    │   └── hline_repair.py
+    ├── ocr/             # cloud OCR and text post-processing
+    │   ├── cloud_ocr.py
+    │   ├── ocr_cache.py
+    │   ├── ocr_post.py
+    │   └── reocr.py
+    ├── matching/        # IoA cell filling
+    │   └── matching.py
+    ├── output/          # HTML / Markdown rendering
+    │   ├── formatter.py
+    │   ├── html2md.py
+    │   └── html_formatter.py
+    └── utils/           # geometry, text patterns, row segments
+        ├── geometry.py
+        ├── label_patterns.py
+        └── segments.py
 ```
 
 ## 6. Library Use
 
 ```python
-from src.pipeline import extract_table_output
+from src.core.pipeline import extract_table_output
 
 out = extract_table_output(
     "data/input/demo.png",
@@ -505,7 +517,7 @@ print(out["html"])
 # out["md"] is the unrolled Markdown (optional)
 ```
 
-The entry point loads the project-root `.env` via `src.config.load_env()`.
+The entry point loads the project-root `.env` via `src.core.config.load_env()`.
 
 ## 7. Dependencies
 

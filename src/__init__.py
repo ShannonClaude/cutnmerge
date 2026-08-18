@@ -7,11 +7,11 @@ __all__ = ["extract_table_markdown", "extract_table_output"]
 
 def __getattr__(name: str):
     if name == "extract_table_markdown":
-        from .pipeline import extract_table_markdown
+        from .core.pipeline import extract_table_markdown
 
         return extract_table_markdown
     if name == "extract_table_output":
-        from .pipeline import extract_table_output
+        from .core.pipeline import extract_table_output
 
         return extract_table_output
     raise AttributeError(f"module {__name__!r} has no attribute {name}")

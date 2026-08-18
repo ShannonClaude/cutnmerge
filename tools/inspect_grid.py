@@ -27,15 +27,15 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.config import load_env
-from src.lines import binarize_otsu, detect_tables, imwrite_unicode, render_debug_overlay
-from src.matching import assign_texts_to_cells
-from src.models import load_ocr, predict_texts
-from src.orient import apply_orientation_axis, ensure_upright_axis, maybe_flip_180_by_ocr
-from src.pipeline import _load_image, deskew_image
-from src.reocr import apply_reocr_to_cells
-from src.tsr import load_tsr_models, predict_cells_tsr
-from src.tsr_refine import (
+from src.core.config import load_env
+from src.structure.lines import binarize_otsu, detect_tables, imwrite_unicode, render_debug_overlay
+from src.matching.matching import assign_texts_to_cells
+from src.core.models import load_ocr, predict_texts
+from src.preprocess.orient import apply_orientation_axis, ensure_upright_axis, maybe_flip_180_by_ocr
+from src.core.pipeline import _load_image, deskew_image
+from src.ocr.reocr import apply_reocr_to_cells
+from src.structure.tsr import load_tsr_models, predict_cells_tsr
+from src.structure.tsr_refine import (
     _derive_seps,
     dedupe_overlapping_cells,
     merge_ghost_columns,
@@ -43,8 +43,8 @@ from src.tsr_refine import (
     split_underspanned_rows,
     unmerge_bad_rowspans,
 )
-from src.grid_fusion import fuse_tsr_with_lines
-from src.ocr_post import postprocess_text_boxes
+from src.structure.grid_fusion import fuse_tsr_with_lines
+from src.ocr.ocr_post import postprocess_text_boxes
 
 
 def _ensure_dir(p: Path) -> None:

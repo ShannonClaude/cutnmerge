@@ -13,7 +13,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.hline_repair import (  # noqa: E402
+from src.structure.hline_repair import (  # noqa: E402
     _hline_coverage_ratio,
     repair_rowspans_by_hline_gaps,
 )

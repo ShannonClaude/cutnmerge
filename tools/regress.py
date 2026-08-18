@@ -17,22 +17,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.config import load_env  # noqa: E402
+from src.core.config import load_env  # noqa: E402
 
 load_env()
 
-from src.lines import binarize_otsu  # noqa: E402
-from src.matching import assign_texts_to_cells  # noqa: E402
-from src.models import predict_texts  # noqa: E402
-from src.ocr_post import postprocess_text_boxes  # noqa: E402
-from src.orient import (  # noqa: E402
+from src.structure.lines import binarize_otsu  # noqa: E402
+from src.matching.matching import assign_texts_to_cells  # noqa: E402
+from src.core.models import predict_texts  # noqa: E402
+from src.ocr.ocr_post import postprocess_text_boxes  # noqa: E402
+from src.preprocess.orient import (  # noqa: E402
     apply_orientation_axis,
     ensure_upright_axis,
     maybe_flip_180_by_ocr,
 )
-from src.pipeline import _load_image, deskew_image, extract_table_output  # noqa: E402
-from src.tsr import predict_cells_tsr  # noqa: E402
-from src.tsr_refine import coverage_score, refine_tsr_cells  # noqa: E402
+from src.core.pipeline import _load_image, deskew_image, extract_table_output  # noqa: E402
+from src.structure.tsr import predict_cells_tsr  # noqa: E402
+from src.structure.tsr_refine import coverage_score, refine_tsr_cells  # noqa: E402
 
 INPUT_DIR = ROOT / "data" / "input"
 DEBUG_DIR = ROOT / "data" / "debug"

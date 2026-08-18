@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.matching import _parse_sticky_row_parts, _split_sticky_row_label  # noqa: E402
+from src.matching.matching import _parse_sticky_row_parts, _split_sticky_row_label  # noqa: E402
 import numpy as np  # noqa: E402
 
 
@@ -49,7 +49,7 @@ def test_no_bare_peel_single_intent():
 
 
 def test_caption_digits_not_labels():
-    from src.label_patterns import extract_independent_labels_from_joined
+    from src.utils.label_patterns import extract_independent_labels_from_joined
 
     assert extract_independent_labels_from_joined("[表1-2]\n聚合物") == []
     assert extract_independent_labels_from_joined("[表1-2]聚合物") == []

@@ -18,7 +18,7 @@ from .formatter import (
     format_free_texts,
     split_cells_into_subtables,
 )
-from .label_patterns import is_index_column
+from ..utils.label_patterns import is_index_column
 
 logger = logging.getLogger(__name__)
 

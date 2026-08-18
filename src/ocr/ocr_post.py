@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from .label_patterns import fix_iii_ocr, split_value_grade
+from ..utils.label_patterns import fix_iii_ocr, split_value_grade
 
 logger = logging.getLogger(__name__)
 

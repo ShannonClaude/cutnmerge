@@ -18,7 +18,7 @@ import cv2
 import numpy as np
 import requests
 
-from .config import ROOT, get_settings
+from ..core.config import ROOT, get_settings
 
 logger = logging.getLogger(__name__)
 

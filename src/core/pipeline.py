@@ -14,30 +14,31 @@ from typing import Any, Dict, List, Optional, Union
 import cv2
 import numpy as np
 
-from .formatter import format_free_texts
-from .grid_fusion import fuse_tsr_with_lines
-from .html2md import html_to_markdown
-from .html_formatter import build_html_output
-from .lines import (
+from .config import ROOT
+from .models import load_lore_model, load_ocr, predict_cells, predict_texts
+from ..matching.matching import assign_texts_to_cells
+from ..ocr.ocr_post import postprocess_text_boxes
+from ..ocr.reocr import apply_reocr_to_cells, recover_empty_vertical_headers
+from ..output.formatter import format_free_texts
+from ..output.html2md import html_to_markdown
+from ..output.html_formatter import build_html_output
+from ..preprocess.orient import apply_orientation_axis, ensure_upright_axis, maybe_flip_180_by_ocr
+from ..structure.grid_fusion import fuse_tsr_with_lines
+from ..structure.lines import (
     DetectedTable,
     binarize_otsu,
     detect_tables,
     imwrite_unicode,
     render_debug_overlay,
 )
-from .matching import assign_texts_to_cells
-from .models import load_lore_model, load_ocr, predict_cells, predict_texts
-from .ocr_post import postprocess_text_boxes
-from .orient import apply_orientation_axis, ensure_upright_axis, maybe_flip_180_by_ocr
-from .reocr import apply_reocr_to_cells, recover_empty_vertical_headers
-from .refine import refine_table
-from .tsr import (
+from ..structure.refine import refine_table
+from ..structure.tsr import (
     cells_to_debug_table,
     predict_cells_tsr,
     render_table_vis,
     render_table_vis_logic,
 )
-from .tsr_refine import (
+from ..structure.tsr_refine import (
     coverage_score,
     logic_conflict_ratio,
     reconstruct_header_cells,
@@ -47,8 +48,6 @@ from .tsr_refine import (
 )
 
 logger = logging.getLogger(__name__)
-
-ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DEBUG_DIR = ROOT / "data" / "debug"
 DEFAULT_OUTPUT_DIR = ROOT / "data" / "output"
 
@@ -437,7 +436,7 @@ def _extract_via_tsr(
     split_cross = True
 
     if tsr_aggressive:
-        from .grid_evidence import apply_grid_evidence_merge
+        from ..structure.grid_evidence import apply_grid_evidence_merge
 
         cells = apply_grid_evidence_merge(
             cells,
@@ -445,7 +444,7 @@ def _extract_via_tsr(
             line_tables=line_tables,
         )
         cells = reconstruct_header_cells(cells, text_boxes)
-        from .tsr_refine import _derive_seps as _derive_seps_local
+        from ..structure.tsr_refine import _derive_seps as _derive_seps_local
 
         _row_seps, col_seps_list = _derive_seps_local(cells)
         if len(col_seps_list) >= 3:
@@ -458,7 +457,7 @@ def _extract_via_tsr(
             v_separators = getattr(best, "v_separators", None)
     elif escalated_from_light:
         # 融合后的网格已无逻辑重叠；不再重建表头（会把多级表头压成过少列）。
-        from .tsr_refine import _derive_seps as _derive_seps_local
+        from ..structure.tsr_refine import _derive_seps as _derive_seps_local
 
         _row_seps, col_seps_list = _derive_seps_local(cells)
         if len(col_seps_list) >= 3:
@@ -471,8 +470,8 @@ def _extract_via_tsr(
             v_separators = getattr(best, "v_separators", None)
     else:
         # 默认路径：仅表头带按列横线连通性局部恢复 rowspan（不改列、不开激进融合）
-        from .hline_repair import repair_rowspans_by_hline_gaps
-        from .tsr_refine import _derive_seps as _derive_seps_local
+        from ..structure.hline_repair import repair_rowspans_by_hline_gaps
+        from ..structure.tsr_refine import _derive_seps as _derive_seps_local
 
         cells = repair_rowspans_by_hline_gaps(cells, binary, text_boxes)
         _row_seps, col_seps_list = _derive_seps_local(cells)
@@ -596,7 +595,7 @@ def extract_table_output(
         orient_angle = (orient_angle + flip) % 360
         if axis_delta or flip:
             try:
-                from .ocr_cache import save_ocr_cache
+                from ..ocr.ocr_cache import save_ocr_cache
 
                 save_ocr_cache(
                     image,
