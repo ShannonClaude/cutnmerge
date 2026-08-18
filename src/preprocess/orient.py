@@ -134,7 +134,7 @@ def ensure_upright_axis(
     Returns:
         (image, axis_delta_0_or_90, text_boxes)
     """
-    from .models import predict_texts
+    from ..core.models import predict_texts
 
     if not looks_sideways(text_boxes, score_thresh=score_thresh):
         return image, 0, text_boxes
@@ -230,7 +230,7 @@ def maybe_flip_180_by_ocr(
     Returns:
         (image, added_180, text_boxes)
     """
-    from .models import predict_texts
+    from ..core.models import predict_texts
 
     s0 = _mean_ocr_score(text_boxes)
     a0 = _box_aspect_upright_ratio(text_boxes)
@@ -275,7 +275,7 @@ def correct_orientation(
     if kind != "auto":
         return image, angle, None
 
-    from .models import predict_texts
+    from ..core.models import predict_texts
 
     boxes = predict_texts(
         image,

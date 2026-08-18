@@ -24,7 +24,7 @@ import logging
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
-from .segments import (
+from ..utils.segments import (
     _HEADER_CAPTION_RE,
     _Y_GAP_THRESH_PX,
     find_row_segments,

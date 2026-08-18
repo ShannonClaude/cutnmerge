@@ -14,13 +14,13 @@ logger = logging.getLogger(__name__)
 
 _CJK_CHAR_RE = re.compile(r"[\u3400-\u9fff]")
 
-from .label_patterns import (
+from ..utils.label_patterns import (
     complete_truncated_component_header,
     fix_iii_ocr,
     split_value_grade,
 )
-from .matching import join_cell_texts, unmerge_filled_label_rowspans
-from .models import predict_texts
+from ..matching.matching import join_cell_texts, unmerge_filled_label_rowspans
+from ..core.models import predict_texts
 from .ocr_post import _maybe_geometric_dash
 
 

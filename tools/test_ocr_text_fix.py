@@ -8,12 +8,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.label_patterns import (
+from src.utils.label_patterns import (
     complete_truncated_component_header,
     split_value_grade,
 )
-from src.matching import _order_value_grade_parts, join_cell_texts
-from src.reocr import _looks_truncated_header
+from src.matching.matching import _order_value_grade_parts, join_cell_texts
+from src.ocr.reocr import _looks_truncated_header
 
 
 def test_split_value_grade():

@@ -19,11 +19,11 @@ import sys
 from pathlib import Path
 from typing import List
 
-from src.config import load_env
+from src.core.config import load_env
 
 load_env()
 
-from src.pipeline import extract_table_output
+from src.core.pipeline import extract_table_output
 
 # 项目根目录
 ROOT = Path(__file__).resolve().parent
@@ -282,7 +282,7 @@ def process_one(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    from src.config import get_settings
+    from src.core.config import get_settings
 
     settings = get_settings()
     reocr = settings.reocr if args.reocr is None else bool(args.reocr)
@@ -322,16 +322,16 @@ def main(argv: list[str] | None = None) -> int:
         f"tsr_aggressive={tsr_aggressive}, reocr={reocr}, format={args.format})"
     )
 
-    from src.models import load_ocr
+    from src.core.models import load_ocr
 
     ocr = load_ocr()
     lore = None
     if args.structure == "lore":
-        from src.models import load_lore_model
+        from src.core.models import load_lore_model
 
         lore = load_lore_model()
     if args.structure in {"tsr", "auto"}:
-        from src.tsr import load_tsr_models
+        from src.structure.tsr import load_tsr_models
 
         print("[info] 预加载 TableStructureRec…")
         load_tsr_models()

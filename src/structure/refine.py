@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .label_patterns import are_independent_row_labels
+from ..utils.label_patterns import are_independent_row_labels
 from .lines import DetectedTable, Separator, build_cells_from_separators
 
 logger = logging.getLogger(__name__)

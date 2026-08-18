@@ -9,9 +9,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.html_formatter import cells_to_html, drop_evidenceless_columns
-from src.label_patterns import is_index_column
-from src.tsr_refine import merge_ghost_columns
+from src.output.html_formatter import cells_to_html, drop_evidenceless_columns
+from src.utils.label_patterns import is_index_column
+from src.structure.tsr_refine import merge_ghost_columns
 
 
 def _cell(rs, re_, cs, ce, text, x1, x2, y1=0.0, y2=30.0):

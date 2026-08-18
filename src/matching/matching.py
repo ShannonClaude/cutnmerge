@@ -17,8 +17,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from shapely.geometry import Point, box
 
-from .geometry import compute_ioa, polygon_to_shapely
-from .label_patterns import (
+from ..utils.geometry import compute_ioa, polygon_to_shapely
+from ..utils.label_patterns import (
     _CAPTION_CHUNK_RE,
     are_independent_row_labels,
     complete_truncated_component_header,

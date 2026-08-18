@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from .models import (
+from ..core.models import (
     _correct_columns_by_physical_x,
     _correct_rows_by_physical_y,
     _to_quad,
