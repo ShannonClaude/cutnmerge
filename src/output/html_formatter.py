@@ -256,23 +256,71 @@ def _cell_physical_bbox_x_y(cell: Dict[str, Any]) -> Tuple[float, float, float, 
     return float(poly[:, 0].min()), float(poly[:, 1].min()), float(poly[:, 0].max()), float(poly[:, 1].max())
 
 
+def _is_cell_frag(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return True
+    compact = "".join(t.split())
+    return len(compact) <= 2
+
+
+def _merge_text_into_cell(cell: Dict[str, Any], text: str) -> None:
+    add = (text or "").strip()
+    if not add:
+        return
+    prev = str(cell.get("text") or "").strip()
+    if add not in prev:
+        cell["text"] = (prev + " " + add).strip() if prev else add
+
+
+def _salvage_dropped_cell_text(
+    out: List[Dict[str, Any]],
+    *,
+    row: int,
+    old_start: int,
+    text: str,
+    kept: List[int],
+    remap: Dict[int, int],
+    axis: str,
+) -> None:
+    """把整段逻辑范围都被删掉的 cell 文本并入最近保留邻格。"""
+    add = (text or "").strip()
+    if not add or not out or not kept:
+        return
+    neighbor = next((k for k in reversed(kept) if k < old_start), None)
+    if neighbor is None:
+        logger.warning("删%s后左侧无邻格，文本已丢: %r", axis, add[:40])
+        return
+    target = remap[neighbor]
+    for oc in out:
+        if axis == "col":
+            if int(oc["row_start"]) <= row <= int(oc["row_end"]) and int(
+                oc["col_start"]
+            ) <= target <= int(oc["col_end"]):
+                _merge_text_into_cell(oc, add)
+                return
+        else:
+            if int(oc["col_start"]) <= row <= int(oc["col_end"]) and int(
+                oc["row_start"]
+            ) <= target <= int(oc["row_end"]):
+                _merge_text_into_cell(oc, add)
+                return
+    logger.warning("删%s后无法并入邻格，文本已丢: %r", axis, add[:40])
+
+
 def drop_evidenceless_columns(cells: List[Dict[str, Any]], *, narrow_ratio: float = 0.35) -> List[Dict[str, Any]]:
     """
     丢弃“证据不足”的幽灵列（零文本、且几何上非常窄、且不参与跨列 colspan）。
     窄列若仅有短碎片文本、且不参与 colspan，同样丢弃。
+
+    非空 cell 的 col_start（含纯 colspan 原点）一律保留，避免 P98 合成例 15/16
+    那种「表头+表体都是 colspan、没有原子格」的列把字连格删掉。
 
     注意：此实现无法直接判定“无框线/无墨迹”（html_formatter 不接收原图），
     因此使用可观测代理：窄宽度 + 不存在跨列占用 + 覆盖该列的文本为空/碎片。
     """
     if not cells:
         return cells
-
-    def _is_frag(text: str) -> bool:
-        t = (text or "").strip()
-        if not t:
-            return True
-        compact = "".join(t.split())
-        return len(compact) <= 2
 
     # 物理宽度统计：用所有 col_span==1 的 cell 估计“标准列宽”
     atomic_widths: List[float] = []
@@ -304,8 +352,15 @@ def drop_evidenceless_columns(cells: List[Dict[str, Any]], *, narrow_ratio: floa
         # 整列多为行序号（如 16–30）：窄但仍是真实列，保留
         if is_index_column(texts):
             continue
-        only_frag = (not any_text) or all(_is_frag(t) for t in texts if t) or (
-            any_text and all(_is_frag(t) for t in texts)
+        # colspan 原点列：格子从这里起步且有实质文本，不能当幽灵列删
+        if any(
+            int(c["col_start"]) == col
+            and not _is_cell_frag(str(c.get("text") or ""))
+            for c in covered_cells
+        ):
+            continue
+        only_frag = (not any_text) or all(_is_cell_frag(t) for t in texts if t) or (
+            any_text and all(_is_cell_frag(t) for t in texts)
         )
         spans_cross = any(int(c.get("col_span") or 1) > 1 for c in covered_cells)
         if spans_cross:
@@ -314,7 +369,7 @@ def drop_evidenceless_columns(cells: List[Dict[str, Any]], *, narrow_ratio: floa
                 for c in covered_cells
                 if int(c.get("col_span") or 1) == 1
             ]
-            if any(not _is_frag(t) for t in atomic_texts):
+            if any(not _is_cell_frag(t) for t in atomic_texts):
                 continue
             if not atomic_texts:
                 dropped.add(col)
@@ -344,10 +399,7 @@ def drop_evidenceless_columns(cells: List[Dict[str, Any]], *, narrow_ratio: floa
                     if int(c["col_start"]) <= col - 1 <= int(c["col_end"]) and int(
                         c.get("row_start", 0)
                     ) == min(int(x.get("row_start", 0)) for x in covered_cells):
-                        prev = str(c.get("text") or "").strip()
-                        add = "".join(frag_bits)
-                        if add and add not in prev:
-                            c["text"] = (prev + add).strip() if prev else add
+                        _merge_text_into_cell(c, "".join(frag_bits))
                         break
             dropped.add(col)
 
@@ -360,17 +412,30 @@ def drop_evidenceless_columns(cells: List[Dict[str, Any]], *, narrow_ratio: floa
 
     remap = {old: new for new, old in enumerate(kept_cols)}
     out: List[Dict[str, Any]] = []
+    orphans: List[Tuple[int, int, str]] = []
     for c in cells:
         cs, ce = int(c["col_start"]), int(c["col_end"])
-        # 如果 cell 只覆盖被丢弃列，则丢弃
         new_idxs = [remap[i] for i in range(cs, ce + 1) if i in remap]
         if not new_idxs:
+            text = str(c.get("text") or "").strip()
+            if text and not _is_cell_frag(text):
+                orphans.append((int(c["row_start"]), cs, text))
             continue
         nc = dict(c)
         nc["col_start"] = min(new_idxs)
         nc["col_end"] = max(new_idxs)
         nc["col_span"] = nc["col_end"] - nc["col_start"] + 1
         out.append(nc)
+    for row, old_cs, text in orphans:
+        _salvage_dropped_cell_text(
+            out,
+            row=row,
+            old_start=old_cs,
+            text=text,
+            kept=kept_cols,
+            remap=remap,
+            axis="col",
+        )
     return out
 
 
@@ -426,16 +491,30 @@ def drop_evidenceless_rows(cells: List[Dict[str, Any]], *, short_ratio: float = 
 
     remap = {old: new for new, old in enumerate(kept_rows)}
     out: List[Dict[str, Any]] = []
+    orphans: List[Tuple[int, int, str]] = []
     for c in cells:
         rs, re = int(c["row_start"]), int(c["row_end"])
         new_idxs = [remap[i] for i in range(rs, re + 1) if i in remap]
         if not new_idxs:
+            text = str(c.get("text") or "").strip()
+            if text and not _is_cell_frag(text):
+                orphans.append((int(c["col_start"]), rs, text))
             continue
         nc = dict(c)
         nc["row_start"] = min(new_idxs)
         nc["row_end"] = max(new_idxs)
         nc["row_span"] = nc["row_end"] - nc["row_start"] + 1
         out.append(nc)
+    for col, old_rs, text in orphans:
+        _salvage_dropped_cell_text(
+            out,
+            row=col,
+            old_start=old_rs,
+            text=text,
+            kept=kept_rows,
+            remap=remap,
+            axis="row",
+        )
     return out
 
 
