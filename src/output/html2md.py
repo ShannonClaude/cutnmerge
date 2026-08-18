@@ -1,6 +1,6 @@
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Set
 
 from bs4 import BeautifulSoup
 
@@ -39,6 +39,7 @@ def table_to_markdown(table) -> str:
 
     # 2. 构建 2D 网格映射
     grid = {}
+    origins = set()
     max_cols = 0
     num_rows = len(rows)
 
@@ -60,6 +61,7 @@ def table_to_markdown(table) -> str:
                 colspan = 1
 
             text = clean_cell(cell)
+            origins.add((r_idx, c_idx))
 
             # 填充该单元格所覆盖的所有子坐标
             for dr in range(rowspan):
@@ -73,7 +75,7 @@ def table_to_markdown(table) -> str:
                         if target_r < header_depth:
                             grid[(target_r, target_c)] = text
                         else:
-                            # 数据体区域的跨列，其余位置填空，保持列对齐
+                            # 数据体区域的跨列，其余位置填空
                             grid[(target_r, target_c)] = ""
 
             c_idx += colspan
@@ -82,9 +84,14 @@ def table_to_markdown(table) -> str:
     if max_cols == 0 or num_rows == 0:
         return ""
 
+    # Markdown 无 colspan：丢掉从未作为 <td>/<th> 起点的填充列
+    # （表头文字仍按整段 colspan 复制，以便拼出「一级 - 二级」；
+    #  表体若在这些列上另有独立格，则该列有 origin，会保留。）
+    keep_cols = _columns_with_cell_origin(origins, num_rows, max_cols)
+
     # 3. 智能合并表头（多层表头合并为：一级表头 - 二级表头）
     headers = []
-    for c in range(max_cols):
+    for c in keep_cols:
         parts = []
         for r in range(header_depth):
             val = grid.get((r, c), "").strip()
@@ -95,17 +102,25 @@ def table_to_markdown(table) -> str:
     # 4. 提取数据行
     data_rows = []
     for r in range(header_depth, num_rows):
-        row_data = [grid.get((r, c), "").strip() for c in range(max_cols)]
+        row_data = [grid.get((r, c), "").strip() for c in keep_cols]
         data_rows.append(row_data)
 
     # 5. 组装 Markdown 表格
     md_lines = []
     md_lines.append("| " + " | ".join(headers) + " |")
-    md_lines.append("| " + " | ".join(["---"] * max_cols) + " |")
+    md_lines.append("| " + " | ".join(["---"] * len(keep_cols)) + " |")
     for row in data_rows:
         md_lines.append("| " + " | ".join(row) + " |")
 
     return "\n".join(md_lines)
+
+
+def _columns_with_cell_origin(
+    origins: Set[tuple], num_rows: int, max_cols: int
+) -> list:
+    """留下至少有一个 <td>/<th> 起点的列；若全无起点则原样返回。"""
+    keep = [c for c in range(max_cols) if any((r, c) in origins for r in range(num_rows))]
+    return keep if keep else list(range(max_cols))
 
 
 def html_to_markdown(content: str) -> str:
