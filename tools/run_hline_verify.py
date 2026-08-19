@@ -15,7 +15,7 @@ load_env()
 
 from src.core.pipeline import extract_table_output  # noqa: E402
 
-KEYS = ["P96X874", "P97X876", "P98X878", "P100X888", "P109X1086", "P135X957"]
+KEYS = ["P96X874", "P97X876", "P98X878", "P100X888", "P109X1086", "P123X933", "P135X957"]
 
 
 def main() -> None:
@@ -44,6 +44,9 @@ def main() -> None:
         html = result.get("html") or ""
         html_path = out / f"{img.stem}.html"
         html_path.write_text(html, encoding="utf-8")
+        html_dir = out / "html"
+        if html_dir.is_dir():
+            (html_dir / f"{img.stem}.html").write_text(html, encoding="utf-8")
         print(f"wrote {html_path.name}")
 
         if key == "P96X874":
@@ -90,6 +93,31 @@ def main() -> None:
                 "分散液" in html,
                 "n_zhizao",
                 html.count("制备例"),
+            )
+        elif key == "P123X933":
+            ghost_split = bool(
+                re.search(
+                    r"组合物</td>\s*<td[^>]*>\s*</td>",
+                    html,
+                )
+            ) or bool(
+                re.search(
+                    r'<td colspan="3"></td>\s*<td colspan="5">组成',
+                    html,
+                )
+            )
+            merged = bool(
+                re.search(r'colspan="9"[^>]*>组成\[质量份\]', html)
+            ) or bool(
+                re.search(r"组合物</td>\s*<td colspan=\"\d+\">组成\[质量份\]", html)
+            )
+            print(
+                "P123 split_header",
+                ghost_split,
+                "merged_group",
+                merged,
+                "n_shishi",
+                html.count("实施例"),
             )
         elif key == "P109X1086":
             print(

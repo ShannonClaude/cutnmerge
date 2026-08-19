@@ -496,9 +496,9 @@ def repair_colspans_by_vline_gaps(
                 body_v,
             )
 
-    # --- Second pass: absorb empty header cells into left non-empty neighbor ---
-    # Handles cases where a multi-colspan cell (e.g. colspan=5) sits next to
-    # empty cells that should be part of the same parent header span.
+    # --- Second pass: absorb empty header cells into the neighboring labeled cell ---
+    # 不限原子格、不限左右方向。P123 这类「左空块 + 右有字组表头」靠此收敛；
+    # 两侧都空或都有字时跳过，避免误吞独立子表头。
     changed = True
     while changed:
         changed = False
@@ -514,15 +514,11 @@ def repair_colspans_by_vline_gaps(
                 r_idx, right = row_cells[ci + 1]
                 if int(left["col_end"]) + 1 != int(right["col_start"]):
                     continue
-                r_texts = _ocr_texts_in_bbox(
-                    text_boxes, _cell_bbox(right)
-                )
-                if any(t.strip() for t in r_texts):
-                    continue
-                l_texts = _ocr_texts_in_bbox(
-                    text_boxes, _cell_bbox(left)
-                )
-                if not any(t.strip() for t in l_texts):
+                l_texts = _ocr_texts_in_bbox(text_boxes, _cell_bbox(left))
+                r_texts = _ocr_texts_in_bbox(text_boxes, _cell_bbox(right))
+                l_has_text = any(t.strip() for t in l_texts)
+                r_has_text = any(t.strip() for t in r_texts)
+                if l_has_text == r_has_text:
                     continue
                 col_boundary = int(right["col_start"])
                 if col_boundary < 1 or col_boundary >= len(col_seps):
@@ -539,18 +535,23 @@ def repair_colspans_by_vline_gaps(
                 )
                 if body_v < body_min_vline:
                     continue
-                merged = _merge_horizontal_pair(left, right)
+                # 以有字一侧为底，避免双向吸收时丢掉标签文本
+                if l_has_text:
+                    merged = _merge_horizontal_pair(left, right)
+                else:
+                    merged = _merge_horizontal_pair(right, left)
                 work[l_idx] = merged
                 work.pop(r_idx)
                 merges += 1
                 changed = True
                 logger.debug(
-                    "vline_repair(pass2): absorb empty into left "
-                    "row=%d cols %d..%d+%d hv=%.2f bv=%.2f",
+                    "vline_repair(pass2): absorb empty neighbor "
+                    "row=%d cols %d..%d+%d..%d hv=%.2f bv=%.2f",
                     header_row,
                     int(left["col_start"]),
                     int(left["col_end"]),
                     int(right["col_start"]),
+                    int(right["col_end"]),
                     header_v,
                     body_v,
                 )

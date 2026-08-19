@@ -16,7 +16,7 @@
 
 | 文件 | 职责 |
 |------|------|
-| `main.py` | CLI 入口：参数解析、扫描 `data/input/`、批量调用 pipeline、按 `--format` 写结果；批量运行存档（失败项/新文件才重跑） |
+| `main.py` | CLI 入口：参数解析、扫描 `data/input/`、批量调用 pipeline、按 `--format` 写结果；批量运行存档（失败项/新文件/产物缺失才重跑） |
 | `src/core/pipeline.py` | 主流程编排：方向归正 → 去偏斜 → 结构识别 → OCR → 网格证据校验 → IoA 填格 → 输出 |
 | `src/core/config.py` | 从项目根目录加载 `.env`（AI Studio Token、模型名、超时、上传预处理/检测参数、REOCR/TSR_AGGRESSIVE 开关） |
 | `src/core/models.py` | 模型加载与推断：ModelScope LORE（`--structure lore`）+ `predict_texts` 云端 OCR 封装 |
@@ -128,16 +128,16 @@ cp .env.example .env
 将表格图片放入 `data/input/`（支持 png / jpg / jpeg / bmp / tif / tiff / webp）：
 
 ```bash
-# 批量：扫描 data/input/，写出 data/output/<同名>.html + .md + 两张彩图
+# 批量：扫描 data/input/，写出 data/output/html/、md/、images/ 三个子目录
 python main.py
 
-# 增量：已成功的跳过，只处理上次失败项与新放入 input 的图片
+# 增量：已成功的跳过，只处理失败项、新放入 input 的图片与产物缺失的图片
 # 失败清单见 data/run_archive.json；全部重跑用 --force-all
 python main.py --force-all
 
 # 单图
 python main.py --image data/input/demo.png
-python main.py --image data/input/demo.png --output data/output/demo.html
+python main.py --image data/input/demo.png --output data/output/html/demo.html
 
 # 输出格式（默认 both：html + md，md 由最终 HTML 经 html2md 转换）
 python main.py --format both    # 默认：html + md
@@ -175,7 +175,7 @@ python main.py --refresh-cache               # 强制重拉 OCR 并覆盖缓存
 python main.py --keep-empty-cols             # 保留整列为空的列（默认压缩删除）
 python main.py --debug                       # 网格叠加图写到 data/debug/
 python main.py --no-vis                      # 关闭表格划线可视化（默认写 *_table_vis.png / *_table_vis_logic.png）
-python main.py --force-all                   # 忽略存档，批量全部重跑（默认只跑失败项与新文件）
+python main.py --force-all                   # 忽略存档，批量全部重跑（默认只跑失败项、新文件与产物缺失）
 ```
 
 回归统计：
@@ -199,7 +199,10 @@ cutnmerge/
 │   └── test_*.py        # 单元/回归测试
 ├── data/
 │   ├── input/           # 待处理图片
-│   ├── output/          # HTML / Markdown 结果
+│   ├── output/          # 结果（gitignore）
+│   │   ├── html/        #    *.html
+│   │   ├── md/          #    *.md
+│   │   └── images/      #    划线彩图 *_table_vis*.png
 │   ├── cache/           # OCR 本地缓存（gitignore）
 │   ├── ocr/             # OCR 产物：json/csv/标注图（gitignore）
 │   ├── debug/           # --debug 叠加图（gitignore）
@@ -271,7 +274,7 @@ print(out["html"])
 确保 `.env` 中 `PADDLEOCR_ACCESS_TOKEN` 已填写且不是占位符 `your-access-token-here`。
 
 **Windows 控制台乱码**  
-结果文件为 UTF-8；控制台可能无法打印部分字符，以 `data/output/*.html` 为准。
+结果文件为 UTF-8；控制台可能无法打印部分字符，以 `data/output/html/*.html` 为准。
 
 **中文路径图片**  
 已通过 `np.fromfile` + `imdecode` 处理，可直接使用含中文的文件名路径。
@@ -408,7 +411,7 @@ cp .env.example .env
 Put table images into `data/input/` (png / jpg / jpeg / bmp / tif / tiff / webp):
 
 ```bash
-# Batch: scan data/input/, write data/output/<same-name>.html + .md + two colored visualizations
+# Batch: scan data/input/, write into data/output/html/ + md/ + images/ subdirs
 python main.py
 
 # Incremental: skip successes; only retry previous failures and new files in input
@@ -417,7 +420,7 @@ python main.py --force-all
 
 # Single image
 python main.py --image data/input/demo.png
-python main.py --image data/input/demo.png --output data/output/demo.html
+python main.py --image data/input/demo.png --output data/output/html/demo.html
 
 # Output format (default both: html + md; md is converted from the final HTML by html2md)
 python main.py --format both    # default: html + md
@@ -551,7 +554,7 @@ The entry point loads the project-root `.env` via `src.core.config.load_env()`.
 Make sure `PADDLEOCR_ACCESS_TOKEN` in `.env` is filled in and not the placeholder `your-access-token-here`.
 
 **Windows console garbled output**  
-Result files are UTF-8; the console may fail to print some characters — rely on `data/output/*.html`.
+Result files are UTF-8; the console may fail to print some characters — rely on `data/output/html/*.html`.
 
 **Images with non-ASCII paths**  
 Handled via `np.fromfile` + `imdecode`; Chinese filenames work directly.

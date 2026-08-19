@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Tuple
 
 from .config import ROOT
 
@@ -99,11 +99,16 @@ class RunArchive:
         images: List[Path],
         *,
         force_all: bool = False,
+        output_present: Callable[[Path], bool] | None = None,
     ) -> Tuple[List[Path], List[Path], Dict[str, int]]:
-        """按存档筛选：失败 / 新文件 / 内容变化 → 处理；已成功且未改 → 跳过。"""
+        """按存档筛选：失败 / 新文件 / 内容变化 / 产物缺失 → 处理；已成功且未改 → 跳过。
+
+        output_present: 可选回调，传入后已成功且输入未变的图片还要检查
+        产物是否还在；返回 False（产物缺失）则重新处理。
+        """
         to_process: List[Path] = []
         skipped: List[Path] = []
-        stats = {"new": 0, "retry": 0, "changed": 0, "force": 0, "skip": 0}
+        stats = {"new": 0, "retry": 0, "changed": 0, "force": 0, "out_missing": 0, "skip": 0}
         for path in images:
             rec = self.items.get(path.name)
             if force_all:
@@ -124,6 +129,10 @@ class RunArchive:
                 stats["changed"] += 1
                 continue
             if status == "success":
+                if output_present is not None and not output_present(path):
+                    to_process.append(path)
+                    stats["out_missing"] += 1
+                    continue
                 skipped.append(path)
                 stats["skip"] += 1
                 continue
@@ -184,5 +193,7 @@ def format_select_summary(stats: Dict[str, int], n_process: int, n_skip: int) ->
         bits.append(f"强制全量 {stats['force']}")
     if stats.get("skip"):
         bits.append(f"跳过已成功 {stats['skip']}")
+    if stats.get("out_missing"):
+        bits.append(f"产物缺失 {stats['out_missing']}")
     detail = "，".join(bits) if bits else "无筛选"
     return f"存档筛选: {detail} → 本次处理 {n_process} 张，跳过 {n_skip} 张"

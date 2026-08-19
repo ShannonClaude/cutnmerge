@@ -3,7 +3,7 @@
 
 用法:
     python main.py
-        # 默认：tsr 结构，写出 data/output/<同名>.html + .md + 两张彩图
+        # 默认：tsr 结构，写出 data/output/html|md|images 三个子目录
         # 批量有存档：已成功的跳过，只处理失败项与新文件
     python main.py --force-all
         # 忽略存档，全部重新处理
@@ -32,6 +32,10 @@ from src.core.pipeline import extract_table_output
 ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT_DIR = ROOT / "data" / "input"
 DEFAULT_OUTPUT_DIR = ROOT / "data" / "output"
+# 默认产物布局：html / md / 划线彩图分目录存放
+OUTPUT_HTML_DIR = DEFAULT_OUTPUT_DIR / "html"
+OUTPUT_MD_DIR = DEFAULT_OUTPUT_DIR / "md"
+OUTPUT_IMAGE_DIR = DEFAULT_OUTPUT_DIR / "images"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 
@@ -65,7 +69,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         default=None,
         help="输出路径（单图模式）；扩展名可省略，将按 --format 补全。"
-             "批量模式默认写入 data/output/<图片名>.html|.md",
+             "批量模式默认写入 data/output/html|md|images 子目录",
     )
     parser.add_argument(
         "--format",
@@ -216,12 +220,12 @@ def _resolve_out_paths(
         ]
 
     if fmt == "html":
-        return [("html", DEFAULT_OUTPUT_DIR / f"{stem}.html")]
+        return [("html", OUTPUT_HTML_DIR / f"{stem}.html")]
     if fmt == "md":
-        return [("md", DEFAULT_OUTPUT_DIR / f"{stem}.md")]
+        return [("md", OUTPUT_MD_DIR / f"{stem}.md")]
     return [
-        ("html", DEFAULT_OUTPUT_DIR / f"{stem}.html"),
-        ("md", DEFAULT_OUTPUT_DIR / f"{stem}.md"),
+        ("html", OUTPUT_HTML_DIR / f"{stem}.html"),
+        ("md", OUTPUT_MD_DIR / f"{stem}.md"),
     ]
 
 
@@ -244,14 +248,15 @@ def process_one(
     tsr_kind: str = "auto",
     tsr_aggressive: bool = False,
     save_vis: bool = True,
+    vis_dir: Path | None = None,
     lore_pipe=None,
     ocr_engine=None,
 ) -> None:
     """处理单张图片并按 format 写入。"""
     print(f"[info] 处理图像: {image_path}")
     force = None if (tsr_kind or "auto").lower() == "auto" else tsr_kind
-    # 划线图默认与首个文本输出同目录；无输出路径时用 data/output
-    vis_dir = out_specs[0][1].parent if out_specs else DEFAULT_OUTPUT_DIR
+    # 划线图默认写入 images 子目录；显式指定输出位置时由调用方传入跟随目录
+    vis_dir = vis_dir if vis_dir is not None else OUTPUT_IMAGE_DIR
     result = extract_table_output(
         str(image_path),
         ioa_threshold=ioa_threshold,
@@ -288,16 +293,16 @@ def process_one(
         print(f"[info] 已写入: {out_path}\n")
 
 
-def _output_exists(image_path: Path, fmt: str) -> bool:
-    """对应 data/output/<stem>.html|.md 是否已有成功产物。"""
+def outputs_present(image_path: Path, fmt: str) -> bool:
+    """当前 format 期望的全部产物是否都在 data/output/html|md 子目录（严格：一个不能缺）。"""
     stem = image_path.stem
-    html = DEFAULT_OUTPUT_DIR / f"{stem}.html"
-    md = DEFAULT_OUTPUT_DIR / f"{stem}.md"
+    html = OUTPUT_HTML_DIR / f"{stem}.html"
+    md = OUTPUT_MD_DIR / f"{stem}.md"
     if fmt == "html":
         return html.is_file()
     if fmt == "md":
         return md.is_file()
-    return html.is_file() or md.is_file()
+    return html.is_file() and md.is_file()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -356,14 +361,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[info] 存档已清理 {pruned} 条（输入目录中已不存在）")
         seeded = 0
         for p in images:
-            if p.name not in archive.items and _output_exists(p, args.format):
+            if p.name not in archive.items and outputs_present(p, args.format):
                 archive.mark_success(p, save=False)
                 seeded += 1
         if seeded:
             archive.save()
             print(f"[info] 存档补记 {seeded} 张已有输出为成功（本次跳过）")
         to_process, skipped, stats = archive.select(
-            images, force_all=bool(args.force_all)
+            images,
+            force_all=bool(args.force_all),
+            output_present=lambda p: outputs_present(p, args.format),
         )
         print(
             f"[info] 输入目录共 {len(images)} 张；"
@@ -404,6 +411,10 @@ def main(argv: list[str] | None = None) -> int:
         load_tsr_models()
 
     ok, fail = 0, 0
+    # 划线图：默认 images 子目录；显式 --output 时跟随用户指定位置
+    vis_dir = (
+        Path(args.output).parent if single and args.output else OUTPUT_IMAGE_DIR
+    )
     for i, image_path in enumerate(to_process, start=1):
         out_specs = _resolve_out_paths(
             image_path, args.output, args.format, single=single and len(to_process) == 1
@@ -428,6 +439,7 @@ def main(argv: list[str] | None = None) -> int:
                 tsr_kind=args.tsr_kind,
                 tsr_aggressive=tsr_aggressive,
                 save_vis=not args.no_vis,
+                vis_dir=vis_dir,
                 lore_pipe=lore,
                 ocr_engine=ocr,
             )
