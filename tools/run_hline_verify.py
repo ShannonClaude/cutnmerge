@@ -15,7 +15,7 @@ load_env()
 
 from src.core.pipeline import extract_table_output  # noqa: E402
 
-KEYS = ["P96X874", "P97X876", "P98X878", "P100X888", "P109X1086", "P123X933", "P135X957"]
+KEYS = ["P96X874", "P97X876", "P98X878", "P100X888", "P109X1086", "P123X933", "P125X937", "P135X957"]
 
 
 def main() -> None:
@@ -118,6 +118,17 @@ def main() -> None:
                 merged,
                 "n_shishi",
                 html.count("实施例"),
+            )
+        elif key == "P125X937":
+            plain = re.sub(r"<br\s*/?>", "", html)
+            bleed = "光来" in html
+            print(
+                "P125 bleed_lai",
+                bleed,
+                "has_c1",
+                "光聚合引发" in plain,
+                "has_from_pigment",
+                "来自颜料分散" in plain,
             )
         elif key == "P109X1086":
             print(

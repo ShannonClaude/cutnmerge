@@ -765,6 +765,60 @@ def _split_breaks_paired_marks(text: str, cuts: Sequence[int]) -> bool:
     return False
 
 
+def _cuts_have_cjk_singleton(text: str, cuts: Sequence[int]) -> bool:
+    """切分后若某段只剩单个汉字，视为贴边误切。"""
+    for i in range(len(cuts) - 1):
+        part = (text[cuts[i] : cuts[i + 1]] or "").strip()
+        if len(part) == 1 and _CJK_RE.fullmatch(part):
+            return True
+    return False
+
+
+def _snap_cjk_cuts_to_ink_mass(
+    text: str,
+    cuts: Sequence[int],
+    snap_xs: Sequence[float],
+    tb_box: Tuple[float, float, float, float],
+    ink: np.ndarray,
+    abs_x0: float,
+) -> List[int]:
+    """
+    列界切点若把贴边汉字切错一侧，用沟左/右墨水比例把切点挪 ±1 个 CJK。
+
+    不改数字切分：只有被挪动的那一个字符是 CJK 时才调整。
+    """
+    if ink.size == 0 or not snap_xs or len(cuts) < 3:
+        return list(cuts)
+    cum = _char_cumulative_widths(text)
+    total = max(cum[-1], 1e-6)
+    out = list(cuts)
+    n_internal = min(len(snap_xs), len(out) - 2)
+    for j in range(n_internal):
+        idx = out[j + 1]
+        sx = float(snap_xs[j])
+        gi = int(np.clip(round(sx - abs_x0), 0, len(ink)))
+        left = float(ink[:gi].sum())
+        right = float(ink[gi:].sum())
+        if left + right < 1e-6:
+            continue
+        ink_frac = left / (left + right)
+        best_i = idx
+        best_d = abs(cum[idx] / total - ink_frac)
+        for di in (-1, 1):
+            ci = idx + di
+            if ci <= out[j] or ci >= out[j + 2]:
+                continue
+            moved = text[min(idx, ci) : max(idx, ci)]
+            if not (len(moved) == 1 and _CJK_RE.fullmatch(moved)):
+                continue
+            d = abs(cum[ci] / total - ink_frac)
+            if d + 1e-9 < best_d:
+                best_d = d
+                best_i = ci
+        out[j + 1] = best_i
+    return out
+
+
 def _geometric_multi_col_split(
     tb: Dict[str, Any],
     cells: List[Dict[str, Any]],
@@ -776,6 +830,9 @@ def _geometric_multi_col_split(
     """
     text = str(tb.get("text") or "")
     if len(text.strip()) < 2:
+        return False
+    # 与 _try_split_across_cells 对齐：单段中文表头不按列界硬切
+    if _should_block_geom_header_split(text):
         return False
 
     tb_box = _text_bbox(tb)
@@ -830,6 +887,8 @@ def _geometric_multi_col_split(
     cuts = _snap_cuts_inside_digit_run(text, cuts)
 
     if _split_breaks_paired_marks(text, cuts):
+        return False
+    if _cuts_have_cjk_singleton(text, cuts):
         return False
 
     assigned = False
@@ -1023,6 +1082,8 @@ def _try_split_across_cells(
                 cuts[i] = cuts[i - 1]
         if _split_breaks_paired_marks(text, cuts):
             return False
+        if _cuts_have_cjk_singleton(text, cuts):
+            return False
         if not _pieces_match_slot_widths(text, cuts, slots):
             return False
     else:
@@ -1033,8 +1094,13 @@ def _try_split_across_cells(
         for i in range(1, len(cuts)):
             if cuts[i] < cuts[i - 1]:
                 cuts[i] = cuts[i - 1]
+        cuts = _snap_cjk_cuts_to_ink_mass(
+            text, cuts, snapped, tb_box, ink, abs_x0
+        )
 
         if _split_breaks_paired_marks(text, cuts):
+            return False
+        if _cuts_have_cjk_singleton(text, cuts):
             return False
 
         all_wide = all(w >= wide_need for w in run_widths)
