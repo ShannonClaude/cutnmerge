@@ -53,6 +53,19 @@ def main() -> int:
             print(f"  {text!r}: {'OK' if ok else 'FAIL'} (found={hit})")
             if not ok:
                 return 1
+        ghost = bool(
+            re.search(
+                r"<td></td>\s*<td[^>]*>聚酰亚胺的酰亚胺化率",
+                html,
+            )
+        )
+        print(f"  ghost_metric_col: {'FAIL' if ghost else 'OK'}")
+        if ghost:
+            return 1
+        if not re.search(r"聚酰亚胺重均分子量", html):
+            print("  missing_mw: FAIL")
+            return 1
+        print("  metric_rows: OK")
     print("OK issue3 verify")
     return 0
 

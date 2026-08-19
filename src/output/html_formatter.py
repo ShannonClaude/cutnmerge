@@ -25,9 +25,10 @@ logger = logging.getLogger(__name__)
 
 # 噪声行：整行仅剩孤立字母/符号（如末行 "L"）
 _NOISE_CELL_RE = re.compile(r"^[A-Za-z]$|^[·•\.\,;:]$")
-# 身列数据值：纯数字、比率、缺测横线。不含 jER-604 / 实施例1 / 4,4'-DAE。
+# 身列数据值：纯数字、比率、缺测横线、单字母等级代号（A/B/C…）。
+# 不含 jER-604 / 实施例1 / 4,4'-DAE。
 _DATA_VALUE_RE = re.compile(
-    r"^(?:[-–—−~～]|[-–—−]?\d+(?:\.\d+)?(?:\s*[\/／]\s*\d+(?:\.\d+)?)?)$"
+    r"^(?:[-–—−~～]|[-–—−]?\d+(?:\.\d+)?(?:\s*[\/／]\s*\d+(?:\.\d+)?)?|[A-Za-z][+＋]?)$"
 )
 
 
@@ -1284,6 +1285,9 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
         if not t:
             return True
         compact = "".join(t.split())
+        # 括号包裹的单位/注释（如 (℃)、(min)、(%)）不是碎片
+        if compact.startswith("(") or compact.startswith("（"):
+            return False
         return len(compact) <= 2 or compact in {"-", "—", "_"}
 
     # 用 (row_start, col_start, col_end) 精确匹配“正下方同列范围”的格

@@ -16,7 +16,7 @@ import numpy as np
 
 from .config import ROOT
 from .models import load_lore_model, load_ocr, predict_cells, predict_texts
-from ..matching.matching import assign_texts_to_cells
+from ..matching.matching import assign_texts_to_cells, _fix_dash_column_consistency
 from ..ocr.ocr_post import postprocess_text_boxes
 from ..ocr.reocr import apply_reocr_to_cells, recover_empty_vertical_headers
 from ..output.formatter import format_free_texts
@@ -50,6 +50,30 @@ from ..structure.tsr_refine import (
 logger = logging.getLogger(__name__)
 DEFAULT_DEBUG_DIR = ROOT / "data" / "debug"
 DEFAULT_OUTPUT_DIR = ROOT / "data" / "output"
+
+
+def _is_degenerate_grid(
+    cells: List[Dict[str, Any]],
+    text_boxes: list,
+) -> bool:
+    """检测退化网格——仅在极端灾难性场景触发，避免误判正常复杂表格。
+
+    触发条件（需同时满足多个强信号）：
+    - 格子数极少而文本框极多（结构基本丢失）
+    - 或逻辑冲突比极高（>0.25）且格子数远少于文本框数
+    """
+    if not cells:
+        return len(text_boxes) > 20
+    n_cells = len(cells)
+    n_boxes = max(len(text_boxes), 1)
+    # 信号1：格子极少、文本框极多——结构几乎完全丢失
+    if n_cells < 4 and n_boxes > 20:
+        return True
+    # 信号2：逻辑冲突比极高 + 格子远少于文本框（双重确认）
+    cr = logic_conflict_ratio(cells)
+    if cr > 0.25 and n_cells < n_boxes * 0.3:
+        return True
+    return False
 
 # auto 模式下框线网格最低置信度（仅 --structure lines/auto 的旧路径）
 _LINES_CONF_THRESH = 0.35
@@ -213,6 +237,7 @@ def _extract_via_lines(
             col_seps=table.col_seps,
             v_separators=table.v_separators,
         )
+        cells = _fix_dash_column_consistency(cells)
         cells = recover_empty_vertical_headers(
             image,
             cells,
@@ -302,6 +327,7 @@ def _extract_via_lore(
         table_bboxes=None,
         binary=binarize_otsu(image),
     )
+    cells = _fix_dash_column_consistency(cells)
     lore_binary = binarize_otsu(image)
     cells = recover_empty_vertical_headers(
         image,
@@ -493,6 +519,7 @@ def _extract_via_tsr(
     from ..structure.row_header import (
         clip_narrow_label_colspans,
         clip_row_header_child_overlaps,
+        extend_section_rowspan_over_metric_rows,
         peel_row_header_text,
     )
 
@@ -516,7 +543,9 @@ def _extract_via_tsr(
         col_seps=col_seps,
         v_separators=v_separators,
     )
+    cells = _fix_dash_column_consistency(cells)
     cells = peel_row_header_text(cells, text_boxes)
+    cells = extend_section_rowspan_over_metric_rows(cells)
     cells, caption_texts = strip_caption_cells(cells)
     if caption_texts:
         free_texts.extend(caption_texts)
@@ -538,6 +567,35 @@ def _extract_via_tsr(
             refresh_cache=refresh_cache,
             max_cells=reocr_max_cells,
         )
+    # 退化网格检测：结构严重损坏时尝试升级或 LORE 兜底
+    if _is_degenerate_grid(cells, text_boxes):
+        logger.warning("检测到退化网格(cells=%d boxes=%d)，尝试兜底", len(cells), len(text_boxes))
+        if not tsr_aggressive:
+            try:
+                agg_cells = refine_tsr_cells(cells, text_boxes)
+                probe_lines = detect_tables(image, confidence_thresh=0.0, text_boxes=text_boxes)
+                fused = fuse_tsr_with_lines(agg_cells, probe_lines) if probe_lines else agg_cells
+                if not _is_degenerate_grid(fused, text_boxes):
+                    cells = fused
+                    logger.info("退化网格升级 aggressive+fused 成功")
+                else:
+                    raise ValueError("aggressive 仍退化")
+            except Exception:
+                logger.info("aggressive 路径未改善，尝试 LORE 兜底")
+                try:
+                    lore_outs, lore_tables = _extract_via_lore(
+                        image, text_boxes,
+                        ioa_threshold=ioa_threshold,
+                        compress_empty_cols=compress_empty_cols,
+                        reocr=reocr, reocr_max_cells=reocr_max_cells,
+                        ocr_engine=ocr_engine, use_cache=use_cache,
+                        refresh_cache=refresh_cache,
+                    )
+                    if lore_outs.get("html"):
+                        return lore_outs, lore_tables
+                except Exception:
+                    logger.warning("LORE 兜底失败，使用当前退化结果")
+
     outs = _render_outputs(
         cells, free_texts, compress_empty_cols=compress_empty_cols
     )

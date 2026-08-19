@@ -645,3 +645,108 @@ def _normalize_truncated_chem_names(cells: List[Dict[str, Any]]) -> List[Dict[st
         if re.search(r"(?<![jJ])ER828", t):
             c["text"] = re.sub(r"(?<![jJ])ER828", "jER828", t)
     return cells
+
+
+_SECTION_PARENT_RE = re.compile(r"聚酰亚胺.*组成")
+_METRIC_ROW_RE = re.compile(r"聚酰亚胺.*(?:酰亚胺化率|重均分子量)")
+
+
+def _refresh_rowspan(cell: Dict[str, Any]) -> None:
+    cell["row_span"] = int(cell["row_end"]) - int(cell["row_start"]) + 1
+
+
+def extend_section_rowspan_over_metric_rows(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    P24/P25：左侧「聚酰亚胺组成（摩尔比）」大类行头若覆盖了
+    「酰亚胺化率 / 重均分子量」测量行，应收缩 rowspan 使其只覆盖
+    组成子行，测量行作为独立全宽标签行。
+    """
+    if not cells:
+        return cells
+
+    changed = 0
+    for parent in cells:
+        if int(parent["col_start"]) != 0:
+            continue
+        row_span = int(
+            parent.get("row_span")
+            or (int(parent["row_end"]) - int(parent["row_start"]) + 1)
+        )
+        if row_span < 3:
+            continue
+        text = str(parent.get("text") or "").strip()
+        if not _SECTION_PARENT_RE.search(text):
+            continue
+
+        parent_start = int(parent["row_start"])
+        parent_end = int(parent["row_end"])
+
+        # 收集在 parent 范围内或紧邻其后的测量行
+        metric_rows: List[int] = []
+        for c in cells:
+            if c is parent:
+                continue
+            rs, re_ = int(c["row_start"]), int(c["row_end"])
+            if rs != re_:
+                continue
+            # 测量行在 parent 范围内或紧邻其后（+3 容差）
+            if rs < parent_start:
+                continue
+            if rs > parent_end + 3:
+                continue
+            label = str(c.get("text") or "").strip()
+            if not _METRIC_ROW_RE.search(label):
+                continue
+            cs = int(c["col_start"])
+            if cs >= 4:
+                continue
+            metric_rows.append(rs)
+
+        if not metric_rows:
+            continue
+
+        metric_rows = sorted(set(metric_rows))
+
+        # 收缩 parent：row_end 设为测量行最小行号的前一行
+        new_end = min(metric_rows) - 1
+        if new_end < parent_start:
+            new_end = parent_start
+        if new_end != parent_end:
+            old_end = parent_end
+            parent["row_end"] = new_end
+            _refresh_rowspan(parent)
+            logger.info(
+                "大类行头收缩排除测量行: %s row_end %d → %d",
+                text[:24],
+                old_end,
+                new_end,
+            )
+
+        # 测量行标签单元格：确保从 col_start=0 开始，成为独立全宽标签
+        metric_row_set = set(metric_rows)
+        for c in cells:
+            rs = int(c["row_start"])
+            if rs not in metric_row_set:
+                continue
+            cs, ce = int(c["col_start"]), int(c["col_end"])
+            label = str(c.get("text") or "").strip()
+
+            # 空的 col0 占位单元格丢弃
+            if cs == 0 and not label:
+                c["_drop_render"] = True
+                continue
+
+            # 测量行标签：扩展到 col_start=0 使其独立
+            if _METRIC_ROW_RE.search(label):
+                if cs >= 1:
+                    c["col_start"] = 0
+                    _refresh_colspan(c)
+                continue
+
+        changed += 1
+
+    if not changed:
+        return cells
+    return [c for c in cells if not c.get("_drop_render")]

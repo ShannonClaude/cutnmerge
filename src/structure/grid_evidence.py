@@ -236,6 +236,23 @@ def apply_grid_evidence_merge(
             )
 
         blank_corridor = not crosses
+
+        # ---------- 幽灵列检测：若分隔线一侧完全无文本框中心落入，视为假列直接合并 ----------
+        # 跳过最外侧边界（j==0 的左列和 j==n_cols-2 的右列可能是合法空白边框列）
+        if 0 < j < n_cols - 2:
+            left_cnt = 0
+            right_cnt = 0
+            for tb in relevant_tbs:
+                bx1, _by1, bx2, _by2 = _tb_bbox(tb)
+                mx = (bx1 + bx2) / 2.0
+                if col_seps[j] <= mx < col_seps[j + 1]:
+                    left_cnt += 1
+                elif col_seps[j + 1] <= mx < col_seps[j + 2]:
+                    right_cnt += 1
+            if left_cnt == 0 or right_cnt == 0:
+                merge_cols.append(j)
+                continue
+
         if (not line_ok) and (not blank_corridor):
             merge_cols.append(j)
             continue

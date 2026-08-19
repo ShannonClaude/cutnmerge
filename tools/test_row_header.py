@@ -29,12 +29,19 @@ from src.ocr.ocr_post import normalize_ocr_text  # noqa: E402
 from src.structure.row_header import (  # noqa: E402
     clip_narrow_label_colspans,
     clip_row_header_child_overlaps,
+    extend_section_rowspan_over_metric_rows,
     peel_row_header_text,
     relocate_misplaced_category_labels,
 )
 from src.structure.tsr_refine import (  # noqa: E402
     dedupe_overlapping_cells,
     refine_tsr_cells_light,
+)
+from src.matching.matching import unmerge_filled_label_rowspans  # noqa: E402
+from src.utils.label_patterns import (  # noqa: E402
+    are_independent_row_labels,
+    extract_independent_labels_from_joined,
+    is_independent_row_label,
 )
 
 
@@ -602,6 +609,59 @@ def test_explode_sticky_header_wide_cell():
     assert all(int(c["col_span"]) == 1 for c in out)
 
 
+def test_extend_section_rowspan_over_metric_rows():
+    """P24/P25：大类行头应收缩排除测量行，测量行独立全宽标签。"""
+    cells = [
+        _cell(2, 12, 0, 0, "聚酰亚胺组成（摩尔比)", 0, 80, 40, 260),
+        _cell(2, 3, 1, 1, "酸酐", 80, 160, 40, 80),
+        _cell(11, 11, 0, 0, "", 0, 80, 220, 240),
+        _cell(11, 11, 1, 3, "聚酰亚胺的酰亚胺化率(%)", 80, 320, 220, 240),
+        _cell(11, 11, 4, 4, "95", 320, 400, 220, 240),
+        _cell(12, 12, 0, 3, "聚酰亚胺重均分子量", 0, 320, 240, 260),
+        _cell(12, 12, 4, 4, "19900", 320, 400, 240, 260),
+    ]
+    out = extend_section_rowspan_over_metric_rows([dict(c) for c in cells])
+    parent = next(c for c in out if "聚酰亚胺组成" in str(c.get("text") or ""))
+    # parent 收缩到 row 10，不再覆盖测量行 11/12
+    assert int(parent["row_end"]) == 10
+    assert int(parent["row_span"]) == 9
+    # 酰亚胺化率标签从 col0 开始，独立全宽
+    metric1 = next(c for c in out if "酰亚胺化率" in str(c.get("text") or ""))
+    assert int(metric1["col_start"]) == 0
+    # 重均分子量标签从 col0 开始
+    metric2 = next(c for c in out if "重均分子量" in str(c.get("text") or ""))
+    assert int(metric2["col_start"]) == 0
+    # 空占位 col0 单元格应被丢弃
+    assert not any(
+        int(c["row_start"]) == 11 and int(c["col_start"]) == 0
+        and not str(c.get("text") or "").strip()
+        for c in out
+    )
+    html = cells_to_html_table(out)
+    assert "聚酰亚胺的酰亚胺化率" in html
+    assert "聚酰亚胺重均分子量" in html
+
+
+def test_p40_aa_independent_label_parse():
+    assert is_independent_row_label("(AA)")
+    assert is_independent_row_label("(AZ)")
+    labels = extract_independent_labels_from_joined("(AA)(AB)(AC)")
+    assert labels == ["(AA)", "(AB)", "(AC)"]
+    assert are_independent_row_labels(["(AA)", "(AB)", "(AC)"])
+
+
+def test_p40_unmerge_aa_rowspan():
+    """P40：左列大 rowspan 粘连 (AA)(AB)(AC) 应拆成逐行。"""
+    cells = [
+        _cell(0, 2, 0, 0, "(AA)(AB)(AC)", 0, 80, 0, 60),
+    ]
+    out = unmerge_filled_label_rowspans([dict(c) for c in cells])
+    assert len(out) == 3
+    texts = [str(c.get("text") or "") for c in out]
+    assert texts == ["(AA)", "(AB)", "(AC)"]
+    assert all(int(c["row_span"]) == 1 for c in out)
+
+
 def main() -> int:
     test_body_left_stub_does_not_merge_column_headers()
     test_p100_fensan_still_merges_in_header_band()
@@ -635,6 +695,9 @@ def main() -> int:
     test_repair_lone_example_number_header()
     test_sticky_strip_bare_example_prefix()
     test_explode_sticky_header_wide_cell()
+    test_extend_section_rowspan_over_metric_rows()
+    test_p40_aa_independent_label_parse()
+    test_p40_unmerge_aa_rowspan()
     print("OK: row header tests passed")
     return 0
 

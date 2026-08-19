@@ -1939,3 +1939,50 @@ def join_cell_texts(
         row_parts = deduped
     row_parts = _order_value_grade_parts(row_parts)
     return _normalize_dash_text("\n".join(row_parts))
+
+
+# ---------------------------------------------------------------------------
+# 列级一致性：将误识别的孤立 "1" 修正为 "-"
+# ---------------------------------------------------------------------------
+_DASH_LIKE_RE = re.compile(r'^[\-\u2013\u2014\u2015\u2212\uff0d]+$')
+
+
+def _fix_dash_column_consistency(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """按列统计 dash vs '1'，当列以 dash 为主时将孤立 '1' 翻转为 '-'。"""
+    from collections import defaultdict
+
+    col_cells: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for c in cells:
+        cs = c.get("col_start")
+        if cs is not None and c.get("col_span", 1) == 1:
+            col_cells[cs].append(c)
+
+    for col_idx, col in col_cells.items():
+        dash_count = 0
+        one_cells: List[Dict[str, Any]] = []
+        multi_char_count = 0
+        for c in col:
+            txt = (c.get("text") or "").strip()
+            if not txt:
+                continue
+            if _DASH_LIKE_RE.match(txt):
+                dash_count += 1
+            elif txt == "1":
+                one_cells.append(c)
+            elif len(txt) > 1:
+                multi_char_count += 1
+        if not one_cells:
+            continue
+        total = dash_count + len(one_cells)
+        # 方式1：列以 dash 为主（原逻辑）
+        if total > 0 and dash_count >= 2 and dash_count / total >= 0.5:
+            for c in one_cells:
+                logger.debug("列 %d dash 一致性: '1' → '-'", col_idx)
+                c["text"] = "-"
+            continue
+        # 方式2：列以多字符值为主，孤立 '1' 大概率是 OCR 把 '-' 误识别
+        if dash_count + multi_char_count >= 2 and multi_char_count > len(one_cells):
+            for c in one_cells:
+                logger.debug("列 %d 多值列孤立1: '1' → '-'", col_idx)
+                c["text"] = "-"
+    return cells

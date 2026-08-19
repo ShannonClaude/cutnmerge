@@ -133,8 +133,12 @@ def split_cells_into_subtables(
     subtables: List[List[Dict[str, Any]]] = []
     for row_lo, row_hi in segments:
         group = [c for c in cells if row_lo <= int(c["row_start"]) <= row_hi]
-        if group:
-            subtables.append(_renormalize_subtable(group))
+        if not group:
+            continue
+        # 过滤全空子表（所有单元格无文本内容）
+        if all(not str(c.get("text", "")).strip() for c in group):
+            continue
+        subtables.append(_renormalize_subtable(group))
     return subtables if subtables else [_renormalize_subtable(cells)]
 
 

@@ -12,6 +12,7 @@ _INDEPENDENT_LABEL_RE = re.compile(
     r"[IVXivx０-９\d]+|"
     r"(?:iii|ii|i|III|II|I|ｌｉｉ|ｌｉ)[-－]?\d+|"
     r"(?:OXL|OXE|OX)[-－]?[A-Za-z0-9]+|"
+    r"\([A-Z]{2}\)|"
     r"\d{1,3}"
     r")$",
     re.IGNORECASE,
@@ -193,7 +194,8 @@ def extract_independent_labels_from_joined(text: str) -> List[str]:
                 r"(?:实[施試]例|実[施試]例|実施例|比較例|比较例|合成例)"
                 r"[IVXivx０-９\d]+|"
                 r"(?:iii|ii|i)\s*[-－]?\s*\d+|"
-                r"(?:OXL|OXE)\s*[-－]?\s*[A-Za-z0-9]+",
+                r"(?:OXL|OXE)\s*[-－]?\s*[A-Za-z0-9]+|"
+                r"\([A-Z]{2}\)",
                 compact,
                 flags=re.IGNORECASE,
             )
