@@ -4,6 +4,9 @@
 用法:
     python main.py
         # 默认：tsr 结构，写出 data/output/<同名>.html + .md + 两张彩图
+        # 批量有存档：已成功的跳过，只处理失败项与新文件
+    python main.py --force-all
+        # 忽略存档，全部重新处理
     python main.py --image data/input/demo.png
     python main.py --structure lines --debug
     python main.py --format html
@@ -138,6 +141,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-vis",
         action="store_true",
         help="关闭表格划线可视化（默认会写出 <stem>_table_vis.png / _table_vis_logic.png）",
+    )
+    parser.add_argument(
+        "--force-all",
+        action="store_true",
+        help="忽略运行存档，批量模式下重新处理全部图片（默认只处理失败项与新文件）",
     )
     reocr_group = parser.add_mutually_exclusive_group()
     reocr_group.add_argument(
@@ -280,6 +288,18 @@ def process_one(
         print(f"[info] 已写入: {out_path}\n")
 
 
+def _output_exists(image_path: Path, fmt: str) -> bool:
+    """对应 data/output/<stem>.html|.md 是否已有成功产物。"""
+    stem = image_path.stem
+    html = DEFAULT_OUTPUT_DIR / f"{stem}.html"
+    md = DEFAULT_OUTPUT_DIR / f"{stem}.md"
+    if fmt == "html":
+        return html.is_file()
+    if fmt == "md":
+        return md.is_file()
+    return html.is_file() or md.is_file()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     from src.core.config import get_settings
@@ -316,11 +336,58 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         single = False
 
-    print(
-        f"[info] 共 {len(images)} 张图片待处理 "
-        f"(structure={args.structure}, tsr_kind={args.tsr_kind}, "
-        f"tsr_aggressive={tsr_aggressive}, reocr={reocr}, format={args.format})"
-    )
+    from src.core.run_archive import RunArchive, format_select_summary, shorten_error
+
+    archive = RunArchive()
+    archive.load()
+    skipped: list[Path] = []
+    if single:
+        # --image 显式指定，始终处理这一张，但仍写入存档
+        to_process = images
+        print(
+            f"[info] 单图模式，将处理 {images[0].name} "
+            f"(structure={args.structure}, tsr_kind={args.tsr_kind}, "
+            f"tsr_aggressive={tsr_aggressive}, reocr={reocr}, format={args.format})"
+        )
+    else:
+        pruned = archive.prune_missing(p.name for p in images)
+        if pruned:
+            archive.save()
+            print(f"[info] 存档已清理 {pruned} 条（输入目录中已不存在）")
+        seeded = 0
+        for p in images:
+            if p.name not in archive.items and _output_exists(p, args.format):
+                archive.mark_success(p, save=False)
+                seeded += 1
+        if seeded:
+            archive.save()
+            print(f"[info] 存档补记 {seeded} 张已有输出为成功（本次跳过）")
+        to_process, skipped, stats = archive.select(
+            images, force_all=bool(args.force_all)
+        )
+        print(
+            f"[info] 输入目录共 {len(images)} 张；"
+            f"{format_select_summary(stats, len(to_process), len(skipped))} "
+            f"(structure={args.structure}, tsr_kind={args.tsr_kind}, "
+            f"tsr_aggressive={tsr_aggressive}, reocr={reocr}, format={args.format})"
+        )
+        retry_names = [
+            p.name
+            for p in to_process
+            if str((archive.items.get(p.name) or {}).get("status") or "") == "failed"
+        ]
+        if retry_names:
+            print(f"[info] 将重试失败项 ({len(retry_names)}): " + "、".join(retry_names))
+
+    if not to_process:
+        leftover = archive.failed_records()
+        if leftover:
+            print(f"[info] 没有需要处理的图片，但仍有 {len(leftover)} 张失败记录")
+            for rec in leftover:
+                print(f"  - {rec.get('name')}: {rec.get('error') or ''}")
+            return 1
+        print("[info] 没有需要处理的图片（均已成功，且无新文件）")
+        return 0
 
     from src.core.models import load_ocr
 
@@ -337,11 +404,11 @@ def main(argv: list[str] | None = None) -> int:
         load_tsr_models()
 
     ok, fail = 0, 0
-    for i, image_path in enumerate(images, start=1):
+    for i, image_path in enumerate(to_process, start=1):
         out_specs = _resolve_out_paths(
-            image_path, args.output, args.format, single=single and len(images) == 1
+            image_path, args.output, args.format, single=single and len(to_process) == 1
         )
-        print(f"[info] ({i}/{len(images)}) {image_path.name}")
+        print(f"[info] ({i}/{len(to_process)}) {image_path.name}")
         try:
             process_one(
                 image_path,
@@ -365,14 +432,28 @@ def main(argv: list[str] | None = None) -> int:
                 ocr_engine=ocr,
             )
             ok += 1
+            archive.mark_success(image_path)
         except Exception as exc:  # noqa: BLE001
             fail += 1
+            archive.mark_failed(image_path, shorten_error(exc))
             print(f"[error] 处理失败 {image_path.name}: {exc}", file=sys.stderr)
             import traceback
 
             traceback.print_exc()
 
-    print(f"[info] 完成: 成功 {ok}，失败 {fail}")
+    skip_n = len(skipped)
+    skip_msg = f"，跳过已成功 {skip_n}" if skip_n else ""
+    print(f"[info] 完成: 成功 {ok}，失败 {fail}{skip_msg}")
+    leftover = archive.failed_records()
+    if leftover:
+        print(
+            f"[info] 仍失败 {len(leftover)} 张（清单: {archive.path}）；"
+            "下次 python main.py 将只重试这些及新文件:"
+        )
+        for rec in leftover:
+            print(f"  - {rec.get('name')}: {rec.get('error') or ''}")
+    elif not single:
+        print(f"[info] 存档中已无失败项: {archive.path}")
     return 0 if fail == 0 else 1
 
 

@@ -47,6 +47,30 @@ def _cell_area(cell: Dict[str, Any]) -> float:
     return max(x2 - x1, 0.0) * max(y2 - y1, 0.0)
 
 
+def _bbox_inter_area(
+    a: Tuple[float, float, float, float],
+    b: Tuple[float, float, float, float],
+) -> float:
+    ix1 = max(a[0], b[0])
+    iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2])
+    iy2 = min(a[3], b[3])
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    return (ix2 - ix1) * (iy2 - iy1)
+
+
+def _logic_strict_subset(child: Dict[str, Any], parent: Dict[str, Any]) -> bool:
+    """True if child's logic rect is strictly inside parent's (not equal)."""
+    crs, cre = int(child["row_start"]), int(child["row_end"])
+    ccs, cce = int(child["col_start"]), int(child["col_end"])
+    prs, pre = int(parent["row_start"]), int(parent["row_end"])
+    pcs, pce = int(parent["col_start"]), int(parent["col_end"])
+    contained = crs >= prs and cre <= pre and ccs >= pcs and cce <= pce
+    equal = crs == prs and cre == pre and ccs == pcs and cce == pce
+    return contained and not equal
+
+
 def _has_cjk(text: str) -> bool:
     return bool(_CJK_RE.search(text or ""))
 
@@ -192,41 +216,84 @@ def dedupe_overlapping_cells(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
     # 包含抑制：大格内若有 ≥2 个子格（各自 ≥90% 面积落入），且子格合计覆盖大格
     # 大部分面积，则丢掉冗余父格（保留更细划分）。
+    # 必须先于空碎片剪除：否则丢掉空子格后可能凑不够 2 个孩子，父格会漏网。
     survivors = [c for k, c in enumerate(kept) if k not in drop]
-    if len(survivors) < 3:
-        return survivors
+    if len(survivors) >= 3:
+        bboxes = [_cell_bbox(c) for c in survivors]
+        areas = [_cell_area(c) for c in survivors]
+        drop2: set = set()
+        for i, (bi, ai) in enumerate(zip(bboxes, areas)):
+            if ai <= 0 or i in drop2:
+                continue
+            children: List[int] = []
+            child_area_sum = 0.0
+            for j, (bj, aj) in enumerate(zip(bboxes, areas)):
+                if i == j or j in drop2 or aj <= 0:
+                    continue
+                # j 落入 i 的比例
+                ix1 = max(bi[0], bj[0])
+                iy1 = max(bi[1], bj[1])
+                ix2 = min(bi[2], bj[2])
+                iy2 = min(bi[3], bj[3])
+                if ix2 <= ix1 or iy2 <= iy1:
+                    continue
+                inter = (ix2 - ix1) * (iy2 - iy1)
+                if inter / aj >= 0.90 and aj < ai * 0.95:
+                    children.append(j)
+                    child_area_sum += aj
+            if len(children) >= 2 and child_area_sum >= 0.55 * ai:
+                drop2.add(i)
+                logger.info(
+                    "TSR 容器格抑制: drop parent area=%.0f children=%d cover=%.2f",
+                    ai,
+                    len(children),
+                    child_area_sum / ai,
+                )
+        survivors = [c for k, c in enumerate(survivors) if k not in drop2]
+    return _drop_contained_empty_fragments(survivors)
 
-    bboxes = [_cell_bbox(c) for c in survivors]
-    areas = [_cell_area(c) for c in survivors]
-    drop2: set = set()
-    for i, (bi, ai) in enumerate(zip(bboxes, areas)):
-        if ai <= 0 or i in drop2:
+
+def _drop_contained_empty_fragments(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """丢弃逻辑上被另一格严格包含、物理上也几乎完全落入、且无实质文本的碎片格。
+
+    TSR 偶发会在合并格角落吐出微型空格；IoU 很低，容器抑制又要求 ≥2 个子格，
+    两条旧规则都接不住。有字的细划分（子表头）不删。
+    """
+    if len(cells) < 2:
+        return cells
+
+    drop: set = set()
+    bboxes = [_cell_bbox(c) for c in cells]
+    areas = [_cell_area(c) for c in cells]
+    for j, child in enumerate(cells):
+        if j in drop:
             continue
-        children: List[int] = []
-        child_area_sum = 0.0
-        for j, (bj, aj) in enumerate(zip(bboxes, areas)):
-            if i == j or j in drop2 or aj <= 0:
+        if not _looks_like_ocr_fragment(str(child.get("text") or "")):
+            continue
+        aj = areas[j]
+        if aj <= 0:
+            drop.add(j)
+            continue
+        for i, parent in enumerate(cells):
+            if i == j or i in drop:
                 continue
-            # j 落入 i 的比例
-            ix1 = max(bi[0], bj[0])
-            iy1 = max(bi[1], bj[1])
-            ix2 = min(bi[2], bj[2])
-            iy2 = min(bi[3], bj[3])
-            if ix2 <= ix1 or iy2 <= iy1:
+            if not _logic_strict_subset(child, parent):
                 continue
-            inter = (ix2 - ix1) * (iy2 - iy1)
-            if inter / aj >= 0.90 and aj < ai * 0.95:
-                children.append(j)
-                child_area_sum += aj
-        if len(children) >= 2 and child_area_sum >= 0.55 * ai:
-            drop2.add(i)
+            if _bbox_inter_area(bboxes[j], bboxes[i]) / aj < 0.90:
+                continue
+            drop.add(j)
             logger.info(
-                "TSR 容器格抑制: drop parent area=%.0f children=%d cover=%.2f",
-                ai,
-                len(children),
-                child_area_sum / ai,
+                "TSR 包含碎片抑制: drop child logic=%s area=%.0f inside parent %s",
+                _logic_key(child),
+                aj,
+                _logic_key(parent),
             )
-    return [c for k, c in enumerate(survivors) if k not in drop2]
+            break
+    if not drop:
+        return cells
+    return [c for k, c in enumerate(cells) if k not in drop]
 
 
 def _texts_in_cell(

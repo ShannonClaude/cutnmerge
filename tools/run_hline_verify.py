@@ -15,7 +15,7 @@ load_env()
 
 from src.core.pipeline import extract_table_output  # noqa: E402
 
-KEYS = ["P96X874", "P97X876", "P98X878", "P109X1086", "P135X957"]
+KEYS = ["P96X874", "P97X876", "P98X878", "P100X888", "P109X1086", "P135X957"]
 
 
 def main() -> None:
@@ -76,6 +76,21 @@ def main() -> None:
         elif key == "P98X878":
             n = html.count("单体[摩尔比]")
             print("P98 monomer_headers", n)
+        elif key == "P100X888":
+            ghost = bool(
+                re.search(
+                    r'<td rowspan="2"></td>\s*<td></td>\s*<td[^>]*>分散液',
+                    html,
+                )
+            )
+            print(
+                "P100 ghost_line",
+                ghost,
+                "has_fensan",
+                "分散液" in html,
+                "n_zhizao",
+                html.count("制备例"),
+            )
         elif key == "P109X1086":
             print(
                 "P109 B_ratio rowspan",

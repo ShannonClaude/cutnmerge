@@ -111,19 +111,86 @@ def compress_empty_logic_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
     return out
 
 
+def _logic_area(cell: Dict[str, Any]) -> int:
+    return (
+        (int(cell["row_end"]) - int(cell["row_start"]) + 1)
+        * (int(cell["col_end"]) - int(cell["col_start"]) + 1)
+    )
+
+
+def _unique_cell_refs(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: Set[int] = set()
+    out: List[Dict[str, Any]] = []
+    for cell in cells:
+        cid = id(cell)
+        if cid not in seen:
+            seen.add(cid)
+            out.append(cell)
+    return out
+
+
+def _evict_occupants(
+    occupants: List[Dict[str, Any]],
+    occupancy: Dict[Tuple[int, int], Dict[str, Any]],
+    out: List[Dict[str, Any]],
+) -> None:
+    ids = {id(o) for o in occupants}
+    for owner in occupants:
+        rs, re = int(owner["row_start"]), int(owner["row_end"])
+        cs, ce = int(owner["col_start"]), int(owner["col_end"])
+        for r in range(rs, re + 1):
+            for c in range(cs, ce + 1):
+                if occupancy.get((r, c)) is owner:
+                    del occupancy[(r, c)]
+    out[:] = [c for c in out if id(c) not in ids]
+
+
+def _try_place_rect_remainder(
+    cell: Dict[str, Any],
+    free_positions: List[Tuple[int, int]],
+    occupancy: Dict[Tuple[int, int], Dict[str, Any]],
+    out: List[Dict[str, Any]],
+    *,
+    clear_text: bool,
+) -> None:
+    """若剩余空位能拼成完整矩形则占位；L 形不拆成额外空格。"""
+    if not free_positions:
+        return
+    frs = min(p[0] for p in free_positions)
+    fre = max(p[0] for p in free_positions)
+    fcs = min(p[1] for p in free_positions)
+    fce = max(p[1] for p in free_positions)
+    needed = {
+        (r, c)
+        for r in range(frs, fre + 1)
+        for c in range(fcs, fce + 1)
+    }
+    if not needed.issubset(set(free_positions)):
+        return
+    nc = dict(cell)
+    nc["row_start"], nc["row_end"] = frs, fre
+    nc["col_start"], nc["col_end"] = fcs, fce
+    nc["row_span"] = fre - frs + 1
+    nc["col_span"] = fce - fcs + 1
+    if clear_text:
+        nc["text"] = ""
+    out.append(nc)
+    for r, c in needed:
+        occupancy[(r, c)] = nc
+
+
 def _resolve_logic_overlaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     渲染前消解逻辑矩形重叠：后到的非空文本并入占位格，并裁掉冲突覆盖。
 
-    避免 `covered` 静默丢字。
+    空/碎片占位者遇到更大有字格时被赶走，避免大格剩余 L 形空位渲染成幽灵线。
     """
     if not cells:
         return cells
 
     # 按面积升序：先处理小格（更具体）
     ordered = sorted(cells, key=lambda c: (
-        (int(c["row_end"]) - int(c["row_start"]) + 1)
-        * (int(c["col_end"]) - int(c["col_start"]) + 1),
+        _logic_area(c),
         int(c["row_start"]),
         int(c["col_start"]),
     ))
@@ -146,7 +213,6 @@ def _resolve_logic_overlaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     conflict_owners.append(owner)
 
         if not conflict_owners:
-            # 无冲突：登记占位
             nc = dict(cell)
             out.append(nc)
             for r in range(rs, re + 1):
@@ -154,8 +220,38 @@ def _resolve_logic_overlaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     occupancy[(r, c)] = nc
             continue
 
+        unique_owners = _unique_cell_refs(conflict_owners)
+        incoming_area = _logic_area(cell)
+        if text and not _is_cell_frag(text):
+            frag_ids = {
+                id(o)
+                for o in unique_owners
+                if _is_cell_frag(str(o.get("text") or ""))
+                and incoming_area > _logic_area(o)
+            }
+            if frag_ids:
+                _evict_occupants(
+                    [o for o in unique_owners if id(o) in frag_ids],
+                    occupancy,
+                    out,
+                )
+                unique_owners = [o for o in unique_owners if id(o) not in frag_ids]
+                conflict_owners = unique_owners
+                free_positions = [
+                    (r, c)
+                    for r in range(rs, re + 1)
+                    for c in range(cs, ce + 1)
+                    if occupancy.get((r, c)) is None
+                ]
+                if not conflict_owners:
+                    nc = dict(cell)
+                    out.append(nc)
+                    for r in range(rs, re + 1):
+                        for c in range(cs, ce + 1):
+                            occupancy[(r, c)] = nc
+                    continue
+
         if text:
-            # 把文本并入第一个冲突占位格
             owner = conflict_owners[0]
             prev = str(owner.get("text") or "").strip()
             if text and text not in prev:
@@ -166,52 +262,15 @@ def _resolve_logic_overlaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     owner.get("col_start"),
                     text[:40],
                 )
-            # 若仍有空位，用空位重建一个缩减格（无文本，仅占位）
-            if free_positions:
-                frs = min(p[0] for p in free_positions)
-                fre = max(p[0] for p in free_positions)
-                fcs = min(p[1] for p in free_positions)
-                fce = max(p[1] for p in free_positions)
-                # 仅当缩减区域是矩形全覆盖时保留
-                needed = {
-                    (r, c)
-                    for r in range(frs, fre + 1)
-                    for c in range(fcs, fce + 1)
-                }
-                if needed.issubset(set(free_positions)):
-                    nc = dict(cell)
-                    nc["row_start"], nc["row_end"] = frs, fre
-                    nc["col_start"], nc["col_end"] = fcs, fce
-                    nc["row_span"] = fre - frs + 1
-                    nc["col_span"] = fce - fcs + 1
-                    nc["text"] = ""
-                    out.append(nc)
-                    for r, c in free_positions:
-                        if (r, c) in needed:
-                            occupancy[(r, c)] = nc
+            # 有字冲突：不把 L 形剩余拆成额外空 <td>
+            _try_place_rect_remainder(
+                cell, free_positions, occupancy, out, clear_text=True
+            )
             continue
 
-        # 空文本冲突格：若有空位则缩减，否则丢弃
-        if free_positions:
-            frs = min(p[0] for p in free_positions)
-            fre = max(p[0] for p in free_positions)
-            fcs = min(p[1] for p in free_positions)
-            fce = max(p[1] for p in free_positions)
-            needed = {
-                (r, c)
-                for r in range(frs, fre + 1)
-                for c in range(fcs, fce + 1)
-            }
-            if needed.issubset(set(free_positions)):
-                nc = dict(cell)
-                nc["row_start"], nc["row_end"] = frs, fre
-                nc["col_start"], nc["col_end"] = fcs, fce
-                nc["row_span"] = fre - frs + 1
-                nc["col_span"] = fce - fcs + 1
-                out.append(nc)
-                for r, c in needed:
-                    occupancy[(r, c)] = nc
-        # else: 完全被覆盖的空格，丢弃
+        _try_place_rect_remainder(
+            cell, free_positions, occupancy, out, clear_text=False
+        )
 
     return out
 

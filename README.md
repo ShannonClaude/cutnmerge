@@ -16,7 +16,7 @@
 
 | 文件 | 职责 |
 |------|------|
-| `main.py` | CLI 入口：参数解析、扫描 `data/input/`、批量调用 pipeline、按 `--format` 写结果 |
+| `main.py` | CLI 入口：参数解析、扫描 `data/input/`、批量调用 pipeline、按 `--format` 写结果；批量运行存档（失败项/新文件才重跑） |
 | `src/core/pipeline.py` | 主流程编排：方向归正 → 去偏斜 → 结构识别 → OCR → 网格证据校验 → IoA 填格 → 输出 |
 | `src/core/config.py` | 从项目根目录加载 `.env`（AI Studio Token、模型名、超时、上传预处理/检测参数、REOCR/TSR_AGGRESSIVE 开关） |
 | `src/core/models.py` | 模型加载与推断：ModelScope LORE（`--structure lore`）+ `predict_texts` 云端 OCR 封装 |
@@ -131,6 +131,10 @@ cp .env.example .env
 # 批量：扫描 data/input/，写出 data/output/<同名>.html + .md + 两张彩图
 python main.py
 
+# 增量：已成功的跳过，只处理上次失败项与新放入 input 的图片
+# 失败清单见 data/run_archive.json；全部重跑用 --force-all
+python main.py --force-all
+
 # 单图
 python main.py --image data/input/demo.png
 python main.py --image data/input/demo.png --output data/output/demo.html
@@ -171,6 +175,7 @@ python main.py --refresh-cache               # 强制重拉 OCR 并覆盖缓存
 python main.py --keep-empty-cols             # 保留整列为空的列（默认压缩删除）
 python main.py --debug                       # 网格叠加图写到 data/debug/
 python main.py --no-vis                      # 关闭表格划线可视化（默认写 *_table_vis.png / *_table_vis_logic.png）
+python main.py --force-all                   # 忽略存档，批量全部重跑（默认只跑失败项与新文件）
 ```
 
 回归统计：
@@ -197,12 +202,14 @@ cutnmerge/
 │   ├── output/          # HTML / Markdown 结果
 │   ├── cache/           # OCR 本地缓存（gitignore）
 │   ├── ocr/             # OCR 产物：json/csv/标注图（gitignore）
-│   └── debug/           # --debug 叠加图（gitignore）
+│   ├── debug/           # --debug 叠加图（gitignore）
+│   └── run_archive.json # 批量运行存档：成功/失败清单（gitignore）
 └── src/
     ├── core/            # 编排、配置、模型加载
     │   ├── pipeline.py
     │   ├── config.py
-    │   └── models.py
+    │   ├── models.py
+    │   └── run_archive.py  # 批量成功/失败存档，供下次增量重跑
     ├── preprocess/      # 方向归正
     │   └── orient.py
     ├── structure/       # 表格拓扑
@@ -289,7 +296,7 @@ print(out["html"])
 
 | File | Responsibility |
 |------|----------------|
-| `main.py` | CLI entry: argument parsing, batch scan of `data/input/`, calls pipeline, writes results per `--format` |
+| `main.py` | CLI entry: argument parsing, batch scan of `data/input/`, calls pipeline, writes results per `--format`; run archive (retries failures and new files only) |
 | `src/core/pipeline.py` | Orchestrates the full flow: orientation → deskew → structure → OCR → grid evidence check → IoA matching → output |
 | `src/core/config.py` | Loads `.env` from the project root (token, model names, timeouts, upload-preprocess / detection params, REOCR/TSR_AGGRESSIVE flags) |
 | `src/core/models.py` | Model loading & inference: ModelScope LORE (`--structure lore`) + `predict_texts` cloud OCR wrapper |
@@ -404,6 +411,10 @@ Put table images into `data/input/` (png / jpg / jpeg / bmp / tif / tiff / webp)
 # Batch: scan data/input/, write data/output/<same-name>.html + .md + two colored visualizations
 python main.py
 
+# Incremental: skip successes; only retry previous failures and new files in input
+# Failure list: data/run_archive.json; reprocess everything with --force-all
+python main.py --force-all
+
 # Single image
 python main.py --image data/input/demo.png
 python main.py --image data/input/demo.png --output data/output/demo.html
@@ -444,6 +455,7 @@ python main.py --refresh-cache               # force re-OCR and overwrite cache
 python main.py --keep-empty-cols             # keep fully-empty columns (dropped by default)
 python main.py --debug                       # write grid overlay images to data/debug/
 python main.py --no-vis                      # disable table-line visualization (default writes *_table_vis.png / *_table_vis_logic.png)
+python main.py --force-all                   # ignore archive, reprocess all (default: failures + new files only)
 ```
 
 Regression stats:
@@ -470,12 +482,14 @@ cutnmerge/
 │   ├── output/          # HTML / Markdown results
 │   ├── cache/           # local OCR cache (gitignored)
 │   ├── ocr/             # OCR artifacts: json/csv/annotated images (gitignored)
-│   └── debug/           # --debug overlay images (gitignored)
+│   ├── debug/           # --debug overlay images (gitignored)
+│   └── run_archive.json # batch run archive: success/failure list (gitignored)
 └── src/
     ├── core/            # orchestration, config, model loading
     │   ├── pipeline.py
     │   ├── config.py
-    │   └── models.py
+    │   ├── models.py
+    │   └── run_archive.py  # success/failure archive for incremental reruns
     ├── preprocess/      # orientation
     │   └── orient.py
     ├── structure/       # table topology
