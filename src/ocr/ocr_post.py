@@ -56,6 +56,9 @@ def normalize_ocr_text(text: str) -> str:
     grade = split_value_grade(t)
     if grade is not None:
         return f"{grade[0]}\n{grade[1]}"
+    # jER 系列常见丢首字母 j（如 ER828 / 化合物ER828）
+    if re.search(r"(?<![jJ])ER828", t):
+        t = re.sub(r"(?<![jJ])ER828", "jER828", t)
     return t
 
 

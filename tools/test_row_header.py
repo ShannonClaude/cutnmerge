@@ -1,0 +1,576 @@
+"""左侧大行头：顶表头带截止 + 父格过宽 colspan 裁剪。
+
+用法:
+    python tools/test_row_header.py
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src.matching.matching import (  # noqa: E402
+    _parse_sticky_column_parts,
+    _split_sticky_column_header,
+)
+from src.output.html_formatter import (  # noqa: E402
+    _merge_header_empty_below,
+    _merge_leading_empty_into_label,
+    _repair_lone_example_number_headers,
+    _resolve_logic_overlaps,
+    cells_to_html_table,
+)
+from src.structure.row_header import (  # noqa: E402
+    clip_narrow_label_colspans,
+    clip_row_header_child_overlaps,
+    peel_row_header_text,
+    relocate_misplaced_category_labels,
+)
+from src.structure.tsr_refine import (  # noqa: E402
+    dedupe_overlapping_cells,
+    refine_tsr_cells_light,
+)
+
+
+def _cell(rs, re_, cs, ce, text, x1, x2, y1=0.0, y2=30.0):
+    return {
+        "row_start": rs,
+        "row_end": re_,
+        "col_start": cs,
+        "col_end": ce,
+        "row_span": re_ - rs + 1,
+        "col_span": ce - cs + 1,
+        "text": text,
+        "polygon": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+    }
+
+
+def _p25x193_like_cells():
+    """比较例表：左侧 (A)成分 rowspan=2，比较例1 下方数据格为空。"""
+    return [
+        _cell(0, 1, 0, 1, "", 0, 160, 0, 60),
+        _cell(0, 0, 2, 5, "感光性树脂组合物(重量份)", 160, 480, 0, 30),
+        _cell(1, 1, 2, 2, "比较例 1", 160, 240, 30, 60),
+        _cell(1, 1, 3, 3, "比较例 2", 240, 320, 30, 60),
+        _cell(1, 1, 4, 4, "比较例 3", 320, 400, 30, 60),
+        _cell(1, 1, 5, 5, "比较例4", 400, 480, 30, 60),
+        _cell(2, 3, 0, 0, "(A)成分", 0, 80, 60, 120),
+        _cell(2, 2, 1, 1, "合成例1的聚酰亚胺", 80, 160, 60, 90),
+        _cell(2, 2, 3, 3, "100", 240, 320, 60, 90),
+        _cell(2, 2, 4, 4, "100", 320, 400, 60, 90),
+        _cell(3, 3, 1, 1, "合成例2的聚酰亚胺", 80, 160, 90, 120),
+        _cell(3, 3, 5, 5, "100", 400, 480, 90, 120),
+        _cell(4, 5, 0, 0, "(B)成分", 0, 80, 120, 180),
+        _cell(4, 4, 1, 1, "jER-630", 80, 160, 120, 150),
+        _cell(5, 5, 1, 1, "jER-604", 80, 160, 150, 180),
+    ]
+
+
+def _nested_row_header_cells():
+    """表1 形态：外层组成 colspan 过宽，盖住酸酐 / 品名。"""
+    names = [
+        "jER828",
+        "OXT-191",
+        "EP4003S",
+        "jER152",
+        "jER630",
+        "NC3000",
+        "EPICLON850",
+    ]
+    cells = [
+        _cell(0, 1, 0, 2, "项目", 0, 240, 0, 40),
+        _cell(0, 1, 3, 3, "实施例 1", 240, 320, 0, 40),
+        _cell(2, 10, 0, 1, "聚酰亚胺组成 (摩尔比)", 0, 80, 40, 220),
+        _cell(2, 3, 1, 1, "酸酐", 80, 160, 40, 80),
+        _cell(2, 2, 2, 2, "ODPA", 160, 240, 40, 60),
+        _cell(3, 3, 2, 2, "BPDA", 160, 240, 60, 80),
+        _cell(14, 20, 1, 3, "化合物(b)", 80, 160, 280, 420),
+    ]
+    for i, name in enumerate(names):
+        y1 = 280.0 + i * 20.0
+        cells.append(_cell(14 + i, 14 + i, 2, 2, name, 160, 280, y1, y1 + 20))
+    return cells
+
+
+def _p100_fensan_split_cells():
+    """顶表头带内：单列「分散液」被切成两层，粒径 rowspan 把表头带扩到 row 2。"""
+    return [
+        _cell(1, 1, 1, 1, "分散液", 118, 200, 35, 53),
+        _cell(2, 2, 1, 1, "", 118, 200, 53, 99),
+        _cell(1, 2, 2, 2, "颜料分散液中的颜料的数均粒径 [nm]", 200, 320, 35, 99),
+        _cell(3, 3, 0, 0, "制备例1", 0, 118, 99, 130),
+    ]
+
+
+def test_body_left_stub_does_not_merge_column_headers():
+    html = cells_to_html_table(_p25x193_like_cells())
+    assert re.search(r'rowspan="2"[^>]*>\(A\)成分', html), html
+    assert re.search(r'rowspan="2"[^>]*>\(B\)成分', html), html
+    assert not re.search(r'rowspan="2"[^>]*>比较例 1', html), html
+    assert not re.search(r'rowspan="2"[^>]*>比较例4', html), html
+    assert not re.search(r'rowspan="2"[^>]*>100', html), html
+    assert "<td>比较例 1</td>" in html or re.search(
+        r"<td>比较例 1</td>", html
+    )
+
+
+def test_p100_fensan_still_merges_in_header_band():
+    merged = _merge_header_empty_below(_p100_fensan_split_cells())
+    fensan = next(
+        c for c in merged if str(c.get("text") or "") == "分散液"
+    )
+    assert int(fensan["row_start"]) == 1
+    assert int(fensan["row_end"]) == 2, fensan
+    html = cells_to_html_table(_p100_fensan_split_cells())
+    assert re.search(r'rowspan="2"[^>]*>分散液', html), html
+
+
+def test_clip_nested_row_header_parent_colspan():
+    cells = _nested_row_header_cells()
+    out = clip_row_header_child_overlaps([dict(c) for c in cells])
+    parent = next(c for c in out if "聚酰亚胺组成" in str(c.get("text") or ""))
+    assert int(parent["col_start"]) == 0
+    assert int(parent["col_end"]) == 0, parent
+    suan = next(c for c in out if str(c.get("text") or "") == "酸酐")
+    assert (int(suan["row_start"]), int(suan["row_end"])) == (2, 3)
+    b_cell = next(c for c in out if "化合物" in str(c.get("text") or ""))
+    assert int(b_cell["col_end"]) == 1, b_cell
+    names = {str(c.get("text") or "") for c in out}
+    assert "jER828" in names and "EPICLON850" in names
+
+
+def test_html_keeps_nested_labels_separate():
+    cells = clip_row_header_child_overlaps(_nested_row_header_cells())
+    html = cells_to_html_table(cells)
+    assert "聚酰亚胺组成" in html
+    assert "酸酐" in html
+    assert "ODPA" in html
+    assert "化合物(b)" in html
+    assert "jER828" in html
+    assert "OXT-191" in html
+    blob = re.search(
+        r'rowspan="7"[^>]*>[^<]*化合物[^<]*jER828',
+        html,
+    )
+    assert blob is None, html
+    assert re.search(r'rowspan="9"[^>]*>聚酰亚胺组成', html), html
+    assert re.search(r'rowspan="2"[^>]*>酸酐', html), html
+
+
+def test_resolve_does_not_swallow_right_child_text():
+    parent = _cell(14, 20, 1, 3, "化合物(b)", 80, 160, 280, 420)
+    child = _cell(14, 14, 2, 2, "jER828", 160, 280, 280, 300)
+    out = _resolve_logic_overlaps([parent, child])
+    texts = {str(c.get("text") or "") for c in out}
+    assert "化合物(b)" in texts
+    assert "jER828" in texts
+    assert not any("化合物(b)" in str(c.get("text")) and "jER828" in str(c.get("text")) for c in out)
+
+
+def test_light_refine_clips_before_dedupe():
+    cells = _nested_row_header_cells()
+    out = refine_tsr_cells_light([dict(c) for c in cells])
+    texts = {str(c.get("text") or "") for c in out}
+    assert "酸酐" in texts
+    assert "jER828" in texts
+    parent = next(c for c in out if "聚酰亚胺组成" in str(c.get("text") or ""))
+    assert int(parent["col_end"]) == 0, parent
+
+
+def test_clip_same_col_start_name_cell():
+    """品名格与 (b) 分类格同一 col_start、物理上在右 → 父格单列、子格右移。"""
+    parent = _cell(14, 20, 1, 2, "化合物(b)", 80, 160, 280, 420)
+    child = _cell(14, 14, 1, 1, "jER828", 160, 280, 280, 300)
+    out = clip_row_header_child_overlaps([parent, child])
+    b_cell = next(c for c in out if "化合物" in str(c.get("text") or ""))
+    name = next(c for c in out if str(c.get("text") or "") == "jER828")
+    assert int(b_cell["col_start"]) == 1
+    assert int(b_cell["col_end"]) == 1, b_cell
+    assert int(name["col_start"]) == 2, name
+    html = cells_to_html_table(out)
+    assert "化合物(b)" in html
+    assert "jER828" in html
+    assert not re.search(r"化合物\(b\)[^<]*jER828|jER828[^<]*化合物", html), html
+
+
+def test_p100_ghost_not_clipped_by_row_header():
+    """分散液右上角碎片不得把父格 colspan 裁窄。"""
+    large = _cell(1, 2, 1, 3, "分散液", 118, 260, 35, 99)
+    ghost = _cell(1, 1, 3, 3, "", 236, 260, 35, 53)
+    out = clip_row_header_child_overlaps([large, ghost])
+    kept = next(c for c in out if str(c.get("text") or "") == "分散液")
+    assert (int(kept["col_start"]), int(kept["col_end"])) == (1, 3)
+    # 去重叠仍应丢掉幽灵格
+    deduped = dedupe_overlapping_cells(out)
+    assert any(str(c.get("text") or "") == "分散液" for c in deduped)
+
+
+def _p24x176_peel_cells():
+    """酸酐空兄弟 + 父格误含「…酸酐…」。"""
+    parent = _cell(2, 10, 0, 0, "聚酰亚胺酸酐组成(摩尔比)", 0, 80, 40, 220)
+    sibling = _cell(2, 3, 1, 1, "", 80, 160, 40, 80)
+    return [parent, sibling]
+
+
+def test_peel_sublabel_from_parent():
+    cells = _p24x176_peel_cells()
+    cells[0]["text"] = "聚酰亚胺组成(摩尔比)酸酐"
+    out = peel_row_header_text(cells)
+    suan = next(c for c in out if str(c.get("text") or "") == "酸酐")
+    parent = next(c for c in out if "聚酰亚胺" in str(c.get("text") or ""))
+    assert "酸酐" not in str(parent.get("text") or "")
+    assert int(suan["col_start"]) == 1
+
+
+def test_clip_narrow_odpa_colspan():
+    """ODPA 物理窄、逻辑 colspan=2 → 收到单列。"""
+    odpa = _cell(2, 2, 2, 3, "ODPA", 160, 200, 40, 60)
+    # 造若干正常宽列供中位宽
+    peers = [
+        _cell(2, 2, 4, 4, "100", 320, 400, 40, 60),
+        _cell(2, 2, 5, 5, "100", 400, 480, 40, 60),
+        _cell(2, 2, 6, 6, "100", 480, 560, 40, 60),
+    ]
+    out = clip_narrow_label_colspans([odpa, *peers])
+    clipped = next(c for c in out if str(c.get("text") or "") == "ODPA")
+    assert int(clipped["col_end"]) == int(clipped["col_start"]) == 2
+
+
+def test_peel_jer828_from_compound_parent():
+    parent = _cell(14, 20, 1, 1, "化合物jER828(b)", 80, 160, 280, 420)
+    sibling = _cell(14, 14, 2, 2, "", 160, 280, 280, 300)
+    out = peel_row_header_text([parent, sibling])
+    name = next(c for c in out if str(c.get("text") or "") == "jER828")
+    bcell = next(c for c in out if "化合物" in str(c.get("text") or ""))
+    assert "jER828" not in str(bcell.get("text") or "")
+    assert int(name["col_start"]) == 2
+
+
+def test_sticky_column_header_parse():
+    parts = _parse_sticky_column_parts("实施例8实施例9实施例10")
+    assert parts == ["实施例 8", "实施例 9", "实施例 10"]
+    parts2 = _parse_sticky_column_parts("8实施例9实施例10")
+    assert parts2 == ["实施例 8", "实施例 9", "实施例 10"]
+
+
+def test_sticky_column_header_split_geom():
+    tb = {
+        "text": "实施例8实施例9",
+        "polygon": [[240, 0], [400, 0], [400, 30], [240, 30]],
+        "top_left": (240, 0),
+    }
+    cells = [
+        _cell(0, 0, 4, 4, "", 240, 320, 0, 30),
+        _cell(0, 0, 5, 5, "", 320, 400, 0, 30),
+    ]
+    pieces = _split_sticky_column_header(tb, cells)
+    assert pieces is not None
+    assert len(pieces) == 2
+    assert "8" in pieces[0]["text"]
+    assert "9" in pieces[1]["text"]
+
+
+def test_merge_leading_empty_into_label():
+    cells = [
+        _cell(20, 20, 0, 0, "", 0, 80, 400, 430),
+        _cell(20, 20, 1, 3, "酰亚胺化率", 80, 240, 400, 430),
+        _cell(20, 20, 4, 4, "100", 240, 320, 400, 430),
+    ]
+    out = _merge_leading_empty_into_label([dict(c) for c in cells])
+    label = next(c for c in out if "酰亚胺化率" in str(c.get("text") or ""))
+    assert int(label["col_start"]) == 0
+    assert int(label["col_end"]) == 3
+    html = cells_to_html_table(out)
+    assert not re.search(r"<tr>\s*<td></td>\s*<td[^>]*>酰亚胺化率", html), html
+
+
+def test_merge_resolution_unit():
+    cells = [
+        _cell(30, 30, 0, 2, "分辨率", 0, 160, 500, 530),
+        _cell(30, 30, 3, 3, "(μm)", 160, 200, 500, 530),
+    ]
+    out = _merge_leading_empty_into_label([dict(c) for c in cells])
+    merged = next(c for c in out if "分辨率" in str(c.get("text") or ""))
+    assert "(μm)" in str(merged.get("text") or "")
+    assert int(merged["col_end"]) == 3
+
+
+def _p25x192_body_cells():
+    """标签右侧为空、其他行同列有数字：不得 colspan 吞空格。"""
+    cells = [
+        _cell(0, 1, 0, 1, "", 0, 160, 0, 40),
+        _cell(0, 0, 2, 8, "感光性树脂组合物(重量份)", 160, 720, 0, 20),
+        _cell(1, 1, 2, 2, "实施例 1", 160, 240, 20, 40),
+        _cell(1, 1, 3, 3, "实施例 2", 240, 320, 20, 40),
+        _cell(1, 1, 4, 4, "实施例 3", 320, 400, 20, 40),
+        _cell(1, 1, 5, 5, "实施例 4", 400, 480, 20, 40),
+        _cell(1, 1, 6, 6, "实施例 5", 480, 560, 20, 40),
+        _cell(1, 1, 7, 7, "实施例 6", 560, 640, 20, 40),
+        _cell(1, 1, 8, 8, "实施例 7", 640, 720, 20, 40),
+        _cell(2, 2, 0, 0, "(A)成分", 0, 80, 40, 60),
+        _cell(2, 2, 1, 1, "合成例 1 的聚酰亚胺", 80, 160, 40, 60),
+        _cell(2, 2, 2, 2, "100", 160, 240, 40, 60),
+        _cell(2, 2, 3, 3, "100", 240, 320, 40, 60),
+        _cell(2, 2, 4, 4, "100", 320, 400, 40, 60),
+        _cell(2, 2, 5, 5, "100", 400, 480, 40, 60),
+        _cell(2, 2, 6, 6, "100", 480, 560, 40, 60),
+        _cell(2, 2, 7, 7, "100", 560, 640, 40, 60),
+        _cell(2, 2, 8, 8, "100", 640, 720, 40, 60),
+        _cell(4, 5, 0, 0, "(B)成分", 0, 80, 80, 120),
+        _cell(4, 4, 1, 1, "jER-630", 80, 160, 80, 100),
+        _cell(4, 4, 2, 2, "60", 160, 240, 80, 100),
+        _cell(4, 4, 3, 3, "", 240, 320, 80, 100),
+        _cell(4, 4, 4, 4, "30", 320, 400, 80, 100),
+        _cell(5, 5, 1, 1, "jER-604", 80, 160, 100, 120),
+        _cell(5, 5, 2, 2, "", 160, 240, 100, 120),
+        _cell(5, 5, 3, 3, "60", 240, 320, 100, 120),
+        _cell(5, 5, 4, 4, "", 320, 400, 100, 120),
+        _cell(8, 9, 0, 0, "(E)成分", 0, 80, 160, 200),
+        _cell(8, 8, 1, 1, "850S", 80, 160, 160, 180),
+        _cell(8, 8, 2, 2, "", 160, 240, 160, 180),
+        _cell(8, 8, 3, 3, "", 240, 320, 160, 180),
+        _cell(8, 8, 4, 4, "30", 320, 400, 160, 180),
+        _cell(9, 9, 1, 7, "EP4003S", 80, 640, 180, 200),
+        _cell(9, 9, 8, 8, "30", 640, 720, 180, 200),
+    ]
+    return cells
+
+
+def test_p25x192_label_does_not_swallow_empty_data_cols():
+    html = cells_to_html_table(_p25x192_body_cells())
+    assert not re.search(r'colspan="\d+"[^>]*>jER-604', html), html
+    assert "<td>jER-604</td>" in html
+    assert not re.search(r'colspan="\d+"[^>]*>850S', html), html
+    assert "<td>850S</td>" in html
+    assert not re.search(r'colspan="[3-9]"[^>]*>EP4003S', html), html
+    assert "EP4003S" in html
+    # 右侧空格应留下独立 td，而不是被标签盖住
+    assert re.search(r"<td>jER-604</td>\s*<td></td>\s*<td>60</td>", html), html
+
+
+def test_p25x193_synthesis2_keeps_empty_cols():
+    cells = [
+        _cell(0, 1, 0, 1, "", 0, 160, 0, 40),
+        _cell(0, 0, 2, 5, "感光性树脂组合物(重量份)", 160, 480, 0, 20),
+        _cell(1, 1, 2, 2, "比较例 1", 160, 240, 20, 40),
+        _cell(1, 1, 3, 3, "比较例 2", 240, 320, 20, 40),
+        _cell(1, 1, 4, 4, "比较例 3", 320, 400, 20, 40),
+        _cell(1, 1, 5, 5, "比较例 4", 400, 480, 20, 40),
+        _cell(2, 3, 0, 0, "(A)成分", 0, 80, 40, 80),
+        _cell(2, 2, 1, 1, "合成例1的聚酰亚胺", 80, 160, 40, 60),
+        _cell(2, 2, 2, 2, "100", 160, 240, 40, 60),
+        _cell(2, 2, 3, 3, "100", 240, 320, 40, 60),
+        _cell(2, 2, 4, 4, "100", 320, 400, 40, 60),
+        _cell(2, 2, 5, 5, "", 400, 480, 40, 60),
+        _cell(3, 3, 1, 4, "合成例2的聚酰亚胺", 80, 400, 60, 80),
+        _cell(3, 3, 5, 5, "100", 400, 480, 60, 80),
+        _cell(5, 5, 1, 5, "jER-604", 80, 480, 100, 120),
+    ]
+    html = cells_to_html_table(cells)
+    assert "合成例2的聚酰亚胺" in html
+    assert not re.search(r'colspan="4"[^>]*>合成例2', html), html
+    assert not re.search(r'colspan="5"[^>]*>jER-604', html), html
+
+
+def test_p26x194_ghost_col0_dropped():
+    """TSR 在第 0 列留表头-only 幽灵列时，渲染前左移列号。"""
+    cells = [
+        _cell(0, 0, 0, 0, "", 0, 80, 0, 30),
+        _cell(0, 0, 1, 1, "", 80, 160, 0, 30),
+        _cell(0, 0, 2, 2, "低温热压接性", 160, 240, 0, 30),
+        _cell(0, 0, 3, 3, "分辨率", 240, 320, 0, 30),
+        _cell(1, 1, 1, 1, "实施例 1", 80, 160, 30, 60),
+        _cell(1, 1, 2, 2, "G", 160, 240, 30, 60),
+    ]
+    html = cells_to_html_table(cells)
+    assert re.search(r"<td></td>\s*<td>低温热压接性</td>", html), html
+    assert re.search(r"<td>实施例 1</td>\s*<td>G</td>", html), html
+
+
+def test_p26x194_header_corner_not_merged():
+    """表头左上角空格保留；低温热压接性不得 colspan 吞掉索引列。"""
+    cells = [
+        _cell(0, 0, 0, 0, "", 0, 80, 0, 30),
+        _cell(0, 0, 1, 1, "低温热压接性", 80, 160, 0, 30),
+        _cell(0, 0, 2, 2, "分辨率", 160, 240, 0, 30),
+        _cell(0, 0, 3, 3, "残膜率", 240, 320, 0, 30),
+        _cell(0, 0, 4, 4, "高温时粘合强度(Mpa)", 320, 480, 0, 30),
+        _cell(1, 1, 0, 0, "实施例 1", 0, 80, 30, 60),
+        _cell(1, 1, 1, 1, "G", 80, 160, 30, 60),
+        _cell(1, 1, 2, 2, "30/30", 160, 240, 30, 60),
+        _cell(1, 1, 3, 3, "88", 240, 320, 30, 60),
+        _cell(1, 1, 4, 4, "7", 320, 480, 30, 60),
+    ]
+    html = cells_to_html_table(cells)
+    assert not re.search(r'colspan="2"[^>]*>低温热压接性', html), html
+    assert re.search(r"<td></td>\s*<td>低温热压接性</td>", html), html
+
+
+def test_p26x194_tsr_colspan2_header_split():
+    """TSR 已输出 colspan=2 表头时，渲染阶段仍拆出索引列空角。"""
+    cells = [
+        _cell(0, 0, 0, 1, "低温热压接性", 0, 160, 0, 30),
+        _cell(0, 0, 2, 2, "分辨率", 160, 240, 0, 30),
+        _cell(0, 0, 3, 3, "残膜率", 240, 320, 0, 30),
+        _cell(0, 0, 4, 4, "高温时粘合强度(Mpa)", 320, 480, 0, 30),
+        _cell(1, 1, 0, 0, "实施例 1", 0, 80, 30, 60),
+        _cell(1, 1, 1, 1, "G", 80, 160, 30, 60),
+        _cell(1, 1, 2, 2, "30/30", 160, 240, 30, 60),
+        _cell(1, 1, 3, 3, "88", 240, 320, 30, 60),
+        _cell(1, 1, 4, 4, "7", 320, 480, 30, 60),
+    ]
+    html = cells_to_html_table(cells)
+    assert not re.search(r'colspan="2"[^>]*>低温热压接性', html), html
+    assert re.search(r"<td></td>\s*<td>低温热压接性</td>", html), html
+
+
+def test_p98_aligned_body_colspan_kept():
+    cells = [
+        _cell(0, 1, 0, 0, "", 0, 40, 0, 40),
+        _cell(0, 1, 1, 1, "聚合物", 40, 120, 0, 40),
+        _cell(0, 0, 2, 7, "单体[摩尔比]", 120, 520, 0, 20),
+        _cell(1, 1, 2, 5, "具有芳香族基团及环氧基的化合物", 120, 360, 20, 40),
+        _cell(1, 1, 6, 6, "二羧酸酐", 360, 440, 20, 40),
+        _cell(1, 1, 7, 7, "不饱和羧酸", 440, 520, 20, 40),
+        _cell(2, 2, 0, 0, "合成例 15", 0, 40, 40, 80),
+        _cell(2, 2, 1, 1, "酸改性环氧树脂溶液 (AE-1)", 40, 120, 40, 80),
+        _cell(2, 2, 2, 5, "NC-7000L (环氧基准摩尔比：100)", 120, 360, 40, 80),
+        _cell(2, 2, 6, 6, "THPHA (摩尔比: 80)", 360, 440, 40, 80),
+        _cell(2, 2, 7, 7, "MAA (摩尔比: 100)", 440, 520, 40, 80),
+    ]
+    html = cells_to_html_table(cells)
+    assert "NC-7000L" in html
+    assert "THPHA" in html
+    assert "MAA" in html
+
+
+def test_relocate_fengduanji_from_data_column():
+    """P24X176：封剂误入数据列时归位到空 rowspan 父格。"""
+    cells = [
+        _cell(2, 10, 0, 0, "聚酰亚胺组成", 0, 80, 40, 220),
+        _cell(2, 3, 1, 1, "酸酐", 80, 160, 40, 80),
+        _cell(4, 6, 1, 1, "二胺", 80, 160, 80, 140),
+        _cell(7, 10, 1, 1, "", 80, 160, 140, 200),
+        _cell(7, 7, 2, 3, "端MAP", 160, 280, 140, 160),
+        _cell(10, 10, 2, 3, "", 160, 280, 190, 200),
+        _cell(10, 10, 4, 4, "封剂", 280, 360, 190, 200),
+    ]
+    out = relocate_misplaced_category_labels([dict(c) for c in cells])
+    parent = next(c for c in out if int(c["row_start"]) == 7 and int(c["col_start"]) == 1)
+    wrong = next(c for c in out if int(c["row_start"]) == 10 and int(c["col_start"]) == 4)
+    assert str(parent.get("text") or "") == "封端剂"
+    assert not str(wrong.get("text") or "").strip()
+
+
+def test_sticky_column_header_split_wide_merged():
+    """P25X177：宽 colspan 顶栏粘连时按 OCR 框均分。"""
+    blob = "实施例11实施例12比较例1参考例1"
+    tb = {
+        "text": blob,
+        "polygon": [[400, 0], [800, 0], [800, 30], [400, 30]],
+        "top_left": (400, 0),
+    }
+    cells = [
+        _cell(0, 1, 8, 12, blob, 400, 800, 0, 30),
+    ]
+    pieces = _split_sticky_column_header(tb, cells)
+    assert pieces is not None
+    assert len(pieces) == 4
+    texts = [p["text"] for p in pieces]
+    assert "11" in texts[0]
+    assert "比较例" in texts[2]
+
+
+def test_sticky_mixed_example_compare_ref_parse():
+    parts = _parse_sticky_column_parts(
+        "实施例11实施例12实施例13比较例1比较例2参考例1"
+    )
+    assert parts is not None
+    assert len(parts) >= 5
+    assert any("比较例" in p for p in parts)
+    assert any("参考例" in p for p in parts)
+
+
+def test_repair_lone_example_number_header():
+    cells = [
+        _cell(0, 0, 4, 4, "实施例 8", 320, 400, 0, 30),
+        _cell(0, 0, 5, 5, "实施例 9", 400, 480, 0, 30),
+        _cell(0, 0, 6, 6, "10", 480, 560, 0, 30),
+    ]
+    out = _repair_lone_example_number_headers([dict(c) for c in cells])
+    last = next(c for c in out if int(c["col_start"]) == 6)
+    assert str(last.get("text") or "") == "实施例 10"
+    html = cells_to_html_table(out)
+    assert "实施例 10" in html
+
+
+def test_sticky_strip_bare_example_prefix():
+    parts = _parse_sticky_column_parts(
+        "实施例实施例实施例比较例1比较例2参考例1"
+    )
+    assert parts is not None
+    assert len(parts) >= 3
+    assert any("比较例" in p for p in parts)
+
+
+def test_explode_sticky_header_wide_cell():
+    from src.matching.matching import explode_sticky_header_wide_cells
+
+    cells = [
+        _cell(
+            0,
+            1,
+            8,
+            12,
+            "实施例实施例比较例1比较例2参考例1",
+            400,
+            800,
+            0,
+            30,
+        ),
+    ]
+    out = explode_sticky_header_wide_cells([dict(c) for c in cells])
+    assert len(out) == 3
+    texts = {str(c.get("text") or "") for c in out}
+    assert any("比较例" in t for t in texts)
+    assert all(int(c["col_span"]) == 1 for c in out)
+
+
+def main() -> int:
+    test_body_left_stub_does_not_merge_column_headers()
+    test_p100_fensan_still_merges_in_header_band()
+    test_clip_nested_row_header_parent_colspan()
+    test_html_keeps_nested_labels_separate()
+    test_resolve_does_not_swallow_right_child_text()
+    test_light_refine_clips_before_dedupe()
+    test_clip_same_col_start_name_cell()
+    test_p100_ghost_not_clipped_by_row_header()
+    test_peel_sublabel_from_parent()
+    test_clip_narrow_odpa_colspan()
+    test_peel_jer828_from_compound_parent()
+    test_sticky_column_header_parse()
+    test_sticky_column_header_split_geom()
+    test_merge_leading_empty_into_label()
+    test_merge_resolution_unit()
+    test_p25x192_label_does_not_swallow_empty_data_cols()
+    test_p25x193_synthesis2_keeps_empty_cols()
+    test_p26x194_ghost_col0_dropped()
+    test_p26x194_header_corner_not_merged()
+    test_p26x194_tsr_colspan2_header_split()
+    test_p98_aligned_body_colspan_kept()
+    test_relocate_fengduanji_from_data_column()
+    test_sticky_column_header_split_wide_merged()
+    test_sticky_mixed_example_compare_ref_parse()
+    test_repair_lone_example_number_header()
+    test_sticky_strip_bare_example_prefix()
+    test_explode_sticky_header_wide_cell()
+    print("OK: row header tests passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

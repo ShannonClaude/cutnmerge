@@ -9,7 +9,7 @@ from __future__ import annotations
 import html
 import logging
 import re
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -18,12 +18,17 @@ from .formatter import (
     format_free_texts,
     split_cells_into_subtables,
 )
+from ..structure.row_header import is_physically_right_child
 from ..utils.label_patterns import is_index_column
 
 logger = logging.getLogger(__name__)
 
 # 噪声行：整行仅剩孤立字母/符号（如末行 "L"）
 _NOISE_CELL_RE = re.compile(r"^[A-Za-z]$|^[·•\.\,;:]$")
+# 身列数据值：纯数字、比率、缺测横线。不含 jER-604 / 实施例1 / 4,4'-DAE。
+_DATA_VALUE_RE = re.compile(
+    r"^(?:[-–—−~～]|[-–—−]?\d+(?:\.\d+)?(?:\s*[\/／]\s*\d+(?:\.\d+)?)?)$"
+)
 
 
 def _cell_key(cell: Dict[str, Any]) -> Tuple[int, int, int, int]:
@@ -179,6 +184,92 @@ def _try_place_rect_remainder(
         occupancy[(r, c)] = nc
 
 
+def _place_cell_rect(
+    cell: Dict[str, Any],
+    occupancy: Dict[Tuple[int, int], Dict[str, Any]],
+    out: List[Dict[str, Any]],
+) -> None:
+    nc = dict(cell)
+    out.append(nc)
+    rs, re = int(nc["row_start"]), int(nc["row_end"])
+    cs, ce = int(nc["col_start"]), int(nc["col_end"])
+    for r in range(rs, re + 1):
+        for c in range(cs, ce + 1):
+            occupancy[(r, c)] = nc
+
+
+def _clip_row_header_logic_overlap(
+    cell: Dict[str, Any],
+    unique_owners: List[Dict[str, Any]],
+    occupancy: Dict[Tuple[int, int], Dict[str, Any]],
+    out: List[Dict[str, Any]],
+    rs: int,
+    re: int,
+    cs: int,
+    ce: int,
+) -> bool:
+    """左右相邻的行头父子格：裁过宽父格的 col_end，而不是合并文本。
+
+    成功把 incoming 放到无冲突矩形时返回 True。
+    """
+    if not unique_owners:
+        return False
+
+    right_owners = [
+        o for o in unique_owners if is_physically_right_child(cell, o)
+    ]
+    if right_owners:
+        clip_at = min(int(o["col_start"]) for o in right_owners) - 1
+        new_end = max(cs, min(ce, clip_at))
+        if new_end < ce:
+            cell["col_end"] = new_end
+            cell["col_span"] = new_end - cs + 1
+            ce = new_end
+            still = False
+            for r in range(rs, re + 1):
+                for c in range(cs, ce + 1):
+                    owner = occupancy.get((r, c))
+                    if owner is not None and owner is not cell:
+                        still = True
+                        break
+                if still:
+                    break
+            if not still:
+                _place_cell_rect(cell, occupancy, out)
+                return True
+
+    left_parents = [
+        o for o in unique_owners if is_physically_right_child(o, cell)
+    ]
+    if left_parents:
+        for parent in left_parents:
+            clip_at = int(cell["col_start"]) - 1
+            pcs = int(parent["col_start"])
+            old_ce = int(parent["col_end"])
+            if clip_at < pcs or old_ce <= clip_at:
+                continue
+            for r in range(int(parent["row_start"]), int(parent["row_end"]) + 1):
+                for c in range(clip_at + 1, old_ce + 1):
+                    if occupancy.get((r, c)) is parent:
+                        del occupancy[(r, c)]
+            parent["col_end"] = clip_at
+            parent["col_span"] = clip_at - pcs + 1
+        still = False
+        for r in range(rs, re + 1):
+            for c in range(int(cell["col_start"]), int(cell["col_end"]) + 1):
+                owner = occupancy.get((r, c))
+                if owner is not None and owner is not cell:
+                    still = True
+                    break
+            if still:
+                break
+        if not still:
+            _place_cell_rect(cell, occupancy, out)
+            return True
+
+    return False
+
+
 def _resolve_logic_overlaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     渲染前消解逻辑矩形重叠：后到的非空文本并入占位格，并裁掉冲突覆盖。
@@ -251,7 +342,42 @@ def _resolve_logic_overlaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                             occupancy[(r, c)] = nc
                     continue
 
+        # 左行头父格盖住右侧子格：裁父格列，而不是把子标签拼进父格。
+        placed = _clip_row_header_logic_overlap(
+            cell, unique_owners, occupancy, out, rs, re, cs, ce
+        )
+        if placed:
+            continue
+        rs, re = int(cell["row_start"]), int(cell["row_end"])
+        cs, ce = int(cell["col_start"]), int(cell["col_end"])
+        conflict_owners = []
+        free_positions = []
+        for r in range(rs, re + 1):
+            for c in range(cs, ce + 1):
+                owner = occupancy.get((r, c))
+                if owner is None:
+                    free_positions.append((r, c))
+                elif owner is not cell:
+                    conflict_owners.append(owner)
+        if not conflict_owners:
+            nc = dict(cell)
+            out.append(nc)
+            for r in range(rs, re + 1):
+                for c in range(cs, ce + 1):
+                    occupancy[(r, c)] = nc
+            continue
+        unique_owners = _unique_cell_refs(conflict_owners)
+
         if text:
+            phys_row_header = any(
+                is_physically_right_child(cell, o) or is_physically_right_child(o, cell)
+                for o in unique_owners
+            )
+            if phys_row_header:
+                _try_place_rect_remainder(
+                    cell, free_positions, occupancy, out, clear_text=False
+                )
+                continue
             owner = conflict_owners[0]
             prev = str(owner.get("text") or "").strip()
             if text and text not in prev:
@@ -275,8 +401,336 @@ def _resolve_logic_overlaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return out
 
 
+def _looks_like_data_value(text: str) -> bool:
+    t = "".join((text or "").split())
+    return bool(t) and bool(_DATA_VALUE_RE.fullmatch(t))
+
+
+def _column_has_data_values(
+    cells: Sequence[Dict[str, Any]],
+    col: int,
+    *,
+    skip_rows: Optional[Set[int]] = None,
+) -> bool:
+    """其他行在该列是否有原子数据格（数字 / 缺测横线）。"""
+    skip = skip_rows or set()
+    for cell in cells:
+        rs, re = int(cell["row_start"]), int(cell["row_end"])
+        if skip and not skip.isdisjoint(range(rs, re + 1)):
+            continue
+        cs, ce = int(cell["col_start"]), int(cell["col_end"])
+        if cs != ce or cs != col:
+            continue
+        if _looks_like_data_value(str(cell.get("text") or "")):
+            return True
+    return False
+
+
+def _header_colspan_spans(cells: Sequence[Dict[str, Any]]) -> Set[Tuple[int, int]]:
+    header_end = _effective_header_end(cells)
+    spans: Set[Tuple[int, int]] = set()
+    if header_end < 0:
+        return spans
+    for cell in cells:
+        if int(cell["row_end"]) > header_end:
+            continue
+        cs, ce = int(cell["col_start"]), int(cell["col_end"])
+        if ce > cs:
+            spans.add((cs, ce))
+    return spans
+
+
+def _empty_atomic_from_bbox(
+    src: Dict[str, Any],
+    col: int,
+    orig_cs: int,
+    orig_ce: int,
+    bbox: Tuple[float, float, float, float],
+) -> Dict[str, Any]:
+    """按原宽格比例切出一列空占位，避免幽灵列清理把空数据列删掉。"""
+    x1, y1, x2, y2 = bbox
+    span = max(orig_ce - orig_cs + 1, 1)
+    w = (x2 - x1) / float(span)
+    off = col - orig_cs
+    nx1 = x1 + off * w
+    nx2 = x1 + (off + 1) * w
+    return {
+        "row_start": int(src["row_start"]),
+        "row_end": int(src["row_end"]),
+        "col_start": col,
+        "col_end": col,
+        "row_span": int(src["row_end"]) - int(src["row_start"]) + 1,
+        "col_span": 1,
+        "text": "",
+        "texts": [],
+        "polygon": [[nx1, y1], [nx2, y1], [nx2, y2], [nx1, y2]],
+    }
+
+
+def _split_label_over_data_columns(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    身行标签 colspan 盖住其他行已有数字的数据列时，收到左缘并补空格。
+
+    保留与表头同区间的真合并（P98 NC-7000L）；不拆表头带。
+    """
+    if len(cells) < 2:
+        return cells
+    header_end = _effective_header_end(cells)
+    aligned = _header_colspan_spans(cells)
+    extras: List[Dict[str, Any]] = []
+    changed = 0
+    for cell in cells:
+        rs, re = int(cell["row_start"]), int(cell["row_end"])
+        cs, ce = int(cell["col_start"]), int(cell["col_end"])
+        if re != rs or ce <= cs:
+            continue
+        if rs <= header_end:
+            continue
+        if (cs, ce) in aligned:
+            continue
+        if not str(cell.get("text") or "").strip():
+            continue
+        clip_end = cs
+        hit_data = False
+        for col in range(cs + 1, ce + 1):
+            if _column_has_data_values(cells, col, skip_rows={rs}):
+                hit_data = True
+                break
+            clip_end = col
+        if not hit_data or clip_end >= ce:
+            continue
+        orig_cs, orig_ce = cs, ce
+        bbox = _cell_physical_bbox_x_y(cell)
+        x1, y1, x2, y2 = bbox
+        span = max(orig_ce - orig_cs + 1, 1)
+        w = (x2 - x1) / float(span)
+        nx2 = x1 + (clip_end - orig_cs + 1) * w
+        cell["col_end"] = clip_end
+        cell["col_span"] = clip_end - cs + 1
+        cell["polygon"] = [[x1, y1], [nx2, y1], [nx2, y2], [x1, y2]]
+        for col in range(clip_end + 1, orig_ce + 1):
+            extras.append(_empty_atomic_from_bbox(cell, col, orig_cs, orig_ce, bbox))
+        changed += 1
+        logger.info(
+            "身列空格拆 colspan: text=%r col %s-%s → %s-%s",
+            str(cell.get("text") or "")[:24],
+            orig_cs,
+            orig_ce,
+            cs,
+            clip_end,
+        )
+    if changed:
+        logger.info("身列空格拆 colspan 完成: %d 格", changed)
+        cells.extend(extras)
+    return cells
+
+
+def _drop_leading_header_only_columns(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    去掉仅被表头空格占用、表体从未覆盖的第 0 列（P26X194 左上角幽灵列）。
+    """
+    if not cells:
+        return cells
+    header_end = _effective_header_end(cells)
+    max_col = max(int(c["col_end"]) for c in cells)
+    drop_leading = 0
+    for col in range(max_col + 1):
+        covers = [
+            c
+            for c in cells
+            if int(c["col_start"]) <= col <= int(c["col_end"])
+        ]
+        if not covers:
+            drop_leading = col + 1
+            continue
+        body_hits = [
+            c
+            for c in covers
+            if int(c["row_start"]) > header_end
+            and str(c.get("text") or "").strip()
+            and not _is_cell_frag(str(c.get("text") or ""))
+        ]
+        if body_hits:
+            break
+        header_only = all(int(c["row_end"]) <= header_end for c in covers)
+        if header_only and all(not str(c.get("text") or "").strip() for c in covers):
+            drop_leading = col + 1
+            continue
+        break
+    if drop_leading <= 0:
+        return cells
+    out: List[Dict[str, Any]] = []
+    for c in cells:
+        nc = dict(c)
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        if ce < drop_leading:
+            continue
+        nc["col_start"] = max(0, cs - drop_leading)
+        nc["col_end"] = ce - drop_leading
+        nc["col_span"] = int(nc["col_end"]) - int(nc["col_start"]) + 1
+        out.append(nc)
+    logger.info("去掉表头幽灵列: drop_leading=%d", drop_leading)
+    return out
+
+
+def _split_header_over_index_column(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """表头格跨第 0 列、而身列 0 为实施例索引时，拆成空角 + 独立标签列。"""
+    if not cells:
+        return cells
+    header_end = _effective_header_end(cells)
+    if header_end < 0:
+        return cells
+    if not _column_has_body_content(cells, 0, header_end):
+        return cells
+
+    extras: List[Dict[str, Any]] = []
+    changed = 0
+    for cell in cells:
+        rs, re = int(cell["row_start"]), int(cell["row_end"])
+        if rs > header_end:
+            continue
+        cs, ce = int(cell["col_start"]), int(cell["col_end"])
+        if cs > 0 or ce <= cs:
+            continue
+        if not str(cell.get("text") or "").strip():
+            continue
+        bbox = _cell_physical_bbox_x_y(cell)
+        x1, y1, x2, y2 = bbox
+        span = ce - cs + 1
+        w = (x2 - x1) / float(span)
+        label_col = ce
+        cell["col_start"] = label_col
+        cell["col_end"] = label_col
+        cell["col_span"] = 1
+        nx1 = x1 + (label_col - cs) * w
+        nx2 = nx1 + w
+        cell["polygon"] = [[nx1, y1], [nx2, y1], [nx2, y2], [nx1, y2]]
+        for col in range(cs, label_col):
+            ex = _empty_atomic_from_bbox(cell, col, cs, ce, bbox)
+            ex["row_start"] = rs
+            ex["row_end"] = re
+            ex["row_span"] = re - rs + 1
+            extras.append(ex)
+        changed += 1
+        logger.info(
+            "表头索引列角拆分: text=%r col %s-%s → %s",
+            str(cell.get("text") or "")[:24],
+            cs,
+            ce,
+            label_col,
+        )
+    if changed:
+        cells.extend(extras)
+    return cells
+
+
+def _column_has_body_content(
+    cells: Sequence[Dict[str, Any]],
+    col: int,
+    header_end: int,
+) -> bool:
+    """表头带以下该列是否有实质文本（如实施例索引列）。"""
+    for cell in cells:
+        if int(cell["row_start"]) <= header_end:
+            continue
+        cs, ce = int(cell["col_start"]), int(cell["col_end"])
+        if cs <= col <= ce:
+            t = str(cell.get("text") or "").strip()
+            if t and not _is_cell_frag(t):
+                return True
+    return False
+
+
+def _body_anchors_between(
+    cells: Sequence[Dict[str, Any]],
+    lo: int,
+    hi: int,
+    header_end: int,
+) -> bool:
+    """表体是否有格子的 col_start 落在 [lo, hi) 内。"""
+    for cell in cells:
+        if int(cell["row_start"]) <= header_end:
+            continue
+        cs = int(cell["col_start"])
+        if lo <= cs < hi and str(cell.get("text") or "").strip():
+            return True
+    return False
+
+
+def _merge_leading_empty_into_label(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """行首空列并入右侧中文标签格；同行「分辨率」+(μm) 合成单格。"""
+    if not cells:
+        return cells
+    header_end = _effective_header_end(cells)
+    _CJK_RE_LOCAL = re.compile(r"[\u4e00-\u9fff]")
+    by_row: Dict[int, List[Dict[str, Any]]] = {}
+    for cell in cells:
+        if int(cell["row_start"]) != int(cell["row_end"]):
+            continue
+        by_row.setdefault(int(cell["row_start"]), []).append(cell)
+
+    for row_cells in by_row.values():
+        row_cells.sort(key=lambda c: int(c["col_start"]))
+        if len(row_cells) < 2:
+            continue
+        label_idx: int | None = None
+        for i, cell in enumerate(row_cells):
+            t = str(cell.get("text") or "").strip()
+            if t and _CJK_RE_LOCAL.search(t):
+                label_idx = i
+                break
+        if label_idx is None or label_idx == 0:
+            continue
+        label = row_cells[label_idx]
+        orig_cs = int(label["col_start"])
+        new_start = orig_cs
+        absorbed: List[Dict[str, Any]] = []
+        for j in range(label_idx):
+            cell = row_cells[j]
+            if int(cell.get("col_span") or 1) != 1:
+                break
+            if str(cell.get("text") or "").strip():
+                break
+            col = int(cell["col_start"])
+            if _column_has_body_content(cells, col, header_end):
+                break
+            if _body_anchors_between(cells, col, orig_cs, header_end):
+                break
+            new_start = col
+            absorbed.append(cell)
+        if not absorbed:
+            continue
+        label["col_start"] = new_start
+        label["col_span"] = int(label["col_end"]) - int(label["col_start"]) + 1
+        for cell in absorbed:
+            cell["_drop_render"] = True
+
+    # 分辨率 + (μm) 等同属性标签与单位格合并
+    _UNIT_TAIL_RE = re.compile(r"^[\(（]?\s*μm\s*[\)）]?$", re.I)
+    for row_cells in by_row.values():
+        row_cells.sort(key=lambda c: int(c["col_start"]))
+        for i, cell in enumerate(row_cells):
+            t = str(cell.get("text") or "").strip()
+            if not t or not _CJK_RE_LOCAL.search(t):
+                continue
+            if i + 1 >= len(row_cells):
+                continue
+            nxt = row_cells[i + 1]
+            if int(nxt["col_start"]) != int(cell["col_end"]) + 1:
+                continue
+            nt = str(nxt.get("text") or "").strip()
+            if not _UNIT_TAIL_RE.fullmatch(nt):
+                continue
+            cell["text"] = f"{t}{nt}"
+            cell["col_end"] = int(nxt["col_end"])
+            cell["col_span"] = int(cell["col_end"]) - int(cell["col_start"]) + 1
+            nxt["_drop_render"] = True
+
+    return [c for c in cells if not c.get("_drop_render")]
+
+
 def _merge_leading_label_gaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Merge leading empty placeholders into the first label cell of a row."""
+    """把同行右侧连续空原子格并进左侧标签；身列已有数字的空格不吞。"""
     if not cells:
         return cells
     by_row: Dict[int, List[Dict[str, Any]]] = {}
@@ -285,7 +739,7 @@ def _merge_leading_label_gaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
             continue
         by_row.setdefault(int(cell["row_start"]), []).append(cell)
 
-    for row_cells in by_row.values():
+    for row_idx, row_cells in by_row.items():
         row_cells.sort(key=lambda c: int(c["col_start"]))
         if len(row_cells) < 2:
             continue
@@ -298,6 +752,9 @@ def _merge_leading_label_gaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
             if int(cell["col_span"]) != 1:
                 break
             if str(cell.get("text") or "").strip():
+                break
+            col = int(cell["col_start"])
+            if _column_has_data_values(cells, col, skip_rows={row_idx}):
                 break
             merge_until = int(cell["col_end"])
             absorbed.append(cell)
@@ -629,22 +1086,85 @@ def drop_noise_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _effective_header_end(cells: Sequence[Dict[str, Any]]) -> int:
+    """顶表头带末行；无 rowspan 线索时取首个有字身行之上。"""
+    he = _top_header_band_end(list(cells))
+    if he >= 0:
+        return he
+    body_starts = [
+        int(c["row_start"])
+        for c in cells
+        if str(c.get("text") or "").strip() and not _is_cell_frag(str(c.get("text") or ""))
+    ]
+    if not body_starts:
+        return 0
+    return max(0, min(body_starts) - 1)
+
+
+_LONE_EXAMPLE_NUM_RE = re.compile(r"^\d+$")
+_HEADER_HAS_EXAMPLE_RE = re.compile(r"实[施試]例|実[施試]例|比較例|比较例|参考例")
+
+
+def _repair_lone_example_number_headers(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """顶栏仅 OCR 出数字时，若同行已有实施例/比较例等列头，补回前缀。"""
+    header_end = _effective_header_end(cells)
+    has_example_peer = any(
+        _HEADER_HAS_EXAMPLE_RE.search(str(c.get("text") or ""))
+        for c in cells
+        if int(c["row_start"]) <= header_end
+    )
+    if not has_example_peer:
+        return cells
+
+    for c in cells:
+        if int(c["row_start"]) > header_end:
+            continue
+        t = str(c.get("text") or "").strip()
+        if not _LONE_EXAMPLE_NUM_RE.fullmatch(t):
+            continue
+        c["text"] = f"实施例 {t}"
+    return cells
+
+
+def _top_header_band_end(cells: List[Dict[str, Any]]) -> int:
+    """顶表头带最后一行（含）。表体左侧大行头的 rowspan 不计入。
+
+    只有 ``row_start <= 1`` 的跨行格才能把表头带向下扩；若存在表体左侧
+    大行头（``row_start >= 2`` 且偏左），表头带截止在其上一行，避免把
+    ``比较例 1`` / 数据 ``100`` 错误向下合并进表体空格。
+    """
+    header_end = -1
+    for c in cells:
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        if re > rs and rs <= 1:
+            header_end = max(header_end, re)
+
+    first_body_stub: int | None = None
+    for c in cells:
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        cs = int(c["col_start"])
+        if re > rs and rs >= 2 and cs <= 1:
+            first_body_stub = rs if first_body_stub is None else min(first_body_stub, rs)
+    if first_body_stub is not None:
+        cap = first_body_stub - 1
+        header_end = cap if header_end < 0 else min(header_end, cap)
+    return header_end
+
+
 def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     合并表头中：上方有“实文本”的单行格，且正下方同列范围是空/碎片文本的单行格。
 
     目标修复：诸如 P100X888 的“分散液”表头被切成两层的情况。
+    仅在真正的顶表头带内合并，不用表体左侧大行头去扩大截止行。
     """
     if not cells:
         return cells
 
-    # 仅在“疑似表头区域”做修复：table 内如果没有任何 rowspan>1 的格，说明不存在多行表头
-    header_cutoff = -1
-    for c in cells:
-        rs, re = int(c["row_start"]), int(c["row_end"])
-        if re > rs:
-            header_cutoff = max(header_cutoff, re)
-    if header_cutoff < 1:
+    header_end = _top_header_band_end(cells)
+    if header_end < 1:
         return cells
 
     def _is_frag_or_empty(text: str) -> bool:
@@ -689,11 +1209,12 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
         uc_e = int(upper["col_end"])
         upper_text = str(upper.get("text") or "").strip()
 
-        # 只合并 header_cutoff 内、且上方格为单行格的情况
+        # 只合并顶表头带内、且上方格为单行格的情况。
+        # 下一行若已出表头带（进入表体），不得把列头/数据格向下吞掉。
         if ue != ur:
             out.append(upper)
             continue
-        if ur > header_cutoff - 1:
+        if ue + 1 > header_end:
             out.append(upper)
             continue
         # 只处理单列表头：避免把诸如“组成[质量%]”(colspan>1) 的大格也错误向下延展
@@ -752,6 +1273,12 @@ def cells_to_html_table(
 
     work = [dict(c) for c in cells]
     work = _resolve_logic_overlaps(work)
+    work = _repair_lone_example_number_headers(work)
+    work = _drop_leading_header_only_columns(work)
+    work = _split_label_over_data_columns(work)
+    work = _split_header_over_index_column(work)
+    work = _merge_leading_empty_into_label(work)
+    work = _merge_leading_label_gaps(work)
     # 去掉原先只处理“行首标签”的非对称美化；改为对称幽灵行/列清理
     work = drop_evidenceless_columns(work)
     work = drop_evidenceless_rows(work)

@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -38,6 +39,7 @@ _CJK_RE = re.compile(
     r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]"
 )
 _DASH_ONLY_RE = re.compile(r"^[一ー—─\-]+$")
+logger = logging.getLogger(__name__)
 # 跨格切分：每格覆盖文本框宽度比例 / 贴边容差
 _CELL_COVER_FRAC = 0.55
 _EDGE_ALIGN_FRAC = 0.30
@@ -108,6 +110,11 @@ def _should_block_geom_header_split(text: str) -> bool:
 # 行标签粘连：比较例1 86 Bk-1 → 切成多段（须配合多列几何门槛，禁止裸剥首位）
 _ROW_LABEL_HEAD_RE = re.compile(
     r"^(实[施試]例|実[施試]例|実施例|比較例|比较例|合成例|对照例|参考例)"
+)
+# 顶栏列头粘连：实施例8实施例9 / 8实施例9实施例10
+_COL_LABEL_HEAD = "实[施試]例|実[施試]例|実施例|比較例|比较例|合成例|对照例|参考例"
+_COL_LABEL_UNIT_RE = re.compile(
+    rf"(?:({_COL_LABEL_HEAD})(\d+)|(\d+)({_COL_LABEL_HEAD}))"
 )
 _TRAILING_CODE_RE = re.compile(
     r"([A-Za-z]{1,8}(?:[-－.]\d+[A-Za-z0-9:]*)?)$"
@@ -254,6 +261,246 @@ def _parse_sticky_row_parts(
         return [f"{head} {left_d}".strip(), right_d]
 
     return None
+
+
+def _strip_leading_bare_example_heads(compact: str) -> str:
+    """去掉 OCR 重复的无数字「实施例」前缀（列号已在邻列独立格）。"""
+    out = compact
+    while out:
+        m = re.match(rf"^({_COL_LABEL_HEAD})(?!\d)", out)
+        if not m:
+            break
+        out = out[m.end() :]
+    return out
+
+
+def _parse_sticky_column_parts(tb_text: str) -> Optional[List[str]]:
+    """
+    顶栏粘连：实施例8实施例9、8实施例9实施例10 等重复单元 ≥2。
+    """
+    compact = re.sub(r"\s+", "", (tb_text or "").strip())
+    if not compact:
+        return None
+    compact = _strip_leading_bare_example_heads(compact)
+    if not compact:
+        return None
+    parts: List[str] = []
+    pos = 0
+    head_name = "实施例"
+    while pos < len(compact):
+        m = _COL_LABEL_UNIT_RE.search(compact, pos)
+        if not m:
+            tail = compact[pos:]
+            if parts and re.fullmatch(r"\d+", tail):
+                parts.append(f"{head_name} {tail}")
+            break
+        if m.start() > pos:
+            gap = compact[pos : m.start()]
+            if re.fullmatch(r"\d+", gap) and parts:
+                parts[-1] = f"{parts[-1].split()[0]} {gap}"
+            elif gap:
+                return None
+        if m.group(1):
+            head_name = m.group(1)
+            num = m.group(2)
+        else:
+            head_name = m.group(4)
+            num = m.group(3)
+        parts.append(f"{head_name} {num}".strip())
+        pos = m.end()
+    if len(parts) < 2:
+        return None
+    normed = [re.sub(r"\s+", "", p) for p in parts]
+    if not all(is_independent_row_label(p) for p in normed):
+        return None
+    return parts
+
+
+def _overlapping_top_header_cols(
+    tb: Dict[str, Any],
+    cells: List[Dict[str, Any]],
+) -> List[Tuple[int, Tuple[float, float, float, float]]]:
+    """顶栏（row_start<=1）上与文本框有足够 X 重叠的原子列。"""
+    tb_box = _text_bbox(tb)
+    text_w = max(tb_box[2] - tb_box[0], 1.0)
+    cy = (tb_box[1] + tb_box[3]) / 2.0
+    out: List[Tuple[int, Tuple[float, float, float, float]]] = []
+    for i, cell in enumerate(cells):
+        if int(cell.get("row_start", 99)) > 1:
+            continue
+        if max(int(cell.get("col_span") or 1), 1) > 1:
+            continue
+        cb = _cell_bbox(cell)
+        cell_cy = (cb[1] + cb[3]) / 2.0
+        row_tol = _row_tol_for_cell(cb, cell)
+        if abs(cell_cy - cy) > row_tol:
+            continue
+        xo = _x_overlap(tb_box, cb)
+        if xo / text_w < 0.12:
+            continue
+        cell_w = max(cb[2] - cb[0], 1.0)
+        if xo / cell_w < 0.35:
+            continue
+        out.append((i, cb))
+    out.sort(key=lambda t: t[1][0])
+    return out
+
+
+def _equal_split_tb_boxes(
+    tb: Dict[str, Any],
+    n_slots: int,
+) -> List[Tuple[float, float, float, float]]:
+    """粘连 OCR 框按宽度均分（宽 colspan 顶栏无原子列时的几何回退）。"""
+    if n_slots < 2:
+        return []
+    tb_box = _text_bbox(tb)
+    x1, y1, x2, y2 = tb_box
+    w = max(x2 - x1, 1.0)
+    step = w / n_slots
+    out: List[Tuple[float, float, float, float]] = []
+    for i in range(n_slots):
+        xa = x1 + i * step
+        xb = x2 if i == n_slots - 1 else x1 + (i + 1) * step
+        out.append((xa, y1, xb, y2))
+    return out
+
+
+def _split_sticky_column_header(
+    tb: Dict[str, Any],
+    cells: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    """顶栏「实施例N」粘连 OCR 框按列界切分。"""
+    text = str(tb.get("text") or "").strip()
+    if not text:
+        return None
+    parts = _parse_sticky_column_parts(text)
+    if not parts or len(parts) < 2:
+        return None
+    overlaps: List[Tuple[int, Tuple[float, float, float, float]]] = []
+    if cells:
+        overlaps = _overlapping_top_header_cols(tb, cells)
+    slot_boxes: List[Tuple[float, float, float, float]] = []
+    if len(overlaps) < 2:
+        slot_boxes = _equal_split_tb_boxes(tb, len(parts))
+        if len(slot_boxes) >= 2:
+            overlaps = [(-1, b) for b in slot_boxes]
+    if len(overlaps) < 2:
+        return None
+
+    tb_box = _text_bbox(tb)
+    x1, y1, x2, y2 = tb_box
+    use_n = min(len(parts), len(overlaps))
+    if use_n < 2:
+        return None
+    if len(parts) > use_n:
+        parts = parts[: use_n - 1] + [" ".join(parts[use_n - 1 :]).strip()]
+
+    pieces: List[Dict[str, Any]] = []
+    for i, part in enumerate(parts):
+        if not part:
+            continue
+        cb = overlaps[i][1]
+        xa = max(x1, cb[0])
+        xb = min(x2, cb[2])
+        if xb <= xa:
+            xa, xb = cb[0], cb[2]
+        piece = dict(tb)
+        piece["text"] = part
+        piece["polygon"] = np.array(
+            [[xa, y1], [xb, y1], [xb, y2], [xa, y2]],
+            dtype=np.float64,
+        )
+        piece["top_left"] = (xa, y1)
+        pieces.append(piece)
+    return pieces if len(pieces) >= 2 else None
+
+
+def _other_header_text_in_span(
+    cell: Dict[str, Any],
+    cells: Sequence[Dict[str, Any]],
+    header_end: int,
+) -> bool:
+    """同顶栏带、列范围重叠且已有其它非空表头格 → 勿整格 explode。"""
+    cs, ce = int(cell["col_start"]), int(cell["col_end"])
+    for c in cells:
+        if c is cell:
+            continue
+        if int(c.get("row_start", 99)) > header_end:
+            continue
+        ocs = int(c["col_start"])
+        if ocs < cs or ocs > ce:
+            continue
+        if not str(c.get("text") or "").strip():
+            continue
+        return True
+    return False
+
+
+def explode_sticky_header_wide_cells(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    顶栏宽 colspan 格内粘连多列头时，按解析单元拆成原子列格。
+    """
+    if not cells:
+        return cells
+
+    header_rows = {
+        int(c["row_start"])
+        for c in cells
+        if int(c.get("row_start", 99)) <= 1
+    }
+    header_end = max(header_rows) if header_rows else 1
+
+    out: List[Dict[str, Any]] = []
+    changed = 0
+    for cell in cells:
+        rs = int(cell["row_start"])
+        if rs > header_end:
+            out.append(cell)
+            continue
+        cspan = max(int(cell.get("col_span") or 1), 1)
+        if cspan < 2:
+            out.append(cell)
+            continue
+        text = str(cell.get("text") or "").strip()
+        if not text:
+            out.append(cell)
+            continue
+        if _other_header_text_in_span(cell, cells, header_end):
+            out.append(cell)
+            continue
+        parts = _parse_sticky_column_parts(text)
+        if not parts or len(parts) < 2:
+            out.append(cell)
+            continue
+        use_n = min(len(parts), cspan)
+        parts = parts[:use_n]
+        cs = int(cell["col_start"])
+        poly = np.asarray(cell["polygon"], dtype=np.float64).reshape(-1, 2)
+        x1, x2 = float(poly[:, 0].min()), float(poly[:, 0].max())
+        y1, y2 = float(poly[:, 1].min()), float(poly[:, 1].max())
+        w = max(x2 - x1, 1.0)
+        step = w / use_n
+        for i, part in enumerate(parts):
+            xa = x1 + i * step
+            xb = x2 if i == use_n - 1 else x1 + (i + 1) * step
+            nc = dict(cell)
+            nc["col_start"] = cs + i
+            nc["col_end"] = cs + i
+            nc["col_span"] = 1
+            nc["text"] = part
+            nc["texts"] = []
+            nc["polygon"] = np.array(
+                [[xa, y1], [xb, y1], [xb, y2], [xa, y2]],
+                dtype=np.float64,
+            )
+            out.append(nc)
+        changed += 1
+
+    if changed:
+        logger.info("顶栏粘连宽格拆分: %d 格", changed)
+    return out if changed else cells
 
 
 def _text_top_left(tb: Dict[str, Any]) -> Tuple[float, float]:
@@ -1172,6 +1419,30 @@ def _try_split_across_cells(
     return assigned_any
 
 
+def _nearest_empty_header_cell(
+    piece_tb: Dict[str, Any],
+    cells: List[Dict[str, Any]],
+    cell_rects: Sequence[Any],
+) -> Optional[int]:
+    """顶栏粘连片段：找与片段中心 X 最近、且尚无文本的表头格。"""
+    tb_box = _text_bbox(piece_tb)
+    cx = (tb_box[0] + tb_box[2]) / 2.0
+    best_i: Optional[int] = None
+    best_dx = float("inf")
+    for i, cell in enumerate(cells):
+        if int(cell.get("row_start", 99)) > 1:
+            continue
+        if cell.get("texts"):
+            continue
+        cb = _cell_bbox(cell)
+        ccx = (cb[0] + cb[2]) / 2.0
+        dx = abs(cx - ccx)
+        if dx < best_dx:
+            best_dx = dx
+            best_i = i
+    return best_i
+
+
 def assign_texts_to_cells(
     cells: List[Dict[str, Any]],
     text_boxes: List[Dict[str, Any]],
@@ -1212,14 +1483,34 @@ def assign_texts_to_cells(
     cell_rects: List[Any] = []
     _rebuild_rects()
 
-    for tb in text_boxes:
+    def _is_sticky_column_blob(tb: Dict[str, Any]) -> bool:
+        parts = _parse_sticky_column_parts(str(tb.get("text") or ""))
+        return bool(parts and len(parts) >= 2)
+
+    ordered_boxes = sorted(
+        text_boxes,
+        key=lambda tb: (1 if _is_sticky_column_blob(tb) else 0),
+    )
+
+    for tb in ordered_boxes:
         # 粘连行标预切：仅当重叠 ≥2 原子列时触发（有几何证据）。
+        col_sticky = False
         sticky_pieces = _split_sticky_row_label(tb, cells)
+        if sticky_pieces is None:
+            sticky_pieces = _split_sticky_column_header(tb, cells)
+            col_sticky = sticky_pieces is not None
         piece_list = sticky_pieces if sticky_pieces else [tb]
         for piece_tb in piece_list:
             text_shape = polygon_to_shapely(piece_tb["polygon"])
             centroid = text_shape.centroid
             center_pt = Point(centroid.x, centroid.y)
+
+            def _header_empty_indices() -> List[int]:
+                return [
+                    i
+                    for i, c in enumerate(cells)
+                    if int(c.get("row_start", 99)) <= 1 and not c.get("texts")
+                ]
 
             n_before = len(cells)
             # ---- 跨格切分 ----
@@ -1251,6 +1542,10 @@ def assign_texts_to_cells(
                 if rect.contains(center_pt) or rect.covers(center_pt):
                     hits.append(i)
             if hits:
+                if col_sticky:
+                    empty_h = [i for i in hits if i in _header_empty_indices()]
+                    if empty_h:
+                        hits = empty_h
                 best_i = min(
                     hits,
                     key=lambda i: max(
@@ -1260,6 +1555,14 @@ def assign_texts_to_cells(
                         1.0,
                     ),
                 )
+                if (
+                    col_sticky
+                    and int(cells[best_i].get("row_start", 99)) <= 1
+                    and cells[best_i].get("texts")
+                ):
+                    alt = _nearest_empty_header_cell(piece_tb, cells, cell_rects)
+                    if alt is not None:
+                        best_i = alt
                 cells[best_i]["texts"].append(piece_tb)
                 continue
 
@@ -1267,7 +1570,13 @@ def assign_texts_to_cells(
             best_idx = -1
             best_ioa = 0.0
             best_area = float("inf")
-            for i, cell_shape in enumerate(cell_shapes):
+            ioa_pool = range(len(cell_shapes))
+            if col_sticky:
+                empty_h = _header_empty_indices()
+                if empty_h:
+                    ioa_pool = empty_h
+            for i in ioa_pool:
+                cell_shape = cell_shapes[i]
                 ioa = compute_ioa(text_shape, cell_shape)
                 area = float(getattr(cell_shape, "area", 0.0) or 0.0)
                 if ioa > best_ioa + 1e-9 or (
@@ -1278,10 +1587,26 @@ def assign_texts_to_cells(
                     best_area = area
 
             if best_idx >= 0 and best_ioa > ioa_threshold:
+                if (
+                    col_sticky
+                    and int(cells[best_idx].get("row_start", 99)) <= 1
+                    and cells[best_idx].get("texts")
+                ):
+                    alt = _nearest_empty_header_cell(piece_tb, cells, cell_rects)
+                    if alt is not None:
+                        best_idx = alt
                 cells[best_idx]["texts"].append(piece_tb)
                 continue
 
             if best_idx >= 0 and best_ioa > 0:
+                if (
+                    col_sticky
+                    and int(cells[best_idx].get("row_start", 99)) <= 1
+                    and cells[best_idx].get("texts")
+                ):
+                    alt = _nearest_empty_header_cell(piece_tb, cells, cell_rects)
+                    if alt is not None:
+                        best_idx = alt
                 cells[best_idx]["texts"].append(piece_tb)
                 continue
 
@@ -1326,6 +1651,7 @@ def assign_texts_to_cells(
 
     _apply_component_header_completion(cells)
     cells = unmerge_filled_label_rowspans(cells)
+    cells = explode_sticky_header_wide_cells(cells)
     return cells, free_texts
 
 

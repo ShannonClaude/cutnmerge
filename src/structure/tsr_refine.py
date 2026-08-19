@@ -1872,9 +1872,13 @@ def explode_header_colspans_by_body(
 def refine_tsr_cells_light(
     cells: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """轻量后处理：仅去重叠，保留 TSR 拓扑（row/colspan 与多边形）。"""
+    """轻量后处理：先裁左行头过宽 colspan，再去重叠，保留 TSR 拓扑。"""
     if not cells:
         return cells
+    from .row_header import clip_narrow_label_colspans, clip_row_header_child_overlaps
+
+    cells = clip_row_header_child_overlaps(cells)
+    cells = clip_narrow_label_colspans(cells)
     return dedupe_overlapping_cells(cells)
 
 
@@ -2134,6 +2138,10 @@ def refine_tsr_cells(
     """激进 TSR 结构后处理：幽灵列合并、拆 rowspan/colspan、双簇补列。"""
     if not cells:
         return cells
+    from .row_header import clip_narrow_label_colspans, clip_row_header_child_overlaps
+
+    cells = clip_row_header_child_overlaps(cells)
+    cells = clip_narrow_label_colspans(cells)
     cells = dedupe_overlapping_cells(cells)
     cells = merge_ghost_columns(cells, boxes)
     cells = dedupe_overlapping_cells(cells)

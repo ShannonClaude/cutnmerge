@@ -485,6 +485,15 @@ def _extract_via_tsr(
         if len(col_seps_list) >= 3:
             col_seps = col_seps_list
 
+    from ..structure.row_header import (
+        clip_narrow_label_colspans,
+        clip_row_header_child_overlaps,
+        peel_row_header_text,
+    )
+
+    cells = clip_row_header_child_overlaps(cells)
+    cells = clip_narrow_label_colspans(cells)
+
     cells, free_texts = assign_texts_to_cells(
         cells,
         text_boxes,
@@ -495,6 +504,7 @@ def _extract_via_tsr(
         col_seps=col_seps,
         v_separators=v_separators,
     )
+    cells = peel_row_header_text(cells, text_boxes)
     cells = recover_empty_vertical_headers(
         image,
         cells,
