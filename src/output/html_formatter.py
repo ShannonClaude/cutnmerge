@@ -573,6 +573,115 @@ def _drop_leading_header_only_columns(cells: List[Dict[str, Any]]) -> List[Dict[
     return out
 
 
+def _left_cols_have_rowspan_body_labels(
+    cells: Sequence[Dict[str, Any]],
+    max_col: int,
+    header_end: int,
+) -> bool:
+    """表体左侧列存在跨多行的行头大格（如聚酰亚胺组成），区别于 P26 索引列。"""
+    for cell in cells:
+        if int(cell["row_start"]) <= header_end:
+            continue
+        if int(cell["col_start"]) >= max_col:
+            continue
+        rsp = int(
+            cell.get("row_span")
+            or (int(cell["row_end"]) - int(cell["row_start"]) + 1)
+        )
+        if rsp < 2:
+            continue
+        t = str(cell.get("text") or "").strip()
+        if t and not _is_cell_frag(t):
+            return True
+    return False
+
+
+def _collapse_header_empty_corners(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    表头行左侧纯空角格并入右侧首个表头标签（P24/P25：项目前有 3 个空 td）。
+
+    仅当左侧列在表体已被 rowspan 大行头占用时触发，避免 P26 索引列空角被吞。
+    """
+    if not cells:
+        return cells
+    header_end = _effective_header_end(cells)
+    _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+    min_label_col: int | None = None
+    for cell in cells:
+        rs, re_ = int(cell["row_start"]), int(cell["row_end"])
+        if rs > header_end or re_ != rs:
+            continue
+        t = str(cell.get("text") or "").strip()
+        if t and not _is_cell_frag(t) and _CJK_RE.search(t):
+            cs = int(cell["col_start"])
+            if min_label_col is None or cs < min_label_col:
+                min_label_col = cs
+    if min_label_col is None or min_label_col <= 0:
+        return cells
+    if not _left_cols_have_rowspan_body_labels(cells, min_label_col, header_end):
+        return cells
+
+    by_row: Dict[int, List[Dict[str, Any]]] = {}
+    for cell in cells:
+        rs, re_ = int(cell["row_start"]), int(cell["row_end"])
+        if rs > header_end or re_ != rs:
+            continue
+        by_row.setdefault(rs, []).append(cell)
+
+    changed = 0
+    for row_cells in by_row.values():
+        row_cells.sort(key=lambda c: int(c["col_start"]))
+        label_idx: int | None = None
+        for i, cell in enumerate(row_cells):
+            if int(cell["col_start"]) < min_label_col:
+                continue
+            t = str(cell.get("text") or "").strip()
+            if t and not _is_cell_frag(t):
+                label_idx = i
+                break
+        if label_idx is None:
+            continue
+        label = row_cells[label_idx]
+        orig_cs = int(label["col_start"])
+        absorbed: List[Dict[str, Any]] = []
+        for j in range(label_idx):
+            cell = row_cells[j]
+            if int(cell.get("col_span") or 1) != 1:
+                break
+            if str(cell.get("text") or "").strip():
+                break
+            col = int(cell["col_start"])
+            if col >= min_label_col:
+                break
+            if not _column_has_body_content(cells, col, header_end):
+                break
+            absorbed.append(cell)
+        if absorbed:
+            new_start = int(absorbed[0]["col_start"])
+            label["col_start"] = new_start
+            label["col_span"] = int(label["col_end"]) - new_start + 1
+            for cell in absorbed:
+                cell["_drop_render"] = True
+            changed += 1
+            continue
+        # 表头行无占位 cell、但逻辑列 0..orig_cs-1 由表体 rowspan 占用 → 左扩标签 colspan
+        rs = int(label["row_start"])
+        has_left = any(
+            int(c["col_start"]) < orig_cs
+            and int(c["row_start"]) <= rs <= int(c["row_end"])
+            for c in cells
+            if not c.get("_drop_render")
+        )
+        if not has_left and orig_cs >= min_label_col:
+            label["col_start"] = 0
+            label["col_span"] = int(label["col_end"]) + 1
+            changed += 1
+
+    if changed:
+        logger.info("表头空角压缩: %d 行", changed)
+    return [c for c in cells if not c.get("_drop_render")]
+
+
 def _split_header_over_index_column(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """表头格跨第 0 列、而身列 0 为实施例索引时，拆成空角 + 独立标签列。"""
     if not cells:
@@ -581,6 +690,9 @@ def _split_header_over_index_column(cells: List[Dict[str, Any]]) -> List[Dict[st
     if header_end < 0:
         return cells
     if not _column_has_body_content(cells, 0, header_end):
+        return cells
+    # P24/P25：身列 0 为 rowspan 大类行头，不是实施例索引列，勿拆表头角格
+    if _left_cols_have_rowspan_body_labels(cells, 1, header_end):
         return cells
 
     extras: List[Dict[str, Any]] = []
@@ -1277,6 +1389,7 @@ def cells_to_html_table(
     work = _drop_leading_header_only_columns(work)
     work = _split_label_over_data_columns(work)
     work = _split_header_over_index_column(work)
+    work = _collapse_header_empty_corners(work)
     work = _merge_leading_empty_into_label(work)
     work = _merge_leading_label_gaps(work)
     # 去掉原先只处理“行首标签”的非对称美化；改为对称幽灵行/列清理
@@ -1287,6 +1400,7 @@ def cells_to_html_table(
         work = compress_empty_logic_columns(work)
         work = compress_empty_logic_rows(work)
     work = _merge_header_empty_below(work)
+    work = [c for c in work if not c.get("_drop_render")]
     if not work:
         return ""
 

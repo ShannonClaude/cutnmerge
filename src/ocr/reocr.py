@@ -569,6 +569,11 @@ def _looks_like_vertical_header_text(text: str, score: float) -> bool:
     if score < 0.6:
         return False
     compact = _compact_header_text(text)
+    if re.search(r"组成|感光性|树脂", compact):
+        if 4 <= len(compact) <= 24 and score >= 0.55:
+            cjk_n = len(_CJK_CHAR_RE.findall(compact))
+            if cjk_n >= max(3, int(round(0.5 * len(compact)))):
+                return True
     if not (2 <= len(compact) <= 8):
         return False
     cjk_n = len(_CJK_CHAR_RE.findall(compact))
@@ -621,6 +626,7 @@ def recover_empty_vertical_headers(
 
     header_hi = 1
     candidates: List[int] = []
+    seen: set[int] = set()
     for i, cell in enumerate(cells):
         if int(cell.get("row_start") or 0) > header_hi:
             continue
@@ -636,8 +642,35 @@ def recover_empty_vertical_headers(
         if _interior_ink_ratio(binary, cell) < 0.04:
             continue
         candidates.append(i)
+        seen.add(i)
         if len(candidates) >= max_cells:
             break
+
+    # 左侧竖排大类行头（如感光性树脂组合物组成）：rowspan 多行、列 0–1
+    if len(candidates) < max_cells:
+        for i, cell in enumerate(cells):
+            if i in seen:
+                continue
+            if int(cell.get("col_start") or 0) > 1:
+                continue
+            rsp = int(
+                cell.get("row_span")
+                or (int(cell["row_end"]) - int(cell["row_start"]) + 1)
+            )
+            if rsp < 3:
+                continue
+            if str(cell.get("text") or "").strip():
+                continue
+            x1, y1, x2, y2 = _cell_bbox(cell)
+            iw, ih = max(x2 - x1, 1), max(y2 - y1, 1)
+            if ih < 48 or ih < 1.5 * iw:
+                continue
+            if _interior_ink_ratio(binary, cell) < 0.03:
+                continue
+            candidates.append(i)
+            seen.add(i)
+            if len(candidates) >= max_cells:
+                break
 
     if not candidates:
         return cells

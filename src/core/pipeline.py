@@ -485,11 +485,23 @@ def _extract_via_tsr(
         if len(col_seps_list) >= 3:
             col_seps = col_seps_list
 
+    from ..structure.transpose_fix import (
+        maybe_fix_transposed_table,
+        maybe_lines_fallback_after_transpose,
+        strip_caption_cells,
+    )
     from ..structure.row_header import (
         clip_narrow_label_colspans,
         clip_row_header_child_overlaps,
         peel_row_header_text,
     )
+
+    transposed = False
+    cells, transposed = maybe_fix_transposed_table(cells, text_boxes)
+    if transposed:
+        cells = maybe_lines_fallback_after_transpose(
+            image, cells, text_boxes
+        )
 
     cells = clip_row_header_child_overlaps(cells)
     cells = clip_narrow_label_colspans(cells)
@@ -505,6 +517,9 @@ def _extract_via_tsr(
         v_separators=v_separators,
     )
     cells = peel_row_header_text(cells, text_boxes)
+    cells, caption_texts = strip_caption_cells(cells)
+    if caption_texts:
+        free_texts.extend(caption_texts)
     cells = recover_empty_vertical_headers(
         image,
         cells,

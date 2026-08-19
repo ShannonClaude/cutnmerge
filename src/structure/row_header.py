@@ -27,9 +27,19 @@ _PEEL_SUBLABEL_RES = (
     re.compile(r"^封端剂$"),
     re.compile(r"^封剂$"),
     re.compile(r"^化合物\s*[\(（]?[bB][\)）]?$"),
+    re.compile(r"^[\(（][bB][\)）]化合物$"),
     re.compile(r"^jER[-\u2010]?\d+$", re.I),
     re.compile(r"^[ABC]$"),
+    re.compile(r"^苯胺$"),
     re.compile(r"^其他$"),
+)
+_B_COMPOUND_PARENT_RE = re.compile(
+    r"化合物.*[\(（][bB][\)）]|[\(（][bB][\)）].*化合物",
+    re.I,
+)
+_C_COMPOUND_PARENT_RE = re.compile(
+    r"[\(（][cC][\)）].*醌二",
+    re.I,
 )
 _CHEM_NAME_RE = re.compile(
     r"^(?:jER[-\u2010]?\d+|OXT[-\u2010]?\d+|EP\d+\w*|NC\d+\w*|EPICLON\d+)$",
@@ -333,6 +343,15 @@ def _peel_text_token_from_parent(
     if not token:
         return False
     parent_text = str(parent.get("text") or "")
+    lines = [ln.strip() for ln in parent_text.split("\n") if ln.strip()]
+    if len(lines) >= 2 and token in {"A", "B", "C"}:
+        for i, ln in enumerate(lines):
+            if ln == token:
+                lines.pop(i)
+                parent["text"] = "\n".join(lines).strip()
+                target["text"] = token
+                target["texts"] = list(target.get("texts") or [])
+                return True
     if token not in parent_text.replace("\n", " "):
         # 尝试无空格粘连：化合物jER828
         compact_p = re.sub(r"\s+", "", parent_text)
@@ -473,12 +492,54 @@ def peel_row_header_text(
                         parent_text = str(parent.get("text") or "")
                         peeled += 1
 
+        # (b)化合物 父格粘连品名：先剥化学名，再规范父格为 (b)化合物
+        parent_text = str(parent.get("text") or "").strip()
+        compact_p = re.sub(r"\s+", "", parent_text)
+        if _B_COMPOUND_PARENT_RE.search(compact_p):
+            for sib in sorted(siblings, key=lambda c: int(c["row_start"])):
+                if not _is_empty_or_frag(sib):
+                    continue
+                cm = _CHEM_NAME_FIND_RE.search(parent_text)
+                if cm and _peel_text_token_from_parent(parent, cm.group(0), sib):
+                    parent_text = str(parent.get("text") or "")
+                    compact_p = re.sub(r"\s+", "", parent_text)
+                    peeled += 1
+                    break
+            if re.search(r"[\(（][bB][\)）]", compact_p):
+                parent["text"] = "(b)化合物"
+
+        # (c)醌二叠氮：按行顺序剥 A/B/C 到空兄弟格
+        parent_text = str(parent.get("text") or "").strip()
+        if _C_COMPOUND_PARENT_RE.search(re.sub(r"\s+", "", parent_text)):
+            abc_sibs = sorted(
+                [s for s in siblings if _is_empty_or_frag(s)],
+                key=lambda c: int(c["row_start"]),
+            )
+            lines = [
+                ln.strip()
+                for ln in parent_text.split("\n")
+                if ln.strip()
+            ]
+            for sib in abc_sibs:
+                if not lines:
+                    break
+                # 跳过首行父标签，只剥独立 A/B/C 行
+                while lines and lines[0] not in {"A", "B", "C"}:
+                    lines.pop(0)
+                if not lines or lines[0] not in {"A", "B", "C"}:
+                    break
+                letter = lines[0]
+                if _peel_text_token_from_parent(parent, letter, sib):
+                    lines.pop(0)
+                    peeled += 1
+
     if peeled:
         logger.info("左行头文本剥离完成: %d 次", peeled)
     return relocate_misplaced_category_labels(cells)
 
 
 _CATEGORY_LABELS = frozenset({"封端剂", "封剂"})
+_SUBROW_LABELS = frozenset({"苯胺"})
 
 
 def relocate_misplaced_category_labels(
@@ -538,7 +599,43 @@ def relocate_misplaced_category_labels(
 
     if moved:
         logger.info("类别行头归位: %d 次", moved)
-    return _normalize_truncated_chem_names(cells)
+    return _relocate_misplaced_subrow_labels(_normalize_truncated_chem_names(cells))
+
+
+def _relocate_misplaced_subrow_labels(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """封端剂末行「苯胺」等子标签误入数据列时归位到空兄弟格。"""
+    if len(cells) < 2:
+        return cells
+    moved = 0
+    for c in cells:
+        raw = str(c.get("text") or "").strip()
+        compact = re.sub(r"\s+", "", raw)
+        if compact not in _SUBROW_LABELS:
+            continue
+        if int(c["col_start"]) <= 2:
+            continue
+        rs = int(c["row_start"])
+        best: Dict[str, Any] | None = None
+        for sib in cells:
+            if sib is c:
+                continue
+            if int(sib["row_start"]) != rs:
+                continue
+            if int(sib["col_start"]) >= int(c["col_start"]):
+                continue
+            if str(sib.get("text") or "").strip():
+                continue
+            if best is None or int(sib["col_start"]) > int(best["col_start"]):
+                best = sib
+        if best is None:
+            continue
+        best["text"] = raw
+        c["text"] = ""
+        c["texts"] = []
+        moved += 1
+    if moved:
+        logger.info("子行标签归位: %d 次", moved)
+    return cells
 
 
 def _normalize_truncated_chem_names(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

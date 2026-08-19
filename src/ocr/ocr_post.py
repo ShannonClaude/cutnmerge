@@ -59,6 +59,10 @@ def normalize_ocr_text(text: str) -> str:
     # jER 系列常见丢首字母 j（如 ER828 / 化合物ER828）
     if re.search(r"(?<![jJ])ER828", t):
         t = re.sub(r"(?<![jJ])ER828", "jER828", t)
+    # 参考例列：无法评价与数值粘连
+    compact = re.sub(r"\s+", "", t)
+    if re.fullmatch(r"无法评价\d+(?:\.\d+)?", compact):
+        t = "无法评价"
     return t
 
 

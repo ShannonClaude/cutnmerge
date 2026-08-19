@@ -18,12 +18,14 @@ from src.matching.matching import (  # noqa: E402
     _split_sticky_column_header,
 )
 from src.output.html_formatter import (  # noqa: E402
+    _collapse_header_empty_corners,
     _merge_header_empty_below,
     _merge_leading_empty_into_label,
     _repair_lone_example_number_headers,
     _resolve_logic_overlaps,
     cells_to_html_table,
 )
+from src.ocr.ocr_post import normalize_ocr_text  # noqa: E402
 from src.structure.row_header import (  # noqa: E402
     clip_narrow_label_colspans,
     clip_row_header_child_overlaps,
@@ -517,6 +519,66 @@ def test_sticky_strip_bare_example_prefix():
     assert any("比较例" in p for p in parts)
 
 
+def test_p24_header_empty_corners_collapsed():
+    """P24/P25：表头角格并入项目/聚酰亚胺，不出现 3 连空 td + 独立项目。"""
+    cells = [
+        _cell(1, 1, 0, 3, "项目", 0, 320, 0, 30),
+        _cell(1, 1, 4, 4, "实施例 1", 320, 400, 0, 30),
+        _cell(2, 2, 0, 3, "聚酰亚胺组成(摩尔比)", 0, 320, 30, 60),
+        _cell(3, 10, 0, 0, "聚酰亚胺组成", 0, 80, 60, 220),
+        _cell(3, 3, 1, 1, "酸酐", 80, 160, 60, 100),
+    ]
+    html = cells_to_html_table(cells)
+    assert not re.search(r"<td></td>\s*<td></td>\s*<td></td>\s*<td>项目", html), html
+    assert "项目" in html
+
+
+def test_peel_b_compound_colspan2_parent():
+    """(b)化合物 父格 colspan=2 粘连 jER828 时剥到子行。"""
+    cells = [
+        _cell(14, 20, 0, 1, "化合物jER828\n(b)", 0, 160, 280, 420),
+        _cell(14, 14, 2, 2, "", 160, 280, 280, 300),
+    ]
+    out = peel_row_header_text([dict(c) for c in cells])
+    parent = next(c for c in out if int(c["row_start"]) == 14 and int(c["col_start"]) == 0)
+    child = next(c for c in out if int(c["row_start"]) == 14 and int(c["col_start"]) == 2)
+    assert "jER828" in str(child.get("text") or "")
+    assert "(b)化合物" in re.sub(r"\s+", "", str(parent.get("text") or ""))
+
+
+def test_peel_c_abc_sublabels():
+    cells = [
+        _cell(21, 23, 0, 1, "(c)醌二A\nA\nB\nC", 0, 160, 400, 460),
+        _cell(21, 21, 2, 2, "", 160, 280, 400, 420),
+        _cell(22, 22, 2, 2, "", 160, 280, 420, 440),
+        _cell(23, 23, 2, 2, "", 160, 280, 440, 460),
+    ]
+    out = peel_row_header_text([dict(c) for c in cells])
+    texts = {
+        (int(c["row_start"]), int(c["col_start"])): str(c.get("text") or "")
+        for c in out
+    }
+    assert texts.get((21, 2), "").strip() == "A"
+    assert texts.get((22, 2), "").strip() == "B"
+    assert texts.get((23, 2), "").strip() == "C"
+
+
+def test_relocate_aniline_subrow_label():
+    cells = [
+        _cell(10, 10, 1, 1, "", 80, 160, 190, 210),
+        _cell(10, 10, 4, 4, "苯胺", 280, 360, 190, 210),
+    ]
+    out = relocate_misplaced_category_labels([dict(c) for c in cells])
+    texts = {int(c["col_start"]): str(c.get("text") or "") for c in out if int(c["row_start"]) == 10}
+    assert texts.get(1, "").strip() == "苯胺"
+    assert texts.get(4, "").strip() == ""
+
+
+def test_wufapingjia_glued_number_stripped():
+    assert normalize_ocr_text("无法评价40") == "无法评价"
+    assert normalize_ocr_text("无法评价21") == "无法评价"
+
+
 def test_explode_sticky_header_wide_cell():
     from src.matching.matching import explode_sticky_header_wide_cells
 
@@ -561,6 +623,11 @@ def main() -> int:
     test_p26x194_ghost_col0_dropped()
     test_p26x194_header_corner_not_merged()
     test_p26x194_tsr_colspan2_header_split()
+    test_p24_header_empty_corners_collapsed()
+    test_peel_b_compound_colspan2_parent()
+    test_peel_c_abc_sublabels()
+    test_relocate_aniline_subrow_label()
+    test_wufapingjia_glued_number_stripped()
     test_p98_aligned_body_colspan_kept()
     test_relocate_fengduanji_from_data_column()
     test_sticky_column_header_split_wide_merged()
