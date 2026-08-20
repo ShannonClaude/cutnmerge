@@ -16,7 +16,12 @@ import numpy as np
 
 from .config import ROOT
 from .models import load_lore_model, load_ocr, predict_cells, predict_texts
-from ..matching.matching import assign_texts_to_cells, _fix_dash_column_consistency
+from ..matching.matching import (
+    assign_texts_to_cells,
+    _fix_dash_column_consistency,
+    detect_eval_symbols_in_empty_cells,
+    upgrade_o_to_double_circle,
+)
 from ..ocr.ocr_post import postprocess_text_boxes
 from ..ocr.reocr import apply_reocr_to_cells, recover_empty_vertical_headers
 from ..output.formatter import format_free_texts
@@ -238,6 +243,8 @@ def _extract_via_lines(
             v_separators=table.v_separators,
         )
         cells = _fix_dash_column_consistency(cells)
+        cells = detect_eval_symbols_in_empty_cells(cells, binary)
+        cells = upgrade_o_to_double_circle(cells, binary)
         cells = recover_empty_vertical_headers(
             image,
             cells,
@@ -329,6 +336,8 @@ def _extract_via_lore(
     )
     cells = _fix_dash_column_consistency(cells)
     lore_binary = binarize_otsu(image)
+    cells = detect_eval_symbols_in_empty_cells(cells, lore_binary)
+    cells = upgrade_o_to_double_circle(cells, lore_binary)
     cells = recover_empty_vertical_headers(
         image,
         cells,
@@ -544,6 +553,8 @@ def _extract_via_tsr(
         v_separators=v_separators,
     )
     cells = _fix_dash_column_consistency(cells)
+    cells = detect_eval_symbols_in_empty_cells(cells, binary)
+    cells = upgrade_o_to_double_circle(cells, binary)
     cells = peel_row_header_text(cells, text_boxes)
     cells = extend_section_rowspan_over_metric_rows(cells)
     cells, caption_texts = strip_caption_cells(cells)

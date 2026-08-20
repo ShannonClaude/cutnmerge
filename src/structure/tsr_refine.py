@@ -1724,8 +1724,20 @@ def reconstruct_header_cells(
                             continue
                         nc = dict(c)
                         crs, cre = int(c["row_start"]), int(c["row_end"])
-                        # 同行其它表头格：扩展为跨两级表头的 rowspan
-                        if crs == insert_at and cre == insert_at:
+                        # 同行其它表头格：扩展为跨两级表头的 rowspan。
+                        # 实施例/比较例列头保持单行，避免吞掉下层 A/B/C 数据行。
+                        peer_text = str(c.get("text") or "")
+                        is_example_peer = bool(
+                            re.search(
+                                r"(合成例|实施例|実施例|比較例|比较例|对照例|参考例)",
+                                peer_text,
+                            )
+                        )
+                        if (
+                            crs == insert_at
+                            and cre == insert_at
+                            and not is_example_peer
+                        ):
                             nc["row_end"] = insert_at + 1
                             _refresh_spans(nc)
                             x1, y1, x2, y2 = _cell_bbox(c)

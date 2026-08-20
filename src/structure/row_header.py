@@ -49,11 +49,17 @@ _CHEM_NAME_FIND_RE = re.compile(
     r"(?:jER[-\u2010]?\d+|OXT[-\u2010]?\d+|EP\d+\w*|NC\d+\w*|EPICLON\d+)",
     re.I,
 )
+_CATEGORY_LABELS = frozenset({"封端剂", "封剂"})
+_SUBROW_LABELS = frozenset({"苯胺"})
 # 子格左缘贴着父格右缘时的像素容差（共享竖线）
 _RIGHT_EDGE_TOL = 8.0
 # 宽度远小于父格且又矮又窄，视为角落幽灵格（如 P100 分散液右上碎片）
 _SLIVER_WIDTH_RATIO = 0.20
 _SLIVER_MIN_PX = 12.0
+# 插入品名格时相对父格宽度的默认比例
+_INSERT_LABEL_WIDTH_RATIO = 0.45
+_INSERT_LABEL_MIN_PX = 40.0
+_INSERT_LABEL_MAX_PX = 180.0
 
 
 def _bbox(cell: Dict[str, Any]) -> Tuple[float, float, float, float]:
@@ -290,11 +296,23 @@ def _point_in_cell(cx: float, cy: float, cell: Dict[str, Any]) -> bool:
     return x1 <= cx <= x2 and y1 <= cy <= y2
 
 
+def _is_known_sublabel_text(text: str) -> bool:
+    """已知子行头标签（苯胺、A/B/C、jER828…）不算空碎片。"""
+    compact = re.sub(r"\s+", "", (text or "").strip())
+    if not compact:
+        return False
+    if compact in {"A", "B", "C"} or compact in _SUBROW_LABELS:
+        return True
+    return _token_matches_sublabel(compact)
+
+
 def _is_empty_or_frag(cell: Dict[str, Any]) -> bool:
     t = str(cell.get("text") or "").strip()
     if not t:
         return True
     compact = re.sub(r"\s+", "", t)
+    if _is_known_sublabel_text(compact):
+        return False
     return len(compact) <= 2 or compact in {"-", "—", "_"}
 
 
@@ -343,6 +361,11 @@ def _peel_text_token_from_parent(
     if not token:
         return False
     parent_text = str(parent.get("text") or "")
+    # 父格整段就是该 token：禁止 self-peel 清空标签
+    parent_compact = re.sub(r"\s+", "", parent_text)
+    token_compact = re.sub(r"\s+", "", token)
+    if parent_compact == token_compact:
+        return False
     lines = [ln.strip() for ln in parent_text.split("\n") if ln.strip()]
     if len(lines) >= 2 and token in {"A", "B", "C"}:
         for i, ln in enumerate(lines):
@@ -389,6 +412,199 @@ def _token_matches_sublabel(token: str) -> bool:
     return bool(_CHEM_NAME_RE.fullmatch(t))
 
 
+def _make_label_sibling(
+    parent: Dict[str, Any],
+    row: int,
+    *,
+    cells: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """在父格右侧插入空品名原子格（逻辑列紧挨父格）。"""
+    pcs = int(parent["col_start"])
+    pce = int(parent["col_end"])
+    dest_col = pce + 1
+    # 若目标列已被占用，仍复用该列起点插入单列格（后续 peel 填字）
+    try:
+        px1, py1, px2, py2 = _bbox(parent)
+    except (TypeError, ValueError):
+        px1, py1, px2, py2 = 0.0, 0.0, 80.0, 40.0
+    pw = max(px2 - px1, 1.0)
+    ph = max(py2 - py1, 1.0)
+    prs, pre = int(parent["row_start"]), int(parent["row_end"])
+    n_rows = max(1, pre - prs + 1)
+    row_h = ph / n_rows
+    y1 = py1 + (row - prs) * row_h
+    y2 = y1 + row_h
+    # 右侧邻格左缘优先，否则按父宽比例估算
+    right_x = None
+    for c in cells:
+        if c is parent:
+            continue
+        if int(c["row_start"]) > row or int(c["row_end"]) < row:
+            continue
+        if int(c["col_start"]) <= pce:
+            continue
+        try:
+            cx1, _, _, _ = _bbox(c)
+        except (TypeError, ValueError):
+            continue
+        if cx1 > px2 - 1:
+            right_x = cx1 if right_x is None else min(right_x, cx1)
+    if right_x is None or right_x <= px2 + 2:
+        w = min(
+            _INSERT_LABEL_MAX_PX,
+            max(_INSERT_LABEL_MIN_PX, pw * _INSERT_LABEL_WIDTH_RATIO),
+        )
+        right_x = px2 + w
+    poly = np.array(
+        [[px2, y1], [right_x, y1], [right_x, y2], [px2, y2]],
+        dtype=np.float64,
+    )
+    return {
+        "polygon": poly,
+        "row_start": row,
+        "row_end": row,
+        "col_start": dest_col,
+        "col_end": dest_col,
+        "row_span": 1,
+        "col_span": 1,
+        "texts": [],
+        "text": "",
+    }
+
+
+def _ensure_compound_label_siblings(
+    parent: Dict[str, Any],
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """(b)/(c) 大父格右侧缺品名格时按原子行插入空格。"""
+    compact = re.sub(r"\s+", "", str(parent.get("text") or ""))
+    need_b = bool(_B_COMPOUND_PARENT_RE.search(compact)) or (
+        "化合物" in compact and bool(_CHEM_NAME_FIND_RE.search(compact))
+    )
+    need_c = bool(_C_COMPOUND_PARENT_RE.search(compact))
+    if not need_b and not need_c:
+        return cells
+    prs, pre = int(parent["row_start"]), int(parent["row_end"])
+    pce = int(parent["col_end"])
+    dest = pce + 1
+    # (b) 只补首行；(c) 补每一原子行
+    rows = list(range(prs, pre + 1)) if need_c else [prs]
+    inserted = 0
+    for row in rows:
+        exists = any(
+            int(c["row_start"]) == row
+            and int(c["row_end"]) == row
+            and int(c["col_start"]) == dest
+            for c in cells
+        )
+        if exists:
+            continue
+        cells.append(_make_label_sibling(parent, row, cells=cells))
+        inserted += 1
+    if inserted:
+        logger.info(
+            "左行头补品名格: parent=(%s,%s) +%d",
+            parent.get("row_start"),
+            parent.get("col_start"),
+            inserted,
+        )
+    return cells
+
+
+def _abc_letter_target(
+    parent: Dict[str, Any],
+    cells: List[Dict[str, Any]],
+    letter: str,
+) -> Optional[Dict[str, Any]]:
+    """rowspan=3 时 A/B/C 分别对应父格首/中/末行的右侧标签格。"""
+    prs, pre = int(parent["row_start"]), int(parent["row_end"])
+    dest = int(parent["col_end"]) + 1
+    want_row: Optional[int] = None
+    if pre - prs == 2:
+        want_row = {"A": prs, "B": prs + 1, "C": pre}.get(letter)
+    if want_row is None:
+        return None
+    for c in cells:
+        if c is parent:
+            continue
+        if int(c["row_start"]) != want_row or int(c["row_end"]) != want_row:
+            continue
+        if int(c["col_start"]) == dest:
+            return c
+    return None
+
+
+def _peel_glued_abc_from_parent(
+    parent: Dict[str, Any],
+    siblings: List[Dict[str, Any]],
+    cells: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    """从 (c)醌二A / 叠氮化合B 等粘连行末尾抽出 A/B/C。"""
+    parent_text = str(parent.get("text") or "").strip()
+    if not _C_COMPOUND_PARENT_RE.search(re.sub(r"\s+", "", parent_text)):
+        return 0
+    abc_sibs = sorted(
+        [s for s in siblings if _is_empty_or_frag(s)],
+        key=lambda c: int(c["row_start"]),
+    )
+    lines = [ln.strip() for ln in parent_text.split("\n") if ln.strip()]
+    # 已有独立 A/B/C 行时交给后续逻辑，避免与粘连末字母双重剥离
+    if any(re.sub(r"\s+", "", ln) in {"A", "B", "C"} for ln in lines):
+        return 0
+    peeled = 0
+    sib_i = 0
+    new_lines: List[str] = []
+    for ln in lines:
+        compact_ln = re.sub(r"\s+", "", ln)
+        letter: Optional[str] = None
+        rest = ln
+        m = re.search(r"([ABC])$", compact_ln)
+        if m:
+            letter = m.group(1)
+            rest = re.sub(r"[ABC]\s*$", "", ln).rstrip()
+        if letter is None or not rest:
+            new_lines.append(ln)
+            continue
+        target = None
+        if cells:
+            target = _abc_letter_target(parent, cells, letter)
+        existing = str((target or {}).get("text") or "").strip()
+        if target is not None and existing == letter:
+            new_lines.append(rest)
+            peeled += 1
+            continue
+        if target is not None and (not existing or _is_empty_or_frag(target)):
+            target["text"] = letter
+            target["texts"] = list(target.get("texts") or [])
+            new_lines.append(rest)
+            peeled += 1
+            logger.info(
+                "左行头粘连字母剥离: %r → (%s,%s)",
+                letter,
+                target.get("row_start"),
+                target.get("col_start"),
+            )
+            continue
+        if sib_i < len(abc_sibs):
+            target = abc_sibs[sib_i]
+            target["text"] = letter
+            target["texts"] = list(target.get("texts") or [])
+            new_lines.append(rest)
+            sib_i += 1
+            peeled += 1
+            logger.info(
+                "左行头粘连字母剥离: %r → (%s,%s)",
+                letter,
+                target.get("row_start"),
+                target.get("col_start"),
+            )
+        else:
+            new_lines.append(ln)
+    if peeled:
+        parent["text"] = "\n".join(new_lines).strip()
+    return peeled
+
+
 def peel_row_header_text(
     cells: List[Dict[str, Any]],
     text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
@@ -410,7 +626,16 @@ def peel_row_header_text(
     ]
     peeled = 0
 
+    # 先为 (b)/(c) 补品名空格，再 peel
     for parent in parents:
+        _ensure_compound_label_siblings(parent, cells)
+
+    for parent in parents:
+        # 父格整段即子标签（如「苯胺」colspan=2）：勿当 peel 源清空
+        parent_compact = re.sub(r"\s+", "", str(parent.get("text") or ""))
+        if parent_compact and _is_known_sublabel_text(parent_compact):
+            continue
+
         siblings = _empty_siblings(parent, cells)
         if not siblings:
             continue
@@ -482,6 +707,9 @@ def peel_row_header_text(
                     if not m:
                         continue
                     token = m.group(0)
+                    # 勿把父格自身整段标签剥到兄弟格
+                    if re.sub(r"\s+", "", parent_text) == re.sub(r"\s+", "", token):
+                        continue
                     if _peel_text_token_from_parent(parent, token, sib):
                         parent_text = str(parent.get("text") or "")
                         peeled += 1
@@ -495,7 +723,11 @@ def peel_row_header_text(
         # (b)化合物 父格粘连品名：先剥化学名，再规范父格为 (b)化合物
         parent_text = str(parent.get("text") or "").strip()
         compact_p = re.sub(r"\s+", "", parent_text)
-        if _B_COMPOUND_PARENT_RE.search(compact_p):
+        if _B_COMPOUND_PARENT_RE.search(compact_p) or (
+            "化合物" in compact_p and _CHEM_NAME_FIND_RE.search(compact_p)
+        ):
+            # 刷新 siblings（可能刚插入）
+            siblings = _empty_siblings(parent, cells)
             for sib in sorted(siblings, key=lambda c: int(c["row_start"])):
                 if not _is_empty_or_frag(sib):
                     continue
@@ -505,10 +737,14 @@ def peel_row_header_text(
                     compact_p = re.sub(r"\s+", "", parent_text)
                     peeled += 1
                     break
-            if re.search(r"[\(（][bB][\)）]", compact_p):
-                parent["text"] = "(b)化合物"
+            if re.search(r"[\(（][bB][\)）]", compact_p) or "化合物" in compact_p:
+                if re.search(r"[\(（][bB][\)）]", compact_p):
+                    parent["text"] = "(b)化合物"
 
-        # (c)醌二叠氮：按行顺序剥 A/B/C 到空兄弟格
+        # (c)醌二叠氮：粘连字母 + 独立 A/B/C
+        siblings = _empty_siblings(parent, cells)
+        glued = _peel_glued_abc_from_parent(parent, siblings, cells)
+        peeled += glued
         parent_text = str(parent.get("text") or "").strip()
         if _C_COMPOUND_PARENT_RE.search(re.sub(r"\s+", "", parent_text)):
             abc_sibs = sorted(
@@ -523,7 +759,6 @@ def peel_row_header_text(
             for sib in abc_sibs:
                 if not lines:
                     break
-                # 跳过首行父标签，只剥独立 A/B/C 行
                 while lines and lines[0] not in {"A", "B", "C"}:
                     lines.pop(0)
                 if not lines or lines[0] not in {"A", "B", "C"}:
@@ -533,13 +768,19 @@ def peel_row_header_text(
                     lines.pop(0)
                     peeled += 1
 
+    for parent in parents:
+        compact_c = re.sub(r"\s+", "", str(parent.get("text") or ""))
+        if "醌二" in compact_c:
+            parent["text"] = "(c)醌二叠氮化合物"
+            _fill_missing_c_compound_b(parent, cells)
+
     if peeled:
         logger.info("左行头文本剥离完成: %d 次", peeled)
     return relocate_misplaced_category_labels(cells)
 
 
-_CATEGORY_LABELS = frozenset({"封端剂", "封剂"})
-_SUBROW_LABELS = frozenset({"苯胺"})
+# 保留别名供测试/外部引用（常量已上移）
+# _CATEGORY_LABELS / _SUBROW_LABELS 定义见文件顶部
 
 
 def relocate_misplaced_category_labels(
@@ -599,6 +840,7 @@ def relocate_misplaced_category_labels(
 
     if moved:
         logger.info("类别行头归位: %d 次", moved)
+    cells = _relocate_photosensitive_section_prefix(cells)
     return _relocate_misplaced_subrow_labels(_normalize_truncated_chem_names(cells))
 
 
@@ -639,11 +881,112 @@ def _relocate_misplaced_subrow_labels(cells: List[Dict[str, Any]]) -> List[Dict[
 
 
 def _normalize_truncated_chem_names(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """修正格内常见化学名 OCR 截断（如 ER828 → jER828）。"""
+    """修正格内常见化学名 OCR 截断（如 ER828 → jER828、端MAP → MAP）。"""
     for c in cells:
         t = str(c.get("text") or "")
         if re.search(r"(?<![jJ])ER828", t):
-            c["text"] = re.sub(r"(?<![jJ])ER828", "jER828", t)
+            t = re.sub(r"(?<![jJ])ER828", "jER828", t)
+        t = re.sub(r"端\s*MAP\b", "MAP", t)
+        c["text"] = t
+    return cells
+
+
+def _fill_missing_c_compound_b(
+    parent: Dict[str, Any],
+    cells: List[Dict[str, Any]],
+) -> None:
+    """(c) 父格 rowspan=3 且子标签为 A / 空 / C 时补 B。"""
+    prs, pre = int(parent["row_start"]), int(parent["row_end"])
+    if pre - prs != 2:
+        return
+    dest = int(parent["col_end"]) + 1
+    by_row: Dict[int, Dict[str, Any]] = {}
+    for c in cells:
+        if c is parent:
+            continue
+        if int(c["row_start"]) != int(c["row_end"]):
+            continue
+        r = int(c["row_start"])
+        if r < prs or r > pre:
+            continue
+        if int(c["col_start"]) != dest:
+            continue
+        by_row[r] = c
+    if not all(r in by_row for r in range(prs, pre + 1)):
+        grouped: Dict[int, Dict[int, Dict[str, Any]]] = {}
+        for c in cells:
+            if c is parent:
+                continue
+            if int(c["row_start"]) != int(c["row_end"]):
+                continue
+            r = int(c["row_start"])
+            if r < prs or r > pre:
+                continue
+            t = str(c.get("text") or "").strip()
+            if t not in {"", "A", "B", "C"}:
+                continue
+            grouped.setdefault(int(c["col_start"]), {})[r] = c
+        by_row = {}
+        for _col, rows in sorted(grouped.items()):
+            if all(k in rows for k in range(prs, pre + 1)):
+                t0 = str(rows[prs].get("text") or "").strip()
+                t2 = str(rows[pre].get("text") or "").strip()
+                if t0 == "A" and t2 == "C":
+                    by_row = rows
+                    break
+    if not all(r in by_row for r in range(prs, pre + 1)):
+        return
+    t0 = str(by_row[prs].get("text") or "").strip()
+    t1 = str(by_row[prs + 1].get("text") or "").strip()
+    t2 = str(by_row[pre].get("text") or "").strip()
+    if t0 == "A" and t2 == "C" and not t1:
+        by_row[prs + 1]["text"] = "B"
+
+
+_PHOTOSENSITIVE_A_RE = re.compile(
+    r"^感光性组\s*[（(]\s*a\s*[)）]\s*聚酰亚胺$",
+    re.I,
+)
+
+
+def _relocate_photosensitive_section_prefix(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """把 (a) 格前缀「感光性组」挪回左侧大类行头。"""
+    donor: Optional[Dict[str, Any]] = None
+    for c in cells:
+        compact = re.sub(r"\s+", "", str(c.get("text") or "").strip())
+        if _PHOTOSENSITIVE_A_RE.fullmatch(compact) or (
+            compact.startswith("感光性组")
+            and "聚酰亚胺" in compact
+            and re.search(r"[（(]a[)）]", compact, re.I)
+        ):
+            donor = c
+            raw = str(c.get("text") or "")
+            c["text"] = re.sub(r"^感光性组\s*", "", raw).strip()
+            break
+    if donor is None:
+        return cells
+    rs = int(donor["row_start"])
+    best: Optional[Dict[str, Any]] = None
+    for p in cells:
+        if p is donor:
+            continue
+        if int(p["col_start"]) != 0:
+            continue
+        if int(p["row_start"]) > rs or int(p["row_end"]) < rs:
+            continue
+        rsp = int(p.get("row_span") or (int(p["row_end"]) - int(p["row_start"]) + 1))
+        if rsp < 2:
+            continue
+        best = p
+        break
+    if best is None:
+        return cells
+    pt = re.sub(r"\s+", "", str(best.get("text") or ""))
+    if "感光性组合物组成" not in pt:
+        best["text"] = "感光性组合物组成（重量份）"
+        logger.info("感光性组合物组成行头归位")
     return cells
 
 

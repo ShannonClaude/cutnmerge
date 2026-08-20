@@ -16,6 +16,8 @@ sys.path.insert(0, str(ROOT))
 from src.matching.matching import (  # noqa: E402
     _parse_sticky_column_parts,
     _split_sticky_column_header,
+    _split_wufapingjia_glued,
+    detect_eval_symbols_in_empty_cells,
 )
 from src.output.html_formatter import (  # noqa: E402
     _collapse_header_empty_corners,
@@ -23,6 +25,7 @@ from src.output.html_formatter import (  # noqa: E402
     _merge_leading_empty_into_label,
     _repair_lone_example_number_headers,
     _resolve_logic_overlaps,
+    _split_example_header_rowspans,
     cells_to_html_table,
 )
 from src.ocr.ocr_post import normalize_ocr_text  # noqa: E402
@@ -526,6 +529,45 @@ def test_sticky_strip_bare_example_prefix():
     assert any("比较例" in p for p in parts)
 
 
+def test_p24_stub_ghost_column_covered():
+    """P24：行头区多出的 A/B/C 列不应在 ODPA/其他/分辨率行切出空 td。"""
+    cells = [
+        _cell(0, 1, 4, 4, "实施例 1", 320, 400, 0, 40),
+        _cell(0, 1, 5, 5, "实施例 2", 400, 480, 0, 40),
+        _cell(0, 0, 0, 3, "项目", 0, 320, 0, 20),
+        _cell(1, 1, 0, 3, "聚酰亚胺", 0, 320, 20, 40),
+        _cell(2, 5, 0, 0, "聚酰亚胺组成", 0, 80, 40, 160),
+        _cell(2, 3, 1, 1, "酸酐", 80, 160, 40, 80),
+        _cell(2, 2, 2, 2, "ODPA", 160, 240, 40, 60),
+        _cell(2, 2, 3, 3, "", 240, 320, 40, 60),
+        _cell(2, 2, 4, 4, "100", 320, 400, 40, 60),
+        _cell(2, 2, 5, 5, "100", 400, 480, 40, 60),
+        _cell(3, 3, 2, 2, "BPDA", 160, 240, 60, 80),
+        _cell(3, 3, 3, 3, "", 240, 320, 60, 80),
+        _cell(3, 3, 4, 4, "-", 320, 400, 60, 80),
+        _cell(4, 4, 1, 2, "(c)醌二叠氮化合物", 80, 240, 80, 100),
+        _cell(4, 4, 3, 3, "C", 240, 320, 80, 100),
+        _cell(4, 4, 4, 4, "-", 320, 400, 80, 100),
+        _cell(5, 5, 1, 1, "其他", 80, 160, 100, 120),
+        _cell(5, 5, 2, 2, "", 160, 240, 100, 120),
+        _cell(5, 5, 3, 3, "合成例 10 的丙烯酸树脂溶液", 240, 320, 100, 120),
+        _cell(5, 5, 4, 4, "5", 320, 400, 100, 120),
+        _cell(6, 6, 0, 2, "分辨率(μm)", 0, 240, 120, 140),
+        _cell(6, 6, 4, 4, "25", 320, 400, 120, 140),
+        _cell(7, 7, 1, 1, "(b)化合物", 80, 160, 140, 160),
+        _cell(7, 7, 3, 3, "OXT-191", 240, 320, 140, 160),
+        _cell(7, 7, 4, 4, "20", 320, 400, 140, 160),
+    ]
+    html = cells_to_html_table(cells)
+    assert not re.search(r"<td>ODPA</td>\s*<td></td>", html), html
+    assert re.search(r'colspan="2"[^>]*>ODPA', html), html
+    assert not re.search(r"<td>其他</td>\s*<td></td>", html), html
+    assert "合成例 10" in html
+    assert not re.search(r"分辨率\(μm\)</td>\s*<td></td>", html), html
+    assert re.search(r'colspan="4"[^>]*>分辨率', html), html
+    assert re.search(r"<td>C</td>", html), html
+
+
 def test_p24_header_empty_corners_collapsed():
     """P24/P25：表头角格并入项目/聚酰亚胺，不出现 3 连空 td + 独立项目。"""
     cells = [
@@ -581,9 +623,167 @@ def test_relocate_aniline_subrow_label():
     assert texts.get(4, "").strip() == ""
 
 
-def test_wufapingjia_glued_number_stripped():
-    assert normalize_ocr_text("无法评价40") == "无法评价"
-    assert normalize_ocr_text("无法评价21") == "无法评价"
+def test_wufapingjia_tail_to_right_on_adhesion_stress_rows():
+    """粘合/应力行：无法评价+尾数或独立数字应写入右邻空列。"""
+    from src.matching.matching import assign_texts_to_cells
+
+    import numpy as np
+
+    cells = [
+        _cell(0, 0, 0, 3, "粘合强度（MPa）", 0, 320, 0, 30),
+        _cell(0, 0, 4, 4, "", 320, 400, 0, 30),
+        _cell(0, 0, 5, 5, "", 400, 480, 0, 30),
+        _cell(1, 1, 0, 3, "应力（MPa）", 0, 320, 30, 60),
+        _cell(1, 1, 4, 4, "", 320, 400, 30, 60),
+        _cell(1, 1, 5, 5, "", 400, 480, 30, 60),
+    ]
+    boxes = [
+        {
+            "text": "无法评价",
+            "polygon": np.array(
+                [[330.0, 5.0], [390.0, 5.0], [390.0, 25.0], [330.0, 25.0]],
+                dtype=np.float64,
+            ),
+            "score": 0.9,
+        },
+        {
+            "text": "21",
+            "polygon": np.array(
+                [[410.0, 5.0], [470.0, 5.0], [470.0, 25.0], [410.0, 25.0]],
+                dtype=np.float64,
+            ),
+            "score": 0.9,
+        },
+        {
+            "text": "无法评价25",
+            "polygon": np.array(
+                [[330.0, 35.0], [470.0, 35.0], [470.0, 55.0], [330.0, 55.0]],
+                dtype=np.float64,
+            ),
+            "score": 0.9,
+        },
+    ]
+    out, _ = assign_texts_to_cells([dict(c) for c in cells], boxes)
+    texts = {
+        (int(c["row_start"]), int(c["col_start"])): str(c.get("text") or "").strip()
+        for c in out
+    }
+    assert texts.get((0, 4)) == "无法评价", texts
+    assert texts.get((0, 5)) == "21", texts
+    assert texts.get((1, 4)) == "无法评价", texts
+    assert texts.get((1, 5)) == "25", texts
+
+
+def test_wufapingjia_tail_to_right_on_resolution_row():
+    """IoA 只落一格时，分辨率行尾数写入右邻空列。"""
+    from src.matching.matching import assign_texts_to_cells
+
+    cells = [
+        _cell(0, 0, 0, 3, "分辨率（μm）", 0, 320, 0, 30),
+        _cell(0, 0, 4, 4, "", 320, 400, 0, 30),
+        _cell(0, 0, 5, 5, "", 400, 480, 0, 30),
+    ]
+    import numpy as np
+
+    tb = {
+        "text": "无法评价40",
+        "polygon": np.array(
+            [[330.0, 5.0], [470.0, 5.0], [470.0, 25.0], [330.0, 25.0]],
+            dtype=np.float64,
+        ),
+        "score": 0.9,
+    }
+    out, _ = assign_texts_to_cells([dict(c) for c in cells], [tb])
+    texts = {int(c["col_start"]): str(c.get("text") or "").strip() for c in out}
+    assert texts.get(4) == "无法评价", texts
+    assert texts.get(5) == "40", texts
+
+
+def test_wufapingjia_glued_number_split():
+    """无法评价+数字跨两列切开；单格丢掉尾数；normalize 不再整段删数字。"""
+    import numpy as np
+
+    assert normalize_ocr_text("无法评价40") == "无法评价40"
+    assert normalize_ocr_text("无法评价21") == "无法评价21"
+
+    two_cols = [
+        _cell(0, 0, 0, 0, "", 0, 100, 0, 30),
+        _cell(0, 0, 1, 1, "", 100, 200, 0, 30),
+    ]
+    tb = {
+        "text": "无法评价40",
+        "polygon": np.array(
+            [[10.0, 5.0], [190.0, 5.0], [190.0, 25.0], [10.0, 25.0]],
+            dtype=np.float64,
+        ),
+        "score": 0.9,
+    }
+    pieces = _split_wufapingjia_glued(tb, two_cols)
+    assert pieces is not None
+    assert [p["text"] for p in pieces] == ["无法评价", "40"]
+
+    one_col = [_cell(0, 0, 0, 0, "", 0, 200, 0, 30)]
+    pieces = _split_wufapingjia_glued(tb, one_col)
+    assert pieces is not None
+    assert len(pieces) == 1
+    assert pieces[0]["text"] == "无法评价"
+
+
+def test_eval_symbols_skip_numeric_metric_row():
+    """分辨率行已有数字时，空格不得被轮廓填成 ◎。"""
+    import cv2
+    import numpy as np
+
+    img = np.zeros((40, 300), dtype=np.uint8)
+    cv2.circle(img, (250, 20), 10, 255, 2)
+    cv2.circle(img, (250, 20), 5, 255, 1)
+    cells = [
+        _cell(0, 0, 0, 0, "分辨率", 0, 80, 0, 40),
+        _cell(0, 0, 1, 1, "21", 80, 160, 0, 40),
+        _cell(0, 0, 2, 2, "40", 160, 220, 0, 40),
+        _cell(0, 0, 3, 3, "", 220, 300, 0, 40),
+    ]
+    out = detect_eval_symbols_in_empty_cells([dict(c) for c in cells], img)
+    empty = next(c for c in out if int(c["col_start"]) == 3)
+    assert str(empty.get("text") or "").strip() == ""
+
+
+def test_peel_c_fills_missing_b():
+    """(c) 已有 A/C、中间空时补 B，父格规范为醌二叠氮化合物。"""
+    cells = [
+        _cell(21, 23, 0, 1, "(c)醌二A", 0, 160, 400, 460),
+        _cell(21, 21, 2, 2, "A", 160, 280, 400, 420),
+        _cell(22, 22, 2, 2, "", 160, 280, 420, 440),
+        _cell(23, 23, 2, 2, "C", 160, 280, 440, 460),
+    ]
+    out = peel_row_header_text([dict(c) for c in cells])
+    texts = {
+        (int(c["row_start"]), int(c["col_start"])): str(c.get("text") or "").strip()
+        for c in out
+    }
+    assert texts.get((21, 2)) == "A"
+    assert texts.get((22, 2)) == "B"
+    assert texts.get((23, 2)) == "C"
+    parent = next(c for c in out if int(c["col_start"]) == 0)
+    ptxt = re.sub(r"\s+", "", str(parent.get("text") or ""))
+    assert ptxt == "(c)醌二叠氮化合物"
+
+
+def test_relocate_photosensitive_section_and_map():
+    """感光性组前缀归位大类行头；端MAP → MAP。"""
+    cells = [
+        _cell(2, 13, 0, 0, "合物组成(重量份）", 0, 80, 60, 400),
+        _cell(2, 2, 1, 3, "感光性组（a）聚酰亚胺", 80, 280, 60, 90),
+        _cell(8, 8, 1, 1, "端MAP", 80, 160, 200, 230),
+    ]
+    out = peel_row_header_text([dict(c) for c in cells])
+    section = next(c for c in out if int(c["col_start"]) == 0)
+    assert "感光性组合物组成" in re.sub(r"\s+", "", str(section.get("text") or ""))
+    a_cell = next(c for c in out if int(c["row_start"]) == 2 and int(c["col_start"]) == 1)
+    assert not str(a_cell.get("text") or "").startswith("感光性组")
+    assert "聚酰亚胺" in str(a_cell.get("text") or "")
+    map_cell = next(c for c in out if int(c["row_start"]) == 8)
+    assert str(map_cell.get("text") or "").strip() == "MAP"
 
 
 def test_explode_sticky_header_wide_cell():
@@ -662,6 +862,74 @@ def test_p40_unmerge_aa_rowspan():
     assert all(int(c["row_span"]) == 1 for c in out)
 
 
+def test_example_header_does_not_swallow_letter_row():
+    """P24：实施例不得 rowspan 吞掉下层 A/B/C 数据字母。"""
+    cells = [
+        _cell(0, 0, 0, 3, "项目", 0, 320, 0, 30),
+        _cell(0, 1, 4, 4, "实施例 1", 320, 400, 0, 60),
+        _cell(0, 1, 5, 5, "实施例 2", 400, 480, 0, 60),
+        _cell(1, 1, 0, 3, "聚酰亚胺", 0, 320, 30, 60),
+        _cell(1, 1, 4, 4, "A", 320, 400, 30, 60),
+        _cell(1, 1, 5, 5, "B", 400, 480, 30, 60),
+    ]
+    split = _split_example_header_rowspans([dict(c) for c in cells])
+    assert all(
+        int(c["row_span"]) == 1
+        for c in split
+        if "实施例" in str(c.get("text") or "")
+    )
+    html = cells_to_html_table([dict(c) for c in cells])
+    assert not re.search(r'rowspan="2"[^>]*>实施例', html), html
+    assert re.search(r"<td>A</td>", html), html
+    assert re.search(r"<td>B</td>", html), html
+    assert "聚酰亚胺" in html
+
+
+def test_peel_aniline_not_self_cleared():
+    """苯胺 colspan=2 不得被 peel 清空。"""
+    cells = [
+        _cell(10, 10, 1, 2, "苯胺", 80, 240, 190, 210),
+        _cell(10, 10, 3, 3, "-", 240, 320, 190, 210),
+    ]
+    out = peel_row_header_text([dict(c) for c in cells])
+    texts = {str(c.get("text") or "").strip() for c in out}
+    assert "苯胺" in texts
+
+
+def test_peel_b_inserts_sibling_for_jer828():
+    """(b) 粘连 jER828 且无兄弟格时插入后剥离。"""
+    parent = _cell(14, 20, 0, 1, "化合物jER828\n(b)", 0, 160, 280, 420)
+    # 仅有后续品名行，首行无标签格
+    child = _cell(15, 15, 2, 2, "OXT-191", 160, 280, 300, 320)
+    out = peel_row_header_text([dict(parent), dict(child)])
+    texts = {str(c.get("text") or "").strip() for c in out}
+    assert "jER828" in texts
+    parent_out = next(c for c in out if int(c["row_start"]) == 14 and int(c["col_start"]) == 0)
+    assert "jER828" not in str(parent_out.get("text") or "")
+    assert "(b)化合物" in re.sub(r"\s+", "", str(parent_out.get("text") or ""))
+
+
+def test_peel_c_glued_ab_letters():
+    """(c)醌二A / 叠氮化合B 粘连字母应剥到子行。"""
+    cells = [
+        _cell(21, 23, 0, 1, "(c)醌二A\n叠氮化合B\n物", 0, 160, 400, 460),
+        _cell(23, 23, 2, 2, "C", 160, 280, 440, 460),
+    ]
+    out = peel_row_header_text([dict(c) for c in cells])
+    by_row = {
+        int(c["row_start"]): str(c.get("text") or "").strip()
+        for c in out
+        if int(c["col_start"]) >= 2
+    }
+    assert by_row.get(21) == "A", by_row
+    assert by_row.get(22) == "B", by_row
+    assert by_row.get(23) == "C", by_row
+    parent = next(c for c in out if int(c["col_start"]) == 0)
+    ptxt = re.sub(r"\s+", "", str(parent.get("text") or ""))
+    assert not ptxt.endswith("A")
+    assert "B" not in ptxt or "叠氮" in ptxt
+
+
 def main() -> int:
     test_body_left_stub_does_not_merge_column_headers()
     test_p100_fensan_still_merges_in_header_band()
@@ -683,11 +951,17 @@ def main() -> int:
     test_p26x194_ghost_col0_dropped()
     test_p26x194_header_corner_not_merged()
     test_p26x194_tsr_colspan2_header_split()
+    test_p24_stub_ghost_column_covered()
     test_p24_header_empty_corners_collapsed()
     test_peel_b_compound_colspan2_parent()
     test_peel_c_abc_sublabels()
     test_relocate_aniline_subrow_label()
-    test_wufapingjia_glued_number_stripped()
+    test_wufapingjia_glued_number_split()
+    test_wufapingjia_tail_to_right_on_resolution_row()
+    test_wufapingjia_tail_to_right_on_adhesion_stress_rows()
+    test_eval_symbols_skip_numeric_metric_row()
+    test_peel_c_fills_missing_b()
+    test_relocate_photosensitive_section_and_map()
     test_p98_aligned_body_colspan_kept()
     test_relocate_fengduanji_from_data_column()
     test_sticky_column_header_split_wide_merged()
@@ -698,6 +972,10 @@ def main() -> int:
     test_extend_section_rowspan_over_metric_rows()
     test_p40_aa_independent_label_parse()
     test_p40_unmerge_aa_rowspan()
+    test_example_header_does_not_swallow_letter_row()
+    test_peel_aniline_not_self_cleared()
+    test_peel_b_inserts_sibling_for_jer828()
+    test_peel_c_glued_ab_letters()
     print("OK: row header tests passed")
     return 0
 

@@ -30,6 +30,10 @@ _NOISE_CELL_RE = re.compile(r"^[A-Za-z]$|^[·•\.\,;:]$")
 _DATA_VALUE_RE = re.compile(
     r"^(?:[-–—−~～]|[-–—−]?\d+(?:\.\d+)?(?:\s*[\/／]\s*\d+(?:\.\d+)?)?|[A-Za-z][+＋]?)$"
 )
+_LETTER_DATA_RE = re.compile(r"^[A-Za-z][+＋]?$")
+_EXAMPLE_COL_HEADER_RE = re.compile(
+    r"(合成例|实施例|実施例|比較例|比较例|对照例|参考例)"
+)
 
 
 def _cell_key(cell: Dict[str, Any]) -> Tuple[int, int, int, int]:
@@ -468,16 +472,42 @@ def _empty_atomic_from_bbox(
     }
 
 
+def _first_example_data_column(cells: Sequence[Dict[str, Any]]) -> Optional[int]:
+    """表头带内实施例/比较例/参考例列头的最小 col_start（须 ≥1）。
+
+    用于区分左侧行头区与数据区。列头落在第 0 列（行索引表）时返回 None，
+    避免把空数据格当行头空隙吞掉。
+    """
+    if not cells:
+        return None
+    header_end = _effective_header_end(cells)
+    first: Optional[int] = None
+    for cell in cells:
+        if int(cell["row_start"]) > header_end:
+            continue
+        cs = int(cell["col_start"])
+        if cs < 1:
+            continue
+        if not _HEADER_HAS_EXAMPLE_RE.search(str(cell.get("text") or "")):
+            continue
+        if first is None or cs < first:
+            first = cs
+    return first
+
+
 def _split_label_over_data_columns(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     身行标签 colspan 盖住其他行已有数字的数据列时，收到左缘并补空格。
 
     保留与表头同区间的真合并（P98 NC-7000L）；不拆表头带。
+    若能定位实施例列头，则仅当 colspan 伸进该列及以右时才裁切，
+    避免把行头区的 A/B/C 子列当成数据列。
     """
     if len(cells) < 2:
         return cells
     header_end = _effective_header_end(cells)
     aligned = _header_colspan_spans(cells)
+    first_data = _first_example_data_column(cells)
     extras: List[Dict[str, Any]] = []
     changed = 0
     for cell in cells:
@@ -494,6 +524,9 @@ def _split_label_over_data_columns(cells: List[Dict[str, Any]]) -> List[Dict[str
         clip_end = cs
         hit_data = False
         for col in range(cs + 1, ce + 1):
+            if first_data is not None and col < first_data:
+                clip_end = col
+                continue
             if _column_has_data_values(cells, col, skip_rows={rs}):
                 hit_data = True
                 break
@@ -842,12 +875,85 @@ def _merge_leading_empty_into_label(cells: List[Dict[str, Any]]) -> List[Dict[st
     return [c for c in cells if not c.get("_drop_render")]
 
 
+def _cover_stub_column_gaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """行头区内：把空原子格与未覆盖逻辑格并入左侧同行标签，不跨数据列。"""
+    first_data = _first_example_data_column(cells)
+    if first_data is None or first_data <= 1:
+        return cells
+
+    header_end = _effective_header_end(cells)
+    occupancy: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    max_row = 0
+    for cell in cells:
+        if cell.get("_drop_render"):
+            continue
+        rs, re = int(cell["row_start"]), int(cell["row_end"])
+        cs, ce = int(cell["col_start"]), int(cell["col_end"])
+        max_row = max(max_row, re)
+        for r in range(rs, re + 1):
+            for c in range(cs, ce + 1):
+                occupancy[(r, c)] = cell
+
+    for row in range(header_end + 1, max_row + 1):
+        col = 0
+        while col < first_data:
+            owner = occupancy.get((row, col))
+            if (
+                owner is None
+                or owner.get("_drop_render")
+                or int(owner["row_start"]) != row
+                or int(owner["row_end"]) != row
+                or int(owner["col_start"]) != col
+                or not str(owner.get("text") or "").strip()
+            ):
+                col += 1
+                continue
+            end = int(owner["col_end"])
+            absorbed: List[Dict[str, Any]] = []
+            j = end + 1
+            while j < first_data:
+                nxt = occupancy.get((row, j))
+                if nxt is not None and nxt.get("_drop_render"):
+                    nxt = None
+                if nxt is None:
+                    end = j
+                    j += 1
+                    continue
+                if nxt is owner:
+                    j += 1
+                    continue
+                if int(nxt["row_start"]) != row:
+                    break
+                if str(nxt.get("text") or "").strip():
+                    break
+                if int(nxt.get("col_span") or 1) != 1:
+                    break
+                absorbed.append(nxt)
+                end = int(nxt["col_end"])
+                j = end + 1
+            if end > int(owner["col_end"]):
+                owner["col_end"] = end
+                owner["col_span"] = end - int(owner["col_start"]) + 1
+                for a in absorbed:
+                    a["_drop_render"] = True
+                for c in range(int(owner["col_start"]), end + 1):
+                    occupancy[(row, c)] = owner
+            col = int(owner["col_end"]) + 1
+    return [c for c in cells if not c.get("_drop_render")]
+
+
 def _merge_leading_label_gaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """把同行右侧连续空原子格并进左侧标签；身列已有数字的空格不吞。"""
+    """把同行右侧连续空原子格并进左侧标签；身列已有数字的空格不吞。
+
+    能定位实施例列头时，只在行头区补 colspan（含未覆盖逻辑格），不跨数据列。
+    """
     if not cells:
         return cells
+    work = _cover_stub_column_gaps(cells)
+    first_data = _first_example_data_column(work)
+
     by_row: Dict[int, List[Dict[str, Any]]] = {}
-    for cell in cells:
+    for cell in work:
         if int(cell["row_start"]) != int(cell["row_end"]):
             continue
         by_row.setdefault(int(cell["row_start"]), []).append(cell)
@@ -867,7 +973,9 @@ def _merge_leading_label_gaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
             if str(cell.get("text") or "").strip():
                 break
             col = int(cell["col_start"])
-            if _column_has_data_values(cells, col, skip_rows={row_idx}):
+            if first_data is not None and col >= first_data:
+                break
+            if _column_has_data_values(work, col, skip_rows={row_idx}):
                 break
             merge_until = int(cell["col_end"])
             absorbed.append(cell)
@@ -877,7 +985,7 @@ def _merge_leading_label_gaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
         first["col_span"] = int(first["col_end"]) - int(first["col_start"]) + 1
         for cell in absorbed:
             cell["_drop_render"] = True
-    return [c for c in cells if not c.get("_drop_render")]
+    return [c for c in work if not c.get("_drop_render")]
 
 
 def _cell_physical_bbox_x_y(cell: Dict[str, Any]) -> Tuple[float, float, float, float]:
@@ -890,6 +998,9 @@ def _is_cell_frag(text: str) -> bool:
     if not t:
         return True
     compact = "".join(t.split())
+    # 单字母等级代号是表体数据，不是空角碎片
+    if _LETTER_DATA_RE.fullmatch(compact):
+        return False
     return len(compact) <= 2
 
 
@@ -1147,6 +1258,126 @@ def drop_evidenceless_rows(cells: List[Dict[str, Any]], *, short_ratio: float = 
     return out
 
 
+def _drop_body_empty_columns(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    删除表体（表头以下）所有原子格均为空/碎片的列。
+
+    与 drop_evidenceless_columns 不同：这里不看几何宽度，只看表体内容。
+    表头 colspan 文本不算该列的证据——colspan 会在列删除后自动收缩。
+    仅在表头 anchor 是该列唯一非空来源时才删。
+    """
+    if not cells:
+        return cells
+    header_end = _effective_header_end(cells)
+    max_col = max(int(c["col_end"]) for c in cells)
+
+    col_to_cells: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(max_col + 1)}
+    for c in cells:
+        for col in range(int(c["col_start"]), int(c["col_end"]) + 1):
+            col_to_cells[col].append(c)
+
+    dropped: Set[int] = set()
+    for col in range(max_col + 1):
+        covered = col_to_cells.get(col, [])
+        if not covered:
+            continue
+        # 该列有数据值（数字/缺测横线等） → 真实数据列
+        if _column_has_data_values(cells, col):
+            continue
+        # 表头带起点有实质标签（实施例列头、分散液、分辨率等）→ 保留
+        if any(
+            int(c["col_start"]) == col
+            and int(c["row_start"]) <= header_end
+            and not _is_cell_frag(str(c.get("text") or ""))
+            for c in covered
+        ):
+            continue
+        # 该列是某 cell 的 col_start 且有行标签等实质非数据文本 → 保留
+        # （如「实施例 1」「聚酰亚胺」等，但不含短单位 "(mJ/cm2)"）
+        body_anchors = [
+            c for c in covered
+            if int(c["row_start"]) > header_end
+            and int(c["col_start"]) == col
+            and not _is_cell_frag(str(c.get("text") or ""))
+        ]
+        # 有多个 body anchor 带文本：很可能是行标签列，保留
+        if len(body_anchors) >= 2:
+            continue
+        # 唯一的 body anchor：若为单位/注释文本 → 幽灵列，但需保留文本
+        if body_anchors:
+            t = str(body_anchors[0].get("text") or "").strip()
+            # 纯单位/注释：必须带括号，如 (mJ/cm2)、(℃)。勿把 jER828 / C 当单位删列。
+            if not re.fullmatch(r"[\(\（][A-Za-z%°℃²³/\s\.\d\-μ]+[\)\）]", t):
+                continue
+        # 幽灵列：无数据值，无实质行标签
+        dropped.add(col)
+
+    # 删除前：把整段范围全在 dropped 中的 cell 的文本迁移到右侧保留列
+    if dropped:
+        for col in sorted(dropped):
+            covered = col_to_cells.get(col, [])
+            for c in covered:
+                if int(c["col_start"]) != col:
+                    continue
+                cs, ce = int(c["col_start"]), int(c["col_end"])
+                # 只迁移整段都在 dropped 中的 cell（跨保留列的 cell 会自行缩列）
+                if not all(i in dropped for i in range(cs, ce + 1)):
+                    continue
+                t = str(c.get("text") or "").strip()
+                if not t or _is_cell_frag(t):
+                    continue
+                row = int(c["row_start"])
+                right = next((k for k in range(ce + 1, max_col + 1) if k not in dropped), None)
+                if right is None:
+                    continue
+                for rc in col_to_cells.get(right, []):
+                    if int(rc["row_start"]) <= row <= int(rc["row_end"]):
+                        prev = str(rc.get("text") or "").strip()
+                        if not prev:
+                            rc["text"] = t
+                        elif t not in prev:
+                            rc["text"] = t + "\n" + prev
+                        c["text"] = ""
+                        break
+
+    if not dropped:
+        return cells
+
+    kept_cols = [i for i in range(max_col + 1) if i not in dropped]
+    if not kept_cols:
+        return cells
+
+    remap = {old: new for new, old in enumerate(kept_cols)}
+    out: List[Dict[str, Any]] = []
+    orphans: List[Tuple[int, int, str]] = []
+    for c in cells:
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        new_idxs = [remap[i] for i in range(cs, ce + 1) if i in remap]
+        if not new_idxs:
+            text = str(c.get("text") or "").strip()
+            if text and not _is_cell_frag(text):
+                orphans.append((int(c["row_start"]), cs, text))
+            continue
+        nc = dict(c)
+        nc["col_start"] = min(new_idxs)
+        nc["col_end"] = max(new_idxs)
+        nc["col_span"] = nc["col_end"] - nc["col_start"] + 1
+        out.append(nc)
+    for row, old_cs, text in orphans:
+        _salvage_dropped_cell_text(
+            out,
+            row=row,
+            old_start=old_cs,
+            text=text,
+            kept=kept_cols,
+            remap=remap,
+            axis="col",
+        )
+    if dropped:
+        logger.info("删除表体空列: %s", sorted(dropped))
+    return out
+
+
 def drop_noise_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     丢弃几乎全空、仅含孤立噪声字符的逻辑行（如表末幻觉 'L'）。
@@ -1266,6 +1497,114 @@ def _top_header_band_end(cells: List[Dict[str, Any]]) -> int:
     return header_end
 
 
+_HEADER_UNIT_RE = re.compile(
+    r"^[\(（][\w%°℃²³/\s\.\-μ]+[\)）]$"
+)
+
+
+def _is_header_unit_line(text: str) -> bool:
+    """括号包裹的纯单位文本，如 (mJ/cm2)、(mN)、(%)、(℃)。"""
+    t = "".join((text or "").split())
+    return bool(t) and bool(_HEADER_UNIT_RE.fullmatch(t))
+
+
+def _merge_header_unit_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    表头中：若某行所有非空格都是括号单位文本且上方同列有描述性表头，
+    则将单位行合并到上方格（文本拼接为换行）并删除单位行。
+
+    典型场景：row0=「最小曝光量（Eth）|密合强度」, row1=「(mJ/cm2)|(mN)」
+    """
+    if not cells:
+        return cells
+
+    max_row = max(int(c["row_end"]) for c in cells)
+    if max_row < 1:
+        return cells
+
+    by_key: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+    for c in cells:
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        if rs == re:
+            by_key[(rs, cs, ce)] = c
+
+    by_row: Dict[int, List[Dict[str, Any]]] = {}
+    for c in cells:
+        rs = int(c["row_start"])
+        re = int(c["row_end"])
+        if rs == re:
+            by_row.setdefault(rs, []).append(c)
+
+    # 找候选单位行：该行所有非空格都是括号单位
+    unit_rows: Set[int] = set()
+    for row, row_cells in by_row.items():
+        if row < 1:
+            continue
+        non_empty = [c for c in row_cells if str(c.get("text") or "").strip()]
+        if not non_empty:
+            continue
+        if all(_is_header_unit_line(str(c.get("text") or "").strip()) for c in non_empty):
+            # 还需上方行存在描述性表头
+            has_upper = False
+            for c in non_empty:
+                cs, ce = int(c["col_start"]), int(c["col_end"])
+                upper = by_key.get((row - 1, cs, ce))
+                if upper and str(upper.get("text") or "").strip():
+                    has_upper = True
+                    break
+            if has_upper:
+                unit_rows.add(row)
+
+    if not unit_rows:
+        return cells
+
+    dropped_ids: Set[int] = set()
+    for row in unit_rows:
+        for c in by_row.get(row, []):
+            t = str(c.get("text") or "").strip()
+            cs, ce = int(c["col_start"]), int(c["col_end"])
+            upper = by_key.get((row - 1, cs, ce))
+            if upper and t:
+                ut = str(upper.get("text") or "").strip()
+                upper["text"] = ut + "\n" + t if ut else t
+                upper["row_end"] = int(c["row_end"])
+                upper["row_span"] = int(upper["row_end"]) - int(upper["row_start"]) + 1
+            dropped_ids.add(id(c))
+
+    if not dropped_ids:
+        return cells
+    return [c for c in cells if id(c) not in dropped_ids]
+
+
+def _split_example_header_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """实施例/比较例列头若被误扩成跨两行 rowspan，收回为单行。
+
+    P24：下层是聚酰亚胺行的 A/B/C 数据，不是二级表头。
+    """
+    if not cells:
+        return cells
+    changed = 0
+    for c in cells:
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        if re <= rs:
+            continue
+        if rs > 1:
+            continue
+        text = str(c.get("text") or "")
+        if not _EXAMPLE_COL_HEADER_RE.search(text):
+            continue
+        # 仅拆「跨一行」的假二级表头（避免误伤更复杂多级）
+        if re != rs + 1:
+            continue
+        c["row_end"] = rs
+        c["row_span"] = 1
+        changed += 1
+    if changed:
+        logger.info("实施例列头 rowspan 收回: %d 格", changed)
+    return cells
+
+
 def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     合并表头中：上方有“实文本”的单行格，且正下方同列范围是空/碎片文本的单行格。
@@ -1287,6 +1626,9 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
         compact = "".join(t.split())
         # 括号包裹的单位/注释（如 (℃)、(min)、(%)）不是碎片
         if compact.startswith("(") or compact.startswith("（"):
+            return False
+        # 单字母等级代号（A/B/C…）是表体数据，不可当下层空碎片吞掉
+        if _LETTER_DATA_RE.fullmatch(compact):
             return False
         return len(compact) <= 2 or compact in {"-", "—", "_"}
 
@@ -1340,6 +1682,10 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
         if not upper_text or _is_frag_or_empty(upper_text):
             out.append(upper)
             continue
+        # 实施例/比较例列头不得向下吞并（下层常为 A/B/C 等数据字母）
+        if _EXAMPLE_COL_HEADER_RE.search(upper_text):
+            out.append(upper)
+            continue
 
         lower = by_key.get((ue + 1, uc_s, uc_e))
         if lower is None:
@@ -1388,6 +1734,7 @@ def cells_to_html_table(
         return ""
 
     work = [dict(c) for c in cells]
+    work = _split_example_header_rowspans(work)
     work = _resolve_logic_overlaps(work)
     work = _repair_lone_example_number_headers(work)
     work = _drop_leading_header_only_columns(work)
@@ -1398,11 +1745,13 @@ def cells_to_html_table(
     work = _merge_leading_label_gaps(work)
     # 去掉原先只处理“行首标签”的非对称美化；改为对称幽灵行/列清理
     work = drop_evidenceless_columns(work)
+    work = _drop_body_empty_columns(work)
     work = drop_evidenceless_rows(work)
     work = drop_noise_rows(work)
     if compress_empty:
         work = compress_empty_logic_columns(work)
         work = compress_empty_logic_rows(work)
+    work = _merge_header_unit_rows(work)
     work = _merge_header_empty_below(work)
     work = [c for c in work if not c.get("_drop_render")]
     if not work:

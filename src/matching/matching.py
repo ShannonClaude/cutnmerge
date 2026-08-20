@@ -15,6 +15,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import cv2
 import numpy as np
 from shapely.geometry import Point, box
 
@@ -973,6 +974,203 @@ def _split_sticky_row_label(
     return pieces if len(pieces) >= 2 else None
 
 
+_WUFAPINGJIA_GLUED_RE = re.compile(r"^无法评价(\d+(?:\.\d+)?)$")
+
+
+def _split_wufapingjia_glued(
+    tb: Dict[str, Any],
+    cells: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    「无法评价40」跨两列时切成左无法评价、右数字。
+    只落在一格时丢掉尾数，避免把噪声写进应力/粘合格。
+    """
+    compact = re.sub(r"\s+", "", str(tb.get("text") or "").strip())
+    m = _WUFAPINGJIA_GLUED_RE.fullmatch(compact)
+    if not m:
+        return None
+    label, num = "无法评价", m.group(1)
+    overlaps: List[Tuple[int, Tuple[float, float, float, float]]] = []
+    if cells:
+        overlaps = _overlapping_atomic_cols(tb, cells)
+    if len(overlaps) < 2:
+        piece = dict(tb)
+        piece["text"] = label
+        return [piece]
+
+    overlaps = overlaps[:2]
+    tb_box = _text_bbox(tb)
+    x1, y1, x2, y2 = tb_box
+    pieces: List[Dict[str, Any]] = []
+    for i, part in enumerate((label, num)):
+        cb = overlaps[i][1]
+        xa = max(x1, cb[0])
+        xb = min(x2, cb[2])
+        if xb <= xa:
+            xa, xb = cb[0], cb[2]
+        piece = dict(tb)
+        piece["text"] = part
+        piece["polygon"] = np.array(
+            [[xa, y1], [xb, y1], [xb, y2], [xa, y2]],
+            dtype=np.float64,
+        )
+        piece["top_left"] = (xa, y1)
+        pieces.append(piece)
+    return pieces
+
+
+_WUFAPINGJIA_METRIC_LABEL_RE = re.compile(r"分辨率|粘合强度|应力")
+
+
+def _metric_rows_with_wufapingjia(cells: List[Dict[str, Any]]) -> set[int]:
+    rows: set[int] = set()
+    for c in cells:
+        blob = str(c.get("text") or "")
+        if not _WUFAPINGJIA_METRIC_LABEL_RE.search(blob):
+            continue
+        rs = int(c.get("row_start") or 0)
+        re_ = int(c.get("row_end") or 0)
+        for r in range(rs, re_ + 1):
+            rows.add(r)
+    return rows
+
+
+def _row_has_wufapingjia_metric_label(cells: List[Dict[str, Any]], row: int) -> bool:
+    return row in _metric_rows_with_wufapingjia(cells)
+
+
+def _row_metric_data_cells(cells: List[Dict[str, Any]], row: int) -> List[Dict[str, Any]]:
+    out = [
+        c
+        for c in cells
+        if int(c.get("row_start") or -1) == row
+        and int(c.get("row_end") or -1) == row
+        and int(c.get("col_start") or 0) >= 4
+    ]
+    out.sort(key=lambda c: int(c["col_start"]))
+    return out
+
+
+def _row_metric_y_center(cells: List[Dict[str, Any]], row: int) -> Optional[float]:
+    ys: List[float] = []
+    for c in _row_metric_data_cells(cells, row):
+        cb = _cell_bbox(c)
+        ys.append((cb[1] + cb[3]) / 2.0)
+    if not ys:
+        return None
+    return float(sum(ys) / len(ys))
+
+
+def _tb_y_center(tb: Dict[str, Any]) -> float:
+    tb_box = _text_bbox(tb)
+    return (tb_box[1] + tb_box[3]) / 2.0
+
+
+def _find_empty_wufapingjia_ref2(
+    row_cells: Sequence[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    for i, c in enumerate(row_cells):
+        if str(c.get("text") or "").strip() != "无法评价":
+            continue
+        if i + 1 >= len(row_cells):
+            continue
+        right = row_cells[i + 1]
+        if str(right.get("text") or "").strip():
+            continue
+        return right
+    return None
+
+
+def _recover_wufapingjia_ref2_from_ocr(
+    cells: List[Dict[str, Any]],
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> None:
+    """指标行：左格「无法评价」、右格空时，从粘连 OCR 或独立尾数框补数字。"""
+    if not text_boxes:
+        return
+    metric_rows = sorted(_metric_rows_with_wufapingjia(cells))
+    if not metric_rows:
+        return
+
+    glued: List[Tuple[Dict[str, Any], str]] = []
+    standalone_digits: List[Tuple[Dict[str, Any], str]] = []
+    for tb in text_boxes:
+        compact = re.sub(r"\s+", "", str(tb.get("text") or "").strip())
+        m = _WUFAPINGJIA_GLUED_RE.fullmatch(compact)
+        if m:
+            glued.append((tb, m.group(1)))
+        elif _NUM_ONLY_RE.fullmatch(compact):
+            standalone_digits.append((tb, compact))
+    if not glued and not standalone_digits:
+        return
+
+    used_glued: set[int] = set()
+    used_digits: set[int] = set()
+    for row in metric_rows:
+        right = _find_empty_wufapingjia_ref2(_row_metric_data_cells(cells, row))
+        if right is None:
+            continue
+        row_y = _row_metric_y_center(cells, row)
+        if row_y is None:
+            continue
+
+        best_g_idx: Optional[int] = None
+        best_g_dist = 1e9
+        for i, (tb, _tail) in enumerate(glued):
+            if i in used_glued:
+                continue
+            dist = abs(_tb_y_center(tb) - row_y)
+            if dist < best_g_dist:
+                best_g_dist = dist
+                best_g_idx = i
+        if best_g_idx is not None and best_g_dist <= 36.0:
+            right["text"] = glued[best_g_idx][1]
+            used_glued.add(best_g_idx)
+            continue
+
+        best_d_idx: Optional[int] = None
+        best_d_dist = 1e9
+        for i, (tb, num) in enumerate(standalone_digits):
+            if i in used_digits:
+                continue
+            dist = abs(_tb_y_center(tb) - row_y)
+            if dist < best_d_dist:
+                best_d_dist = dist
+                best_d_idx = i
+        if best_d_idx is not None and best_d_dist <= 36.0:
+            right["text"] = standalone_digits[best_d_idx][1]
+            used_digits.add(best_d_idx)
+
+
+def _strip_lone_wufapingjia_digits(cells: List[Dict[str, Any]]) -> None:
+    """单格残留「无法评价40」：指标行分到右邻格，其余丢掉尾数。"""
+    for cell in cells:
+        compact = re.sub(r"\s+", "", str(cell.get("text") or "").strip())
+        m = _WUFAPINGJIA_GLUED_RE.fullmatch(compact)
+        if not m:
+            continue
+        row = int(cell.get("row_start") or 0)
+        tail = m.group(1)
+        right: Optional[Dict[str, Any]] = None
+        ce = int(cell.get("col_end") or cell.get("col_start") or 0)
+        for c in cells:
+            if int(c.get("row_start") or -1) != row:
+                continue
+            if int(c.get("row_end") or -1) != row:
+                continue
+            if int(c.get("col_start") or -1) != ce + 1:
+                continue
+            if str(c.get("text") or "").strip():
+                continue
+            right = c
+            break
+        if right is not None and _row_has_wufapingjia_metric_label(cells, row):
+            cell["text"] = "无法评价"
+            right["text"] = tail
+        else:
+            cell["text"] = "无法评价"
+
+
 def _snap_cuts_inside_digit_run(text: str, cuts: List[int]) -> List[int]:
     """
     若切点落在连续数字串内部，保留（这正是 186→1|86 所需）；
@@ -1497,6 +1695,8 @@ def assign_texts_to_cells(
         col_sticky = False
         sticky_pieces = _split_sticky_row_label(tb, cells)
         if sticky_pieces is None:
+            sticky_pieces = _split_wufapingjia_glued(tb, cells)
+        if sticky_pieces is None:
             sticky_pieces = _split_sticky_column_header(tb, cells)
             col_sticky = sticky_pieces is not None
         piece_list = sticky_pieces if sticky_pieces else [tb]
@@ -1650,6 +1850,8 @@ def assign_texts_to_cells(
                 free_texts.extend(captions)
 
     _apply_component_header_completion(cells)
+    _strip_lone_wufapingjia_digits(cells)
+    _recover_wufapingjia_ref2_from_ocr(cells, text_boxes)
     cells = unmerge_filled_label_rowspans(cells)
     cells = explode_sticky_header_wide_cells(cells)
     return cells, free_texts
@@ -1947,8 +2149,11 @@ def join_cell_texts(
 _DASH_LIKE_RE = re.compile(r'^[\-\u2013\u2014\u2015\u2212\uff0d]+$')
 
 
+_DASH_MISREAD_CHARS = {"1", "l", "I"}
+
+
 def _fix_dash_column_consistency(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """按列统计 dash vs '1'，当列以 dash 为主时将孤立 '1' 翻转为 '-'。"""
+    """按列统计 dash vs '1'/'I'/'l'，当列以 dash 为主时将孤立误识翻转为 '-'。"""
     from collections import defaultdict
 
     col_cells: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
@@ -1959,7 +2164,7 @@ def _fix_dash_column_consistency(cells: List[Dict[str, Any]]) -> List[Dict[str, 
 
     for col_idx, col in col_cells.items():
         dash_count = 0
-        one_cells: List[Dict[str, Any]] = []
+        suspect_cells: List[Dict[str, Any]] = []
         multi_char_count = 0
         for c in col:
             txt = (c.get("text") or "").strip()
@@ -1967,22 +2172,205 @@ def _fix_dash_column_consistency(cells: List[Dict[str, Any]]) -> List[Dict[str, 
                 continue
             if _DASH_LIKE_RE.match(txt):
                 dash_count += 1
-            elif txt == "1":
-                one_cells.append(c)
+            elif txt in _DASH_MISREAD_CHARS:
+                suspect_cells.append(c)
             elif len(txt) > 1:
                 multi_char_count += 1
-        if not one_cells:
+        if not suspect_cells:
             continue
-        total = dash_count + len(one_cells)
-        # 方式1：列以 dash 为主（原逻辑）
+        total = dash_count + len(suspect_cells)
         if total > 0 and dash_count >= 2 and dash_count / total >= 0.5:
-            for c in one_cells:
-                logger.debug("列 %d dash 一致性: '1' → '-'", col_idx)
+            for c in suspect_cells:
+                logger.debug("列 %d dash 一致性: %r → '-'", col_idx, c.get("text"))
                 c["text"] = "-"
             continue
-        # 方式2：列以多字符值为主，孤立 '1' 大概率是 OCR 把 '-' 误识别
-        if dash_count + multi_char_count >= 2 and multi_char_count > len(one_cells):
-            for c in one_cells:
-                logger.debug("列 %d 多值列孤立1: '1' → '-'", col_idx)
+        if dash_count + multi_char_count >= 2 and multi_char_count > len(suspect_cells):
+            for c in suspect_cells:
+                logger.debug("列 %d 多值列孤立误识: %r → '-'", col_idx, c.get("text"))
                 c["text"] = "-"
+    return cells
+
+
+# ---------------------------------------------------------------------------
+# 空单元格符号检测：○ / ◎ / △ / × 等评价符号
+# ---------------------------------------------------------------------------
+
+def _detect_eval_symbol(roi: np.ndarray) -> Optional[str]:
+    """对单元格 ROI（二值图，前景=255）做轮廓分析，识别评价符号。"""
+    if roi is None or roi.size == 0:
+        return None
+    fg = (roi > 0).astype(np.uint8) * 255
+    fg_ratio = np.count_nonzero(fg) / max(fg.size, 1)
+    if fg_ratio < 0.01:
+        return None
+
+    contours, _ = cv2.findContours(fg, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    h_roi, w_roi = roi.shape[:2]
+    min_area = max(20, int(h_roi * w_roi * 0.02))
+
+    significant = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area >= min_area:
+            significant.append(cnt)
+    if not significant:
+        return None
+
+    def _is_circular(cnt: np.ndarray) -> bool:
+        area = cv2.contourArea(cnt)
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter < 1e-3:
+            return False
+        circularity = 4 * np.pi * area / (perimeter * perimeter)
+        return circularity > 0.65
+
+    def _is_triangular(cnt: np.ndarray) -> bool:
+        perimeter = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.04 * perimeter, True)
+        if len(approx) != 3:
+            return False
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            return False
+        return True
+
+    circular = [c for c in significant if _is_circular(c)]
+    triangular = [c for c in significant if _is_triangular(c)]
+
+    if len(circular) >= 2:
+        areas = sorted([cv2.contourArea(c) for c in circular], reverse=True)
+        if areas[1] / max(areas[0], 1e-6) > 0.15:
+            return "◎"
+    if len(circular) == 1:
+        return "○"
+    if triangular:
+        return "△"
+
+    return None
+
+
+def _cell_texts_on_row(cells: List[Dict[str, Any]], row: int) -> List[str]:
+    out: List[str] = []
+    for c in cells:
+        rs = int(c.get("row_start") or 0)
+        re_ = int(c.get("row_end") or 0)
+        if rs <= row <= re_:
+            t = re.sub(r"\s+", "", str(c.get("text") or "").strip())
+            if t:
+                out.append(t)
+    return out
+
+
+def _cell_texts_on_col(cells: List[Dict[str, Any]], col: int) -> List[str]:
+    out: List[str] = []
+    for c in cells:
+        if int(c.get("col_start") or -1) != col:
+            continue
+        t = re.sub(r"\s+", "", str(c.get("text") or "").strip())
+        if t:
+            out.append(t)
+    return out
+
+
+def _skip_eval_symbol_fill(cells: List[Dict[str, Any]], cell: Dict[str, Any]) -> bool:
+    """数值/分辨率行或「无法评价」+数字混排列上不填 ○/◎/△。"""
+    row = int(cell.get("row_start") or 0)
+    col = int(cell.get("col_start") or 0)
+    row_texts = _cell_texts_on_row(cells, row)
+    if any("无法评价" in t for t in row_texts):
+        return True
+    if sum(1 for t in row_texts if _NUM_ONLY_RE.fullmatch(t)) >= 2:
+        return True
+    col_texts = _cell_texts_on_col(cells, col)
+    has_wufa = any("无法评价" in t for t in col_texts)
+    has_num = any(_NUM_ONLY_RE.fullmatch(t) for t in col_texts)
+    return has_wufa and has_num
+
+
+def detect_eval_symbols_in_empty_cells(
+    cells: List[Dict[str, Any]],
+    binary: Optional[np.ndarray],
+) -> List[Dict[str, Any]]:
+    """对空单元格做 CV 符号检测，填充 ○/◎/△ 等评价符号。"""
+    if binary is None or binary.size == 0:
+        return cells
+    h_img, w_img = binary.shape[:2]
+    for cell in cells:
+        txt = (cell.get("text") or "").strip()
+        if txt:
+            continue
+        if _skip_eval_symbol_fill(cells, cell):
+            continue
+        poly = np.asarray(cell.get("polygon"), dtype=np.float64).reshape(-1, 2)
+        if poly.size < 4:
+            continue
+        x1 = int(max(0, np.floor(poly[:, 0].min())))
+        y1 = int(max(0, np.floor(poly[:, 1].min())))
+        x2 = int(min(w_img, np.ceil(poly[:, 0].max())))
+        y2 = int(min(h_img, np.ceil(poly[:, 1].max())))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        roi = binary[y1:y2, x1:x2]
+        sym = _detect_eval_symbol(roi)
+        if sym:
+            cell["text"] = sym
+            logger.debug("符号检测: cell (%d,%d) → %s", cell.get("row_start", -1), cell.get("col_start", -1), sym)
+    return cells
+
+
+_EVAL_SYMBOL_CHARS = {"O", "o", "○", "×", "◎", "△"}
+
+
+def _is_eval_column(cells: List[Dict[str, Any]], col: int) -> bool:
+    """判断某列是否为评价列（多数单元格为单字符符号 O/×/○/◎/△/- 或空）。"""
+    col_texts = []
+    for c in cells:
+        if c.get("col_start") != col or c.get("col_span", 1) != 1:
+            continue
+        txt = (c.get("text") or "").strip()
+        if txt:
+            col_texts.append(txt)
+    if len(col_texts) < 2:
+        return False
+    eval_count = sum(1 for t in col_texts if t in _EVAL_SYMBOL_CHARS or t == "-")
+    return eval_count / len(col_texts) >= 0.5
+
+
+def upgrade_o_to_double_circle(
+    cells: List[Dict[str, Any]],
+    binary: Optional[np.ndarray],
+) -> List[Dict[str, Any]]:
+    """将评价列中被 OCR 识别为 'O' 但实际是 ◎（双圆圈）的单元格升级。"""
+    if binary is None or binary.size == 0:
+        return cells
+    h_img, w_img = binary.shape[:2]
+    eval_cols: Dict[int, bool] = {}
+    for cell in cells:
+        txt = (cell.get("text") or "").strip()
+        if txt not in ("O", "o", "○"):
+            continue
+        col = cell.get("col_start")
+        if col is None:
+            continue
+        if col not in eval_cols:
+            eval_cols[col] = _is_eval_column(cells, col)
+        if not eval_cols[col]:
+            continue
+        poly = np.asarray(cell.get("polygon"), dtype=np.float64).reshape(-1, 2)
+        if poly.size < 4:
+            continue
+        x1 = int(max(0, np.floor(poly[:, 0].min())))
+        y1 = int(max(0, np.floor(poly[:, 1].min())))
+        x2 = int(min(w_img, np.ceil(poly[:, 0].max())))
+        y2 = int(min(h_img, np.ceil(poly[:, 1].max())))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        roi = binary[y1:y2, x1:x2]
+        sym = _detect_eval_symbol(roi)
+        if sym == "◎":
+            cell["text"] = "◎"
+            logger.debug("O→◎ 升级: cell (%d,%d)", cell.get("row_start", -1), cell.get("col_start", -1))
     return cells

@@ -283,14 +283,21 @@ def repair_rowspans_by_hline_gaps(
 
     text_boxes = list(text_boxes or [])
     row_seps, _col_seps = _derive_seps(cells)
+    logger.debug(
+        "hline_repair: n_cells=%d row_seps=%d",
+        len(cells), len(row_seps),
+    )
     if len(row_seps) < 3:
         return cells
 
     n_rows = len(row_seps) - 1
     body_row = _first_body_row_index(cells, text_boxes, row_seps)
-    # 只处理表头行之间的边界（不含表体行界）。body_row=2 → 仅 boundary 0。
     n_header_boundaries = max(0, body_row - 1)
     max_boundary = min(n_header_boundaries, max_header_boundaries, n_rows - 1)
+    logger.debug(
+        "hline_repair: body_row=%d n_rows=%d max_boundary=%d",
+        body_row, n_rows, max_boundary,
+    )
     if max_boundary <= 0:
         logger.info(
             "hline_repair: 无可修表头行界 (body_row=%d n_rows=%d)",
@@ -320,6 +327,12 @@ def repair_rowspans_by_hline_gaps(
                 uppers.setdefault(key, []).append(idx)
             elif rs == re == lower_row:
                 lowers.setdefault(key, []).append(idx)
+        logger.debug(
+            "hline_repair: boundary=%d upper_row=%d lower_row=%d "
+            "upper_keys=%s lower_keys=%s",
+            boundary, upper_row, lower_row,
+            list(uppers.keys()), list(lowers.keys()),
+        )
 
         to_drop: set = set()
         to_add: List[Dict[str, Any]] = []
@@ -337,13 +350,31 @@ def repair_rowspans_by_hline_gaps(
             xa, xb = min(x1, lx1), max(x2, lx2)
 
             ink = _hline_coverage_ratio(binary, y, xa, xb, tol=tol)
-            if ink >= min_ink_ratio:
-                continue
 
             u_texts = _ocr_texts_in_bbox(text_boxes, (x1, y1, x2, y2))
             l_texts = _ocr_texts_in_bbox(text_boxes, (lx1, ly1, lx2, ly2))
             u_joined = " ".join(u_texts)
             l_joined = " ".join(l_texts)
+
+            # 短 CJK 标签对：两行都是 3-4 字 CJK，视为同一格折行。
+            # 横线可能存在（全表贯穿线经过该格），故不受 ink 门槛限制。
+            short_cjk_merge = False
+            u_compact = _compact(u_joined)
+            l_compact = _compact(l_joined)
+            if (
+                3 <= len(u_compact) <= 4
+                and 3 <= len(l_compact) <= 4
+                and _CJK_RE.search(u_compact)
+                and _CJK_RE.search(l_compact)
+                and _same_column_wrap(upper, lower)
+                and not _SUBHEADER_TAIL_RE.search(u_compact)
+                and not _SUBHEADER_TAIL_RE.search(l_compact)
+            ):
+                short_cjk_merge = True
+
+            if ink >= min_ink_ratio and not short_cjk_merge:
+                continue
+
             u_h = max(0.0, y2 - y1)
             l_h = max(0.0, ly2 - ly1)
             u_frag = _is_fragment_text(u_joined)
@@ -374,6 +405,7 @@ def repair_rowspans_by_hline_gaps(
                 or l_sliver
                 or crosses
                 or wrap_merge
+                or short_cjk_merge
             )
             if not evidence:
                 continue

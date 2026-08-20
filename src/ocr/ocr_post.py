@@ -59,10 +59,7 @@ def normalize_ocr_text(text: str) -> str:
     # jER 系列常见丢首字母 j（如 ER828 / 化合物ER828）
     if re.search(r"(?<![jJ])ER828", t):
         t = re.sub(r"(?<![jJ])ER828", "jER828", t)
-    # 参考例列：无法评价与数值粘连
-    compact = re.sub(r"\s+", "", t)
-    if re.fullmatch(r"无法评价\d+(?:\.\d+)?", compact):
-        t = "无法评价"
+    # 「无法评价40」留给 IoA 按列切开，此处不再整段丢掉尾数
     return t
 
 
@@ -233,6 +230,7 @@ def _maybe_tiny_one_to_dash(
     「—」被 OCR 成极小偏扁的 1/|/l 时改回 '-'。
 
     极小框（短边<10）仅靠尺寸；稍大时再要求横带墨迹。
+    低置信 + 宽扁框也按横带墨迹兜底。
     """
     t = (text or "").strip()
     if t not in {"1", "l", "I", "|", "丨"}:
@@ -242,14 +240,18 @@ def _maybe_tiny_one_to_dash(
     w, h = _tb_wh(tb)
     if h <= 0:
         return text
-    if h > 0.35 * median_box_h:
-        return text
-    if w / h < 1.10:
-        return text
-    if max(w, h) >= 10.0 and binary is not None:
-        if not _has_horizontal_ink_band(binary, tb):
-            return text
-    return "-"
+    score = float(tb.get("score") if tb.get("score") is not None else 1.0)
+    # 原有路径：极小框
+    if h <= 0.35 * median_box_h and w / h >= 1.10:
+        if max(w, h) >= 10.0 and binary is not None:
+            if not _has_horizontal_ink_band(binary, tb):
+                return text
+        return "-"
+    # 补充路径：低置信且宽扁，按墨迹判定
+    if score < 0.70 and w / h >= 1.10 and binary is not None:
+        if _has_horizontal_ink_band(binary, tb):
+            return "-"
+    return text
 
 
 def _strip_leading_pipe_digits(text: str) -> str:
