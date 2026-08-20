@@ -141,6 +141,31 @@ def test_p100_fensan_still_merges_in_header_band():
     assert re.search(r'rowspan="2"[^>]*>分散液', html), html
 
 
+def test_p40_stacked_chemical_header():
+    """P40：同列「二苯基醚/二甲酰氯」应纵向合并为一格。"""
+    cells = [
+        _cell(0, 0, 0, 0, "树脂", 0, 80, 0, 20),
+        _cell(0, 0, 1, 5, "单体、封端剂组成", 80, 400, 0, 20),
+        _cell(1, 1, 1, 3, "酸二酐 (摩尔比率)", 80, 240, 20, 40),
+        _cell(1, 1, 4, 4, "二苯基醚", 240, 320, 20, 40),
+        _cell(1, 1, 5, 9, "二胺(摩尔比率)", 320, 560, 20, 40),
+        _cell(2, 2, 1, 1, "6FDA", 80, 160, 40, 60),
+        _cell(2, 2, 2, 2, "ODPA", 160, 240, 40, 60),
+        _cell(2, 2, 4, 4, "二甲酰氯", 240, 320, 40, 60),
+        _cell(2, 2, 5, 5, "α", 320, 400, 40, 60),
+        _cell(3, 3, 0, 0, "树脂（AA）", 0, 80, 60, 80),
+        _cell(3, 3, 1, 1, "100", 80, 160, 60, 80),
+    ]
+    html = cells_to_html_table(cells)
+    assert re.search(r'rowspan="2"[^>]*>二苯基醚<br>二甲酰氯', html), html
+    assert not re.search(
+        r">二苯基醚</td>\s*</tr>\s*<tr>[^<]*<td>6FDA",
+        html,
+    ), html
+    assert re.search(r">6FDA</td>", html), html
+    assert re.search(r">ODPA</td>", html), html
+
+
 def test_clip_nested_row_header_parent_colspan():
     cells = _nested_row_header_cells()
     out = clip_row_header_child_overlaps([dict(c) for c in cells])
@@ -309,6 +334,62 @@ def test_merge_resolution_unit():
     merged = next(c for c in out if "分辨率" in str(c.get("text") or ""))
     assert "(μm)" in str(merged.get("text") or "")
     assert int(merged["col_end"]) == 3
+
+
+def test_resolution_um_merged_on_metric_data_row():
+    """P24：测量汇总行（同行有实施例数值）应合并 分辨率+(μm) 为一格。"""
+    cells = [
+        _cell(0, 0, 0, 1, "其他", 0, 160, 0, 30),
+        _cell(0, 0, 2, 2, "合成例10的丙烯酸树脂溶液", 160, 320, 0, 30),
+        _cell(1, 1, 0, 0, "分辨率", 0, 80, 30, 60),
+        _cell(1, 1, 1, 3, "(μm)", 80, 320, 30, 60),
+        _cell(1, 1, 4, 4, "25", 320, 400, 30, 60),
+        _cell(1, 1, 5, 5, "30", 400, 480, 30, 60),
+    ]
+    html = cells_to_html_table(cells)
+    assert "分辨率(μm)" in html.replace(" ", "")
+    assert not re.search(r">分辨率</td>\s*<td[^>]*>\(μm\)</td>", html), html
+
+
+def test_resolution_um_separate_when_unit_is_column():
+    """嵌套表头：单位列上方有独立列头、同行无数值时保持分列。"""
+    cells = [
+        _cell(0, 0, 0, 0, "其他", 0, 80, 0, 30),
+        _cell(0, 0, 1, 1, "烯酸树脂溶液", 80, 160, 0, 30),
+        _cell(1, 1, 0, 0, "分辨率", 0, 80, 30, 60),
+        _cell(1, 1, 1, 1, "(μm)", 80, 160, 30, 60),
+    ]
+    html = cells_to_html_table(cells)
+    assert "分辨率(μm)" not in html.replace(" ", "")
+    assert re.search(r">分辨率</td>\s*<td[^>]*>\(μm\)</td>", html), html
+
+
+def test_no_merge_other_with_um_unit():
+    """P33：「其他」与下方数据列的 (μm) 单位格不得横向合并。"""
+    cells = [
+        _cell(0, 0, 0, 0, "", 0, 80, 0, 30),
+        _cell(0, 0, 1, 4, "清漆组成", 80, 400, 0, 15),
+        _cell(0, 0, 5, 5, "其他", 400, 480, 0, 15),
+        _cell(0, 0, 6, 6, "显影膜损失量", 480, 560, 0, 15),
+        _cell(0, 0, 7, 7, "判定", 560, 640, 0, 30),
+        _cell(1, 1, 1, 1, "清漆", 80, 160, 15, 30),
+        _cell(1, 1, 2, 2, "树脂", 160, 240, 15, 30),
+        _cell(1, 1, 3, 3, "感光剂", 240, 320, 15, 30),
+        _cell(1, 1, 4, 4, "溶剂", 320, 400, 15, 30),
+        _cell(1, 1, 5, 5, "其他", 400, 480, 15, 30),
+        _cell(1, 1, 6, 6, "(μm)", 480, 560, 15, 30),
+        _cell(2, 2, 0, 0, "实施例1", 0, 80, 30, 50),
+        _cell(2, 2, 5, 5, "e-1", 400, 480, 30, 50),
+        _cell(2, 2, 6, 6, "0.41", 480, 560, 30, 50),
+    ]
+    out = _merge_leading_empty_into_label([dict(c) for c in cells])
+    other = next(c for c in out if str(c.get("text") or "").strip() == "其他" and int(c["row_start"]) == 1)
+    unit = next(c for c in out if str(c.get("text") or "").strip() == "(μm)")
+    assert int(other["col_end"]) == 5
+    assert int(unit["col_start"]) == 6
+    html = cells_to_html_table(cells)
+    assert "其他(μm)" not in html
+    assert re.search(r">其他</td>\s*<td[^>]*>\(μm\)</td>", html), html
 
 
 def _p25x192_body_cells():
@@ -729,6 +810,24 @@ def test_wufapingjia_glued_number_split():
     assert pieces[0]["text"] == "无法评价"
 
 
+def test_eval_symbols_detect_cross_mark():
+    """空单元格中的 × 应被 CV 符号检测补全。"""
+    import cv2
+    import numpy as np
+
+    img = np.zeros((36, 120), dtype=np.uint8)
+    cx, cy, r = 90, 18, 10
+    cv2.line(img, (cx - r, cy - r), (cx + r, cy + r), 255, 2)
+    cv2.line(img, (cx - r, cy + r), (cx + r, cy - r), 255, 2)
+    cells = [
+        _cell(0, 0, 0, 0, "比较例5", 0, 80, 0, 36),
+        _cell(0, 0, 1, 1, "", 80, 120, 0, 36),
+    ]
+    out = detect_eval_symbols_in_empty_cells([dict(c) for c in cells], img)
+    empty = next(c for c in out if int(c["col_start"]) == 1)
+    assert str(empty.get("text") or "").strip() == "×"
+
+
 def test_eval_symbols_skip_numeric_metric_row():
     """分辨率行已有数字时，空格不得被轮廓填成 ◎。"""
     import cv2
@@ -933,6 +1032,7 @@ def test_peel_c_glued_ab_letters():
 def main() -> int:
     test_body_left_stub_does_not_merge_column_headers()
     test_p100_fensan_still_merges_in_header_band()
+    test_p40_stacked_chemical_header()
     test_clip_nested_row_header_parent_colspan()
     test_html_keeps_nested_labels_separate()
     test_resolve_does_not_swallow_right_child_text()
@@ -946,6 +1046,9 @@ def main() -> int:
     test_sticky_column_header_split_geom()
     test_merge_leading_empty_into_label()
     test_merge_resolution_unit()
+    test_resolution_um_merged_on_metric_data_row()
+    test_resolution_um_separate_when_unit_is_column()
+    test_no_merge_other_with_um_unit()
     test_p25x192_label_does_not_swallow_empty_data_cols()
     test_p25x193_synthesis2_keeps_empty_cols()
     test_p26x194_ghost_col0_dropped()
@@ -959,6 +1062,7 @@ def main() -> int:
     test_wufapingjia_glued_number_split()
     test_wufapingjia_tail_to_right_on_resolution_row()
     test_wufapingjia_tail_to_right_on_adhesion_stress_rows()
+    test_eval_symbols_detect_cross_mark()
     test_eval_symbols_skip_numeric_metric_row()
     test_peel_c_fills_missing_b()
     test_relocate_photosensitive_section_and_map()

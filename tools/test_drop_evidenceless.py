@@ -104,10 +104,90 @@ def test_salvage_when_origin_cols_all_dropped():
     assert out, "expected surviving cells"
 
 
+def test_colspan_ghost_columns_p28_pattern():
+    """P28X229：TSR 5 列（label|ghost|data|ghost|data）→ 3 列。"""
+    # 5 cols x 4 rows: header x2 + 2 data rows
+    cells = [
+        _cell(0, 0, 0, 0, "", 0, 80, 0, 30),
+        _cell(0, 0, 1, 2, "最小曝光量（Eth）", 80, 280, 0, 30),
+        _cell(0, 0, 3, 4, "密合强度", 280, 480, 0, 30),
+        _cell(1, 1, 0, 0, "", 0, 80, 30, 60),
+        _cell(1, 1, 1, 1, "", 80, 130, 30, 60),
+        _cell(1, 1, 2, 2, "(mJ/cm2)", 130, 230, 30, 60),
+        _cell(1, 1, 3, 3, "(mN)", 230, 330, 30, 60),
+        _cell(1, 1, 4, 4, "", 330, 480, 30, 60),
+        _cell(2, 2, 0, 0, "实施例 1", 0, 80, 60, 90),
+        _cell(2, 2, 1, 1, "", 80, 130, 60, 90),
+        _cell(2, 2, 2, 2, "200", 130, 230, 60, 90),
+        _cell(2, 2, 3, 3, "", 230, 330, 60, 90),
+        _cell(2, 2, 4, 4, "358", 330, 480, 60, 90),
+        _cell(3, 3, 0, 0, "实施例 2", 0, 80, 90, 120),
+        _cell(3, 3, 1, 1, "", 80, 130, 90, 120),
+        _cell(3, 3, 2, 2, "180", 130, 230, 90, 120),
+        _cell(3, 3, 3, 3, "", 230, 330, 90, 120),
+        _cell(3, 3, 4, 4, "309", 330, 480, 90, 120),
+    ]
+    html = cells_to_html_table(cells)
+    assert "200" in html and "358" in html
+    assert "最小曝光量" in html and "密合强度" in html
+    assert "<td></td>" not in html.split("<tr>")[3]  # 数据行无幽灵空 td 串
+
+
+def test_p32_solubility_viscosity_columns_separate():
+    """P32X266：溶解性 / 聚合物溶液粘度 应为并列子列，不得合并。"""
+    cells = [
+        _cell(0, 1, 0, 0, "", 0, 60, 0, 40),
+        _cell(0, 1, 1, 1, "树脂", 60, 140, 0, 40),
+        _cell(0, 0, 2, 3, "溶解性评价\n30wt% PGMEA 溶液", 140, 340, 0, 20),
+        _cell(0, 1, 4, 4, "判定", 340, 420, 0, 40),
+        _cell(1, 1, 2, 2, "溶解性", 140, 220, 20, 40),
+        _cell(1, 1, 3, 3, "聚合物溶液粘度", 220, 340, 20, 40),
+        _cell(2, 2, 0, 0, "树脂(A)", 0, 60, 40, 70),
+        _cell(2, 2, 1, 1, "聚酰胺酸酯", 60, 140, 40, 70),
+        _cell(2, 2, 2, 2, "溶解", 140, 220, 40, 70),
+        _cell(2, 2, 3, 3, "119 mPa·s", 220, 340, 40, 70),
+        _cell(2, 2, 4, 4, "A", 340, 420, 40, 70),
+    ]
+    html = cells_to_html_table(cells)
+    assert "溶解性<br>聚合物溶液粘度" not in html, html
+    assert "<td>溶解性</td>" in html and "<td>聚合物溶液粘度</td>" in html
+    assert "溶解" in html and "119" in html
+
+
+def test_colspan_ghost_columns_p29_pattern():
+    """P29X231：比较例表，5 列幽灵 padding → 3 列，单位并入表头。"""
+    cells = [
+        _cell(0, 0, 0, 0, "", 0, 80, 0, 30),
+        _cell(0, 0, 1, 2, "最小曝光量（Eth）", 80, 280, 0, 30),
+        _cell(0, 0, 3, 4, "密合强度", 280, 480, 0, 30),
+        _cell(1, 1, 0, 0, "", 0, 80, 30, 60),
+        _cell(1, 1, 1, 1, "", 80, 130, 30, 60),
+        _cell(1, 1, 2, 2, "(mJ/cm²)", 130, 230, 30, 60),
+        _cell(1, 1, 3, 3, "(mN)", 230, 330, 30, 60),
+        _cell(1, 1, 4, 4, "", 330, 480, 30, 60),
+        _cell(2, 2, 0, 0, "比较例1", 0, 80, 60, 90),
+        _cell(2, 2, 1, 1, "", 80, 130, 60, 90),
+        _cell(2, 2, 2, 2, "350", 130, 230, 60, 90),
+        _cell(2, 2, 3, 3, "", 230, 330, 60, 90),
+        _cell(2, 2, 4, 4, "31", 330, 480, 60, 90),
+    ]
+    html = cells_to_html_table(cells)
+    assert "350" in html and "31" in html
+    assert "最小曝光量" in html and "密合强度" in html
+    assert "(mJ/cm" in html and "(mN)" in html
+    assert html.count("<td") <= 12  # 3 cols * ~4 rows
+    data_row = html.split("<tr>")[3]
+    assert data_row.count("<td") == 3, data_row
+    assert "<td></td>" not in data_row
+
+
 def main() -> int:
     test_example15_colspan4_keeps_nc7000l()
     test_example16_two_colspan2_keeps_maa_str()
     test_salvage_when_origin_cols_all_dropped()
+    test_colspan_ghost_columns_p28_pattern()
+    test_colspan_ghost_columns_p29_pattern()
+    test_p32_solubility_viscosity_columns_separate()
     print("OK: drop_evidenceless colspan origin tests passed")
     return 0
 

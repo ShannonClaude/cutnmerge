@@ -2152,7 +2152,57 @@ _DASH_LIKE_RE = re.compile(r'^[\-\u2013\u2014\u2015\u2212\uff0d]+$')
 _DASH_MISREAD_CHARS = {"1", "l", "I"}
 
 
-def _fix_dash_column_consistency(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _column_should_coerce_dash_misreads(
+    dash_count: int,
+    suspect_count: int,
+    multi_char_count: int,
+) -> bool:
+    """判断该列是否应以缺测横线 '-' 为主（允许少量真实多字符值如 100）。"""
+    if suspect_count == 0:
+        return False
+    pair = dash_count + suspect_count
+    if pair == 0:
+        return False
+    # dash 在 dash+suspect 中占多数
+    if dash_count >= 2 and dash_count / pair >= 0.5:
+        return True
+    # 多值列：multi 明显多于 suspect（原逻辑）
+    if dash_count + multi_char_count >= 2 and multi_char_count > suspect_count:
+        return True
+    # dash+suspect 占非空绝大多数，multi 只是少量例外（P40X268 二苯基醚二甲酰氯列）
+    all_nonempty = pair + multi_char_count
+    if dash_count >= 2 and all_nonempty >= 5 and suspect_count >= dash_count:
+        if pair / all_nonempty >= 0.75 and multi_char_count <= max(
+            3, int(round(all_nonempty * 0.2))
+        ):
+            return True
+    return False
+
+
+def _fill_dash_in_empty_cells(
+    cells: List[Dict[str, Any]],
+    dash_cols: set[int],
+) -> None:
+    """缺测横线列：空单元格补 '-'（列级已确认 dash 为主）。"""
+    for cell in cells:
+        if int(cell.get("col_start") or -1) not in dash_cols:
+            continue
+        if int(cell.get("col_span", 1)) != 1:
+            continue
+        if (cell.get("text") or "").strip():
+            continue
+        cell["text"] = "-"
+        logger.debug(
+            "列 %d 空单元格补 dash: row=%d",
+            cell.get("col_start"),
+            cell.get("row_start"),
+        )
+
+
+def _fix_dash_column_consistency(
+    cells: List[Dict[str, Any]],
+    binary: Optional[np.ndarray] = None,
+) -> List[Dict[str, Any]]:
     """按列统计 dash vs '1'/'I'/'l'，当列以 dash 为主时将孤立误识翻转为 '-'。"""
     from collections import defaultdict
 
@@ -2162,6 +2212,7 @@ def _fix_dash_column_consistency(cells: List[Dict[str, Any]]) -> List[Dict[str, 
         if cs is not None and c.get("col_span", 1) == 1:
             col_cells[cs].append(c)
 
+    dash_cols: set[int] = set()
     for col_idx, col in col_cells.items():
         dash_count = 0
         suspect_cells: List[Dict[str, Any]] = []
@@ -2176,24 +2227,61 @@ def _fix_dash_column_consistency(cells: List[Dict[str, Any]]) -> List[Dict[str, 
                 suspect_cells.append(c)
             elif len(txt) > 1:
                 multi_char_count += 1
-        if not suspect_cells:
+        if not _column_should_coerce_dash_misreads(
+            dash_count, len(suspect_cells), multi_char_count
+        ):
             continue
-        total = dash_count + len(suspect_cells)
-        if total > 0 and dash_count >= 2 and dash_count / total >= 0.5:
-            for c in suspect_cells:
-                logger.debug("列 %d dash 一致性: %r → '-'", col_idx, c.get("text"))
-                c["text"] = "-"
-            continue
-        if dash_count + multi_char_count >= 2 and multi_char_count > len(suspect_cells):
-            for c in suspect_cells:
-                logger.debug("列 %d 多值列孤立误识: %r → '-'", col_idx, c.get("text"))
-                c["text"] = "-"
+        dash_cols.add(col_idx)
+        for c in suspect_cells:
+            logger.debug("列 %d dash 一致性: %r → '-'", col_idx, c.get("text"))
+            c["text"] = "-"
+
+    if dash_cols:
+        _fill_dash_in_empty_cells(cells, dash_cols)
     return cells
 
 
 # ---------------------------------------------------------------------------
 # 空单元格符号检测：○ / ◎ / △ / × 等评价符号
 # ---------------------------------------------------------------------------
+
+def _is_cross_mark(fg: np.ndarray, h_roi: int, w_roi: int) -> bool:
+    """检测 ×：两条近似正交的斜线，排除水平/竖直（横线误识）。"""
+    side = max(min(h_roi, w_roi), 1)
+    min_len = max(8, int(round(side * 0.22)))
+    thresh = max(12, int(round(side * 0.28)))
+    lines = cv2.HoughLinesP(
+        fg,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=thresh,
+        minLineLength=min_len,
+        maxLineGap=max(2, int(round(side * 0.08))),
+    )
+    if lines is None or len(lines) < 2:
+        return False
+    diagonals: List[float] = []
+    for ln in lines[:12]:
+        x1, y1, x2, y2 = (int(v) for v in ln[0])
+        length = float(np.hypot(x2 - x1, y2 - y1))
+        if length < min_len:
+            continue
+        ang = float(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+        # 跳过近水平/近竖直线段（破折号或格线残留）
+        acute = abs(ang) % 90.0
+        if acute < 12.0 or acute > 78.0:
+            continue
+        diagonals.append(ang)
+    if len(diagonals) < 2:
+        return False
+    for i in range(len(diagonals)):
+        for j in range(i + 1, len(diagonals)):
+            diff = abs(diagonals[i] - diagonals[j])
+            diff = min(diff, 360.0 - diff)
+            if 65.0 <= diff <= 115.0:
+                return True
+    return False
+
 
 def _detect_eval_symbol(roi: np.ndarray) -> Optional[str]:
     """对单元格 ROI（二值图，前景=255）做轮廓分析，识别评价符号。"""
@@ -2248,6 +2336,9 @@ def _detect_eval_symbol(roi: np.ndarray) -> Optional[str]:
         return "○"
     if triangular:
         return "△"
+
+    if _is_cross_mark(fg, h_roi, w_roi):
+        return "×"
 
     return None
 

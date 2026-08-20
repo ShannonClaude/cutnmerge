@@ -431,6 +431,49 @@ def _column_has_data_values(
     return False
 
 
+def _colspan_sibling_has_body_data(
+    cells: Sequence[Dict[str, Any]], col: int, header_end: int
+) -> bool:
+    """表头 colspan 带内除 col 外是否另有列承担表体数据（幽灵列典型模式）。"""
+    for cell in cells:
+        cs, ce = int(cell["col_start"]), int(cell["col_end"])
+        if ce <= cs or int(cell["row_start"]) > header_end:
+            continue
+        if not (cs <= col <= ce):
+            continue
+        for sibling in range(cs, ce + 1):
+            if sibling != col and (
+                _column_has_data_values(cells, sibling)
+                or _column_has_body_content(cells, sibling, header_end)
+            ):
+                return True
+    return False
+
+
+def _column_has_body_content(
+    cells: Sequence[Dict[str, Any]],
+    col: int,
+    header_end: int,
+    *,
+    skip_rows: Optional[Set[int]] = None,
+) -> bool:
+    """表体行该列是否有非碎片文本（含 溶解/不溶 等分类值）。"""
+    skip = skip_rows or set()
+    for cell in cells:
+        rs, re = int(cell["row_start"]), int(cell["row_end"])
+        if rs <= header_end:
+            continue
+        if skip and not skip.isdisjoint(range(rs, re + 1)):
+            continue
+        cs, ce = int(cell["col_start"]), int(cell["col_end"])
+        if cs != ce or cs != col:
+            continue
+        t = str(cell.get("text") or "").strip()
+        if t and not _is_cell_frag(t):
+            return True
+    return False
+
+
 def _header_colspan_spans(cells: Sequence[Dict[str, Any]]) -> Set[Tuple[int, int]]:
     header_end = _effective_header_end(cells)
     spans: Set[Tuple[int, int]] = set()
@@ -803,6 +846,74 @@ def _body_anchors_between(
     return False
 
 
+def _column_has_upper_header(
+    cells: Sequence[Dict[str, Any]],
+    row: int,
+    col_start: int,
+    col_end: int,
+) -> bool:
+    """单位格正上方同列是否有表头描述（如 显影膜损失量 在上、(μm) 在下）。"""
+    if row < 1:
+        return False
+    upper_row = row - 1
+    for c in cells:
+        if c.get("_drop_render"):
+            continue
+        if int(c["row_start"]) > upper_row or int(c["row_end"]) < upper_row:
+            continue
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        if cs <= col_end and ce >= col_start:
+            if str(c.get("text") or "").strip():
+                return True
+    return False
+
+
+_METRIC_SUMMARY_LABEL_RE = re.compile(r"分辨率|耐热性|粘合强度|应力")
+
+
+def _row_has_trailing_data_values(
+    cells: Sequence[Dict[str, Any]], row: int, after_col: int
+) -> bool:
+    """标签区右侧同一行是否已有实施例数值（测量汇总行）。"""
+    for c in cells:
+        if int(c["row_start"]) != row or int(c["row_end"]) != row:
+            continue
+        if int(c["col_start"]) <= after_col:
+            continue
+        t = str(c.get("text") or "").strip()
+        if t and _looks_like_data_value(t):
+            return True
+    return False
+
+
+def _should_merge_label_with_unit_tail(
+    cells: Sequence[Dict[str, Any]],
+    label_cell: Dict[str, Any],
+    unit_cell: Dict[str, Any],
+) -> bool:
+    """
+    同行标签 + 括号单位是否应合成一格。
+
+    - P24 测量汇总行（分辨率 + 同行数值）：合并为「分辨率(μm)」
+    - P33 / 嵌套表头（单位列上方有独立列头、同行无数值）：保持分列
+    """
+    label_text = str(label_cell.get("text") or "").strip()
+    unit_text = str(unit_cell.get("text") or "").strip()
+    if not _is_header_unit_line(unit_text):
+        return False
+    row = int(label_cell["row_start"])
+    unit_cs = int(unit_cell["col_start"])
+    unit_ce = int(unit_cell["col_end"])
+    if not _column_has_upper_header(cells, row, unit_cs, unit_ce):
+        return True
+    if not _METRIC_SUMMARY_LABEL_RE.search(label_text):
+        return False
+    first_data = _first_example_data_column(cells)
+    if first_data is not None:
+        return _row_has_trailing_data_values(cells, row, first_data - 1)
+    return _row_has_trailing_data_values(cells, row, int(label_cell["col_end"]))
+
+
 def _merge_leading_empty_into_label(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """行首空列并入右侧中文标签格；同行「分辨率」+(μm) 合成单格。"""
     if not cells:
@@ -851,8 +962,7 @@ def _merge_leading_empty_into_label(cells: List[Dict[str, Any]]) -> List[Dict[st
         for cell in absorbed:
             cell["_drop_render"] = True
 
-    # 分辨率 + (μm) 等同属性标签与单位格合并
-    _UNIT_TAIL_RE = re.compile(r"^[\(（]?\s*μm\s*[\)）]?$", re.I)
+    # 分辨率 + (μm) 等：按表格结构决定同行合并或保持分列
     for row_cells in by_row.values():
         row_cells.sort(key=lambda c: int(c["col_start"]))
         for i, cell in enumerate(row_cells):
@@ -864,9 +974,9 @@ def _merge_leading_empty_into_label(cells: List[Dict[str, Any]]) -> List[Dict[st
             nxt = row_cells[i + 1]
             if int(nxt["col_start"]) != int(cell["col_end"]) + 1:
                 continue
-            nt = str(nxt.get("text") or "").strip()
-            if not _UNIT_TAIL_RE.fullmatch(nt):
+            if not _should_merge_label_with_unit_tail(cells, cell, nxt):
                 continue
+            nt = str(nxt.get("text") or "").strip()
             cell["text"] = f"{t}{nt}"
             cell["col_end"] = int(nxt["col_end"])
             cell["col_span"] = int(cell["col_end"]) - int(cell["col_start"]) + 1
@@ -977,6 +1087,12 @@ def _merge_leading_label_gaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
                 break
             if _column_has_data_values(work, col, skip_rows={row_idx}):
                 break
+            # 数据列左侧的空列常为排版幽灵列（P28 label|ghost|data），勿并进标签
+            if (
+                _column_has_data_values(work, col + 1, skip_rows={row_idx})
+                and not _column_has_data_values(work, col, skip_rows={row_idx})
+            ):
+                break
             merge_until = int(cell["col_end"])
             absorbed.append(cell)
         if not absorbed:
@@ -1001,7 +1117,12 @@ def _is_cell_frag(text: str) -> bool:
     # 单字母等级代号是表体数据，不是空角碎片
     if _LETTER_DATA_RE.fullmatch(compact):
         return False
-    return len(compact) <= 2
+    if len(compact) <= 2:
+        # 两汉字表体/表头词（溶解/不溶等）
+        if re.fullmatch(r"[\u4e00-\u9fff]{2}", compact):
+            return False
+        return True
+    return False
 
 
 def _merge_text_into_cell(cell: Dict[str, Any], text: str) -> None:
@@ -1281,16 +1402,69 @@ def _drop_body_empty_columns(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]
         covered = col_to_cells.get(col, [])
         if not covered:
             continue
-        # 该列有数据值（数字/缺测横线等） → 真实数据列
-        if _column_has_data_values(cells, col):
+        # 该列有数据值（数字/缺测横线等）或分类表体文本 → 真实数据列
+        if _column_has_data_values(cells, col) or _column_has_body_content(
+            cells, col, header_end
+        ):
             continue
-        # 表头带起点有实质标签（实施例列头、分散液、分辨率等）→ 保留
-        if any(
+        # 表头带起点有实质标签 → 保留；但若同 colspan 带内另有列承担表体数据，则本列是幽灵列
+        header_anchor = any(
             int(c["col_start"]) == col
             and int(c["row_start"]) <= header_end
             and not _is_cell_frag(str(c.get("text") or ""))
             for c in covered
+        )
+        if header_anchor and not _colspan_sibling_has_body_data(cells, col, header_end):
+            continue
+        # 子列表头（比较例 1 / 实施例 2 等）不是 colspan 幽灵列
+        if header_anchor and any(
+            int(c["col_start"]) == col
+            and int(c["row_start"]) <= header_end
+            and _HEADER_HAS_EXAMPLE_RE.search(str(c.get("text") or ""))
+            for c in covered
         ):
+            continue
+        # 仅含括号单位、右侧邻列有表体数据 → 幽灵列（单位文本并入右侧）
+        unit_texts = [
+            str(c.get("text") or "").strip()
+            for c in covered
+            if str(c.get("text") or "").strip() and _is_header_unit_line(str(c.get("text") or ""))
+        ]
+        if (
+            unit_texts
+            and not _column_has_data_values(cells, col)
+            and col + 1 <= max_col
+            and _column_has_data_values(cells, col + 1)
+        ):
+            for c in covered:
+                if int(c["col_start"]) != col:
+                    continue
+                t = str(c.get("text") or "").strip()
+                if not t or not _is_header_unit_line(t):
+                    continue
+                row = int(c["row_start"])
+                target = None
+                # 同行右侧格
+                for rc in col_to_cells.get(col + 1, []):
+                    if int(rc["col_start"]) == col + 1 and int(rc["row_start"]) == row:
+                        target = rc
+                        break
+                # 表头叠放：并入上一行或同 span 的描述性表头
+                if target is None and row > 0:
+                    for rc in col_to_cells.get(col + 1, []):
+                        if int(rc["col_start"]) != col + 1:
+                            continue
+                        if int(rc["row_start"]) <= header_end and int(rc["row_end"]) >= row - 1:
+                            if str(rc.get("text") or "").strip() and not _is_header_unit_line(
+                                str(rc.get("text") or "")
+                            ):
+                                target = rc
+                                break
+                if target is not None:
+                    ut = str(target.get("text") or "").strip()
+                    target["text"] = (ut + "\n" + t) if ut else t
+                    c["text"] = ""
+            dropped.add(col)
             continue
         # 该列是某 cell 的 col_start 且有行标签等实质非数据文本 → 保留
         # （如「实施例 1」「聚酰亚胺」等，但不含短单位 "(mJ/cm2)"）
@@ -1378,6 +1552,43 @@ def _drop_body_empty_columns(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return out
 
 
+def _drop_fully_empty_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """删除该行所有起点格均无文本的逻辑行（幽灵表头/间隙行）。
+
+    仅看 ``row_start == row`` 的起点格；纯 rowspan 延续行（无起点）保留。
+    """
+    if not cells:
+        return cells
+    max_row = max(int(c["row_end"]) for c in cells)
+    dropped: Set[int] = set()
+    for row in range(max_row + 1):
+        origins = [c for c in cells if int(c["row_start"]) == row]
+        if not origins:
+            continue
+        if all(not str(c.get("text") or "").strip() for c in origins):
+            dropped.add(row)
+    if not dropped:
+        return cells
+    kept_rows = [i for i in range(max_row + 1) if i not in dropped]
+    if not kept_rows:
+        return cells
+    remap = {old: new for new, old in enumerate(kept_rows)}
+    out: List[Dict[str, Any]] = []
+    for c in cells:
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        new_idxs = [remap[i] for i in range(rs, re + 1) if i in remap]
+        if not new_idxs:
+            continue
+        nc = dict(c)
+        nc["row_start"] = min(new_idxs)
+        nc["row_end"] = max(new_idxs)
+        nc["row_span"] = nc["row_end"] - nc["row_start"] + 1
+        out.append(nc)
+    if dropped:
+        logger.info("删除全空逻辑行: %s", sorted(dropped))
+    return out
+
+
 def drop_noise_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     丢弃几乎全空、仅含孤立噪声字符的逻辑行（如表末幻觉 'L'）。
@@ -1430,23 +1641,96 @@ def drop_noise_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+_HEADER_HAS_EXAMPLE_RE = re.compile(r"实[施試]例|実[施試]例|比較例|比较例|参考例")
+_HEADER_UNIT_RE = re.compile(
+    r"^[\(（][\w%°℃²³/\s\.\-μ]+[\)）]$"
+)
+
+
+def _is_header_unit_line(text: str) -> bool:
+    """括号包裹的纯单位文本，如 (mJ/cm2)、(mN)、(%)、(℃)。"""
+    t = "".join((text or "").split())
+    return bool(t) and bool(_HEADER_UNIT_RE.fullmatch(t))
+
+
+def _row_is_unit_subheader(cells: Sequence[Dict[str, Any]], row: int) -> bool:
+    """整行非空格均为括号单位 → 二级表头单位行（P28/P29）。"""
+    row_cells = [
+        c
+        for c in cells
+        if int(c["row_start"]) == row == int(c["row_end"])
+    ]
+    non_empty = [c for c in row_cells if str(c.get("text") or "").strip()]
+    if not non_empty:
+        return False
+    return all(_is_header_unit_line(str(c.get("text") or "")) for c in non_empty)
+
+
+def _row_has_descriptive_header(cells: Sequence[Dict[str, Any]], row: int) -> bool:
+    """该行是否存在描述性表头（非单位/非表体数据/非行标签）。"""
+    for c in cells:
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        if not (rs <= row <= re):
+            continue
+        t = str(c.get("text") or "").strip()
+        if not t or _is_header_unit_line(t):
+            continue
+        if _looks_like_data_value(t):
+            continue
+        if _HEADER_HAS_EXAMPLE_RE.search(t):
+            continue
+        return True
+    return False
+
+
+def _extend_header_end_for_unit_rows(
+    cells: Sequence[Dict[str, Any]],
+    header_end: int,
+    *,
+    cap_row: int | None = None,
+) -> int:
+    """无 rowspan 时，把紧挨其下的「纯单位行」纳入顶表头带。"""
+    if header_end < 0:
+        header_end = 0
+    max_row = max(int(c["row_end"]) for c in cells)
+    stop = cap_row if cap_row is not None else max_row + 1
+    he = header_end
+    for row in range(he + 1, max_row + 1):
+        if row >= stop:
+            break
+        if _row_is_unit_subheader(cells, row) and _row_has_descriptive_header(cells, row - 1):
+            he = row
+        else:
+            break
+    return he
+
+
 def _effective_header_end(cells: Sequence[Dict[str, Any]]) -> int:
     """顶表头带末行；无 rowspan 线索时取首个有字身行之上。"""
-    he = _top_header_band_end(list(cells))
-    if he >= 0:
-        return he
-    body_starts = [
-        int(c["row_start"])
-        for c in cells
-        if str(c.get("text") or "").strip() and not _is_cell_frag(str(c.get("text") or ""))
-    ]
-    if not body_starts:
-        return 0
-    return max(0, min(body_starts) - 1)
+    cell_list = list(cells)
+    he = _top_header_band_end(cell_list)
+    if he < 0:
+        body_starts = [
+            int(c["row_start"])
+            for c in cell_list
+            if str(c.get("text") or "").strip()
+            and not _is_cell_frag(str(c.get("text") or ""))
+            and not _is_header_unit_line(str(c.get("text") or ""))
+            and not _HEADER_HAS_EXAMPLE_RE.search(str(c.get("text") or ""))
+        ]
+        he = max(0, min(body_starts) - 1) if body_starts else 0
+    first_body_stub: int | None = None
+    for c in cell_list:
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        cs = int(c["col_start"])
+        if re > rs and rs >= 2 and cs <= 1:
+            first_body_stub = rs if first_body_stub is None else min(first_body_stub, rs)
+    return _extend_header_end_for_unit_rows(
+        cell_list, he, cap_row=first_body_stub
+    )
 
 
 _LONE_EXAMPLE_NUM_RE = re.compile(r"^\d+$")
-_HEADER_HAS_EXAMPLE_RE = re.compile(r"实[施試]例|実[施試]例|比較例|比较例|参考例")
 
 
 def _repair_lone_example_number_headers(
@@ -1494,18 +1778,46 @@ def _top_header_band_end(cells: List[Dict[str, Any]]) -> int:
     if first_body_stub is not None:
         cap = first_body_stub - 1
         header_end = cap if header_end < 0 else min(header_end, cap)
-    return header_end
+    if header_end < 0:
+        header_end = 0
+    return _extend_header_end_for_unit_rows(
+        cells, header_end, cap_row=first_body_stub
+    )
 
 
-_HEADER_UNIT_RE = re.compile(
-    r"^[\(（][\w%°℃²³/\s\.\-μ]+[\)）]$"
-)
+def _header_cell_above(
+    cells: Sequence[Dict[str, Any]], row: int, cs: int, ce: int
+) -> Dict[str, Any] | None:
+    """单位子表头正上方、列范围被覆盖的描述性表头格（支持 colspan 父格）。"""
+    upper_row = row - 1
+    best: Dict[str, Any] | None = None
+    best_span = 10**9
+    for c in cells:
+        if int(c["row_start"]) > upper_row or int(c["row_end"]) < upper_row:
+            continue
+        pcs, pce = int(c["col_start"]), int(c["col_end"])
+        if pcs > cs or pce < ce:
+            continue
+        t = str(c.get("text") or "").strip()
+        if not t or _is_header_unit_line(t):
+            continue
+        span = pce - pcs
+        if span < best_span:
+            best = c
+            best_span = span
+    return best
 
 
-def _is_header_unit_line(text: str) -> bool:
-    """括号包裹的纯单位文本，如 (mJ/cm2)、(mN)、(%)、(℃)。"""
-    t = "".join((text or "").split())
-    return bool(t) and bool(_HEADER_UNIT_RE.fullmatch(t))
+def _split_mismerged_unit_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """单位格被误扩 rowspan 时收回单行，避免 P29 单位行错位。"""
+    for c in cells:
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        if re <= rs:
+            continue
+        if _is_header_unit_line(str(c.get("text") or "")):
+            c["row_end"] = rs
+            c["row_span"] = 1
+    return cells
 
 
 def _merge_header_unit_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1545,11 +1857,10 @@ def _merge_header_unit_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         if not non_empty:
             continue
         if all(_is_header_unit_line(str(c.get("text") or "").strip()) for c in non_empty):
-            # 还需上方行存在描述性表头
             has_upper = False
             for c in non_empty:
                 cs, ce = int(c["col_start"]), int(c["col_end"])
-                upper = by_key.get((row - 1, cs, ce))
+                upper = _header_cell_above(cells, row, cs, ce)
                 if upper and str(upper.get("text") or "").strip():
                     has_upper = True
                     break
@@ -1564,11 +1875,11 @@ def _merge_header_unit_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         for c in by_row.get(row, []):
             t = str(c.get("text") or "").strip()
             cs, ce = int(c["col_start"]), int(c["col_end"])
-            upper = by_key.get((row - 1, cs, ce))
+            upper = _header_cell_above(cells, row, cs, ce)
             if upper and t:
                 ut = str(upper.get("text") or "").strip()
                 upper["text"] = ut + "\n" + t if ut else t
-                upper["row_end"] = int(c["row_end"])
+                upper["row_end"] = max(int(upper["row_end"]), int(c["row_end"]))
                 upper["row_span"] = int(upper["row_end"]) - int(upper["row_start"]) + 1
             dropped_ids.add(id(c))
 
@@ -1605,9 +1916,39 @@ def _split_example_header_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str
     return cells
 
 
+_HEADER_SUBCOL_CODE_RE = re.compile(
+    r"^(?:"
+    r"[A-Za-zα-ωΑ-Ω][A-Za-zα-ωΑ-Ω0-9\-\+']*|"
+    r"摩尔[%％]"
+    r")$"
+)
+
+
+def _is_stacked_header_label(text: str) -> bool:
+    """表头同列纵向叠放的中文标签（非子列代号/单位/数据）。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    compact = "".join(t.split())
+    if len(compact) <= 2 or compact in {"-", "—", "_"}:
+        return False
+    if compact.startswith("(") or compact.startswith("（"):
+        return False
+    if _is_header_unit_line(t):
+        return False
+    if _EXAMPLE_COL_HEADER_RE.search(t):
+        return False
+    if _DATA_VALUE_RE.fullmatch(compact) or _LETTER_DATA_RE.fullmatch(compact):
+        return False
+    if _HEADER_SUBCOL_CODE_RE.fullmatch(compact):
+        return False
+    return bool(re.search(r"[\u4e00-\u9fff]", t))
+
+
 def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    合并表头中：上方有“实文本”的单行格，且正下方同列范围是空/碎片文本的单行格。
+    合并表头中：上方有“实文本”的单行格，且正下方同列范围是空/碎片文本的单行格；
+    或上下两层均为应纵向叠在同一格的中文标签（如 P40「二苯基醚/二甲酰氯」）。
 
     目标修复：诸如 P100X888 的“分散液”表头被切成两层的情况。
     仅在真正的顶表头带内合并，不用表体左侧大行头去扩大截止行。
@@ -1682,6 +2023,17 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
         if not upper_text or _is_frag_or_empty(upper_text):
             out.append(upper)
             continue
+        # 上层 colspan 组头覆盖多列 → 子列头不得纵向叠字合并（P32 溶解性/粘度）
+        under_colspan_parent = False
+        if ur > 0:
+            for pc in cells:
+                prs, pre = int(pc["row_start"]), int(pc["row_end"])
+                if not (prs <= ur - 1 <= pre):
+                    continue
+                pcs, pce = int(pc["col_start"]), int(pc["col_end"])
+                if pce > pcs and pcs <= uc_s <= pce:
+                    under_colspan_parent = True
+                    break
         # 实施例/比较例列头不得向下吞并（下层常为 A/B/C 等数据字母）
         if _EXAMPLE_COL_HEADER_RE.search(upper_text):
             out.append(upper)
@@ -1697,8 +2049,25 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
             out.append(upper)
             continue
 
-        lower_text = str(lower.get("text") or "")
+        lower_text = str(lower.get("text") or "").strip()
         if not _is_frag_or_empty(lower_text):
+            if (
+                _is_stacked_header_label(upper_text)
+                and _is_stacked_header_label(lower_text)
+            ):
+                if under_colspan_parent:
+                    out.append(upper)
+                    continue
+                upper["text"] = (
+                    upper_text + "\n" + lower_text
+                    if upper_text
+                    else lower_text
+                )
+                upper["row_end"] = int(lower["row_end"])
+                upper["row_span"] = int(upper["row_end"]) - int(upper["row_start"]) + 1
+                dropped_ids.add(id(lower))
+                out.append(upper)
+                continue
             out.append(upper)
             continue
 
@@ -1741,16 +2110,17 @@ def cells_to_html_table(
     work = _split_label_over_data_columns(work)
     work = _split_header_over_index_column(work)
     work = _collapse_header_empty_corners(work)
-    work = _merge_leading_empty_into_label(work)
-    work = _merge_leading_label_gaps(work)
-    # 去掉原先只处理“行首标签”的非对称美化；改为对称幽灵行/列清理
     work = drop_evidenceless_columns(work)
     work = _drop_body_empty_columns(work)
+    work = _merge_leading_empty_into_label(work)
+    work = _merge_leading_label_gaps(work)
     work = drop_evidenceless_rows(work)
+    work = _drop_fully_empty_rows(work)
     work = drop_noise_rows(work)
     if compress_empty:
         work = compress_empty_logic_columns(work)
         work = compress_empty_logic_rows(work)
+    work = _split_mismerged_unit_rowspans(work)
     work = _merge_header_unit_rows(work)
     work = _merge_header_empty_below(work)
     work = [c for c in work if not c.get("_drop_render")]

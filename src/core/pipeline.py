@@ -46,6 +46,7 @@ from ..structure.tsr import (
 from ..structure.tsr_refine import (
     coverage_score,
     logic_conflict_ratio,
+    merge_ghost_columns,
     reconstruct_header_cells,
     refine_tsr_cells,
     refine_tsr_cells_light,
@@ -242,7 +243,7 @@ def _extract_via_lines(
             col_seps=table.col_seps,
             v_separators=table.v_separators,
         )
-        cells = _fix_dash_column_consistency(cells)
+        cells = _fix_dash_column_consistency(cells, binary=binary)
         cells = detect_eval_symbols_in_empty_cells(cells, binary)
         cells = upgrade_o_to_double_circle(cells, binary)
         cells = recover_empty_vertical_headers(
@@ -326,16 +327,16 @@ def _extract_via_lore(
             [], text_boxes, compress_empty_cols=compress_empty_cols
         )
         return outs, []
+    lore_binary = binarize_otsu(image)
     cells, free_texts = assign_texts_to_cells(
         cells,
         text_boxes,
         ioa_threshold=ioa_threshold,
         split_cross_cell=True,
         table_bboxes=None,
-        binary=binarize_otsu(image),
+        binary=lore_binary,
     )
-    cells = _fix_dash_column_consistency(cells)
-    lore_binary = binarize_otsu(image)
+    cells = _fix_dash_column_consistency(cells, binary=lore_binary)
     cells = detect_eval_symbols_in_empty_cells(cells, lore_binary)
     cells = upgrade_o_to_double_circle(cells, lore_binary)
     cells = recover_empty_vertical_headers(
@@ -398,6 +399,7 @@ def _extract_via_tsr(
                 cells = fuse_tsr_with_lines(cells, line_tables)
         else:
             light_cells = refine_tsr_cells_light(cells)
+            light_cells = merge_ghost_columns(light_cells, text_boxes)
             light_cells = repair_monomer_parent_spans(light_cells, text_boxes)
             conflict_ratio = logic_conflict_ratio(light_cells)
             if conflict_ratio > _LIGHT_ESCALATE_CONFLICT_RATIO:
@@ -552,7 +554,7 @@ def _extract_via_tsr(
         col_seps=col_seps,
         v_separators=v_separators,
     )
-    cells = _fix_dash_column_consistency(cells)
+    cells = _fix_dash_column_consistency(cells, binary=binary)
     cells = detect_eval_symbols_in_empty_cells(cells, binary)
     cells = upgrade_o_to_double_circle(cells, binary)
     cells = peel_row_header_text(cells, text_boxes)

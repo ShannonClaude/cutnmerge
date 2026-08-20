@@ -376,6 +376,8 @@ def _looks_like_garbage_ink(
     t = (text or "").strip()
     if not t:
         return False
+    if t in {"×", "x", "X"}:
+        return False
     if _DASH_CANDIDATE_RE.match(t):
         return False
     if score >= 0.85:

@@ -316,6 +316,9 @@ def _looks_like_ocr_fragment(text: str) -> bool:
         return True
     compact = re.sub(r"\s+", "", t)
     if len(compact) <= 2:
+        # 两汉字表体词（溶解/不溶/判定等）不是 OCR 碎片
+        if re.fullmatch(r"[\u4e00-\u9fff]{2}", compact):
+            return False
         return True
     if re.fullmatch(r"[0-9一二三四五六七八九十]+", compact):
         return True
