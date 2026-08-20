@@ -206,6 +206,31 @@ def test_vline_keeps_true_dual_subheaders():
     assert all(int(c.get("col_span") or 1) == 1 for c in row1)
 
 
+def test_vline_keeps_short_standalone_alkenyl_header():
+    """P98：长卤素列头 + 短「烯基」→ 不得 colspan 杂糅。"""
+    binary = _blank(h=220, w=320)
+    _draw_vline(binary, 150, 120, 200, thickness=3)
+    cells = [
+        _cell(10, 60, 145, 110, 1, 1, 0),
+        _cell(155, 60, 290, 110, 1, 1, 1),
+        _cell(10, 120, 145, 170, 2, 2, 0),
+        _cell(155, 120, 290, 170, 2, 2, 1),
+    ]
+    boxes = [
+        _tb("以卤素", 20, 62, 90, 78),
+        _tb("作为取代", 18, 78, 100, 94),
+        _tb("基的基团", 18, 94, 100, 108),
+        _tb("烯基", 175, 75, 230, 100),
+        _tb("合成例8", 20, 125, 100, 165),
+    ]
+    out = repair_colspans_by_vline_gaps(cells, binary, boxes)
+    row1 = [c for c in out if int(c["row_start"]) == 1]
+    assert len(row1) == 2, [
+        (c["col_start"], c["col_end"], c.get("col_span")) for c in row1
+    ]
+    assert all(int(c.get("col_span") or 1) == 1 for c in row1)
+
+
 def test_wrap_rowspan_merge_substantive_cjk():
     """同列折行长中文表头 → rowspan 合并。"""
     binary = _blank(h=200, w=200)
@@ -337,6 +362,7 @@ def main():
     test_body_boundary_not_touched()
     test_vline_colspan_merges_when_body_has_line()
     test_vline_keeps_true_dual_subheaders()
+    test_vline_keeps_short_standalone_alkenyl_header()
     test_wrap_rowspan_merge_substantive_cjk()
     test_vline_absorbs_empty_peers_into_right_group_header()
     test_vline_still_absorbs_empty_on_right_of_label()

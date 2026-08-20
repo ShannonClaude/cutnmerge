@@ -33,6 +33,11 @@ _CJK_RE = re.compile(
 _SUBHEADER_TAIL_RE = re.compile(
     r"(衍生物|化合物|单体|封端剂|硅烷|当量|比率|低聚物|\)|）)$"
 )
+# 短而完整的独立列头（P98「烯基」等）；不含「二羟基」这类可拼回前缀
+_STANDALONE_SHORT_HDR_RE = re.compile(
+    r"^(硝基|烯基|烷基|芳基|酰基|氨基|羟基|羧基|巯基|氰基|"
+    r"醛基|酮基|醚基|酯基|卤素|粘度|酸值)$"
+)
 
 
 def _tb_bbox(tb: Dict[str, Any]) -> Tuple[float, float, float, float]:
@@ -142,9 +147,27 @@ def _substantive_cjk_label(text: str) -> bool:
     return bool(_SUBHEADER_TAIL_RE.search(t))
 
 
+def _is_standalone_short_header(text: str) -> bool:
+    """短独立列头（如「烯基」），不可当碎片吞进邻列。"""
+    t = _compact(text)
+    return bool(t and _STANDALONE_SHORT_HDR_RE.fullmatch(t))
+
+
 def _looks_like_two_independent_subheaders(left_text: str, right_text: str) -> bool:
     """两侧 OCR 都像独立子表头时，禁止 colspan 合并。"""
-    return _substantive_cjk_label(left_text) and _substantive_cjk_label(right_text)
+    if _substantive_cjk_label(left_text) and _substantive_cjk_label(right_text):
+        return True
+    l, r = _compact(left_text), _compact(right_text)
+    # 一侧是短完整列头、另一侧仍有标签文本 → 禁止合并（P98 卤素列 vs 烯基）
+    if _is_standalone_short_header(l) and (
+        _substantive_cjk_label(r) or (_CJK_RE.search(r) and len(r) >= 2)
+    ):
+        return True
+    if _is_standalone_short_header(r) and (
+        _substantive_cjk_label(l) or (_CJK_RE.search(l) and len(l) >= 2)
+    ):
+        return True
+    return False
 
 
 def _same_column_wrap(
