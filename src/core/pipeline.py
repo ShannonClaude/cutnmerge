@@ -44,13 +44,16 @@ from ..structure.tsr import (
     render_table_vis_logic,
 )
 from ..structure.tsr_refine import (
+    cell_grid_stats,
     coverage_score,
     logic_conflict_ratio,
+    looks_oversegmented,
     merge_ghost_columns,
     reconstruct_header_cells,
     refine_tsr_cells,
     refine_tsr_cells_light,
     repair_monomer_parent_spans,
+    structure_quality_score,
 )
 
 logger = logging.getLogger(__name__)
@@ -438,13 +441,31 @@ def _extract_via_tsr(
     # 覆盖率偏低或格子过少时回退（竖排表头等场景常出现「有格但几乎填不进」）
     n_boxes = max(len(text_boxes), 1)
     too_few_cells = bool(cells) and len(cells) < max(8, n_boxes // 8)
-    if (not cells or cov < 0.55 or too_few_cells) and fallback_lines:
-        logger.info(
-            "TSR 质量不足(cov=%.3f cells=%d boxes=%d)，--fallback-lines 回退框线路径",
-            cov,
-            len(cells or []),
-            len(text_boxes),
+    # TSR 把多行单元格切成碎逻辑行时 cov 仍可能很高，须单独识别过切
+    overseg = bool(cells) and looks_oversegmented(cells, text_boxes)
+    need_lines_fallback = bool(
+        (not cells or cov < 0.55 or too_few_cells) and fallback_lines
+    ) or overseg
+    if need_lines_fallback:
+        n_cols, n_rows, n_cells = (
+            cell_grid_stats(cells) if cells else (0, 0, 0)
         )
+        if overseg:
+            logger.info(
+                "TSR 过切(cols=%d rows=%d cells=%d boxes=%d cov=%.3f)，尝试框线回退",
+                n_cols,
+                n_rows,
+                n_cells,
+                len(text_boxes),
+                cov,
+            )
+        else:
+            logger.info(
+                "TSR 质量不足(cov=%.3f cells=%d boxes=%d)，--fallback-lines 回退框线路径",
+                cov,
+                len(cells or []),
+                len(text_boxes),
+            )
         outs, tables, _, _ = _extract_via_lines(
             image,
             text_boxes,
@@ -456,7 +477,32 @@ def _extract_via_tsr(
             use_cache=use_cache,
             refresh_cache=refresh_cache,
         )
-        return outs, tables
+        line_cells: List[Dict[str, Any]] = []
+        for t in tables or []:
+            line_cells.extend(list(getattr(t, "cells", None) or []))
+        if not overseg:
+            return outs, tables
+        # 过切场景：框线不过切，或行数明显收敛时采用框线
+        if line_cells:
+            lc, lr, ln = cell_grid_stats(line_cells)
+            line_ok = not looks_oversegmented(line_cells, text_boxes)
+            rows_improved = lr < n_rows * 0.65 and lr >= 4
+            qual_ok = (
+                structure_quality_score(line_cells, text_boxes)
+                >= structure_quality_score(cells, text_boxes) - 0.05
+            )
+            if (line_ok or rows_improved) and qual_ok:
+                logger.info(
+                    "TSR 过切已回退框线: cells %d→%d rows %d→%d cols %d→%d",
+                    n_cells,
+                    ln,
+                    n_rows,
+                    lr,
+                    n_cols,
+                    lc,
+                )
+                return outs, tables
+        logger.info("框线回退未改善过切，保留 TSR 结果")
 
     if not cells:
         outs = _render_outputs(

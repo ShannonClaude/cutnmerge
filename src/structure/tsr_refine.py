@@ -854,14 +854,19 @@ def looks_oversegmented(
     cells: Sequence[Dict[str, Any]],
     text_boxes: Sequence[Dict[str, Any]],
 ) -> bool:
-    """列/行/格数相对 OCR 过多 → 过切（后处理易塌缩）。"""
+    """列/行/格数相对 OCR 过多 → 过切（后处理易塌缩）。
+
+    注意：有线完整表常见「行数 ≈ 文本框数/4~6」；阈值须高于该量级，
+    避免把正常的 30+ 行数据表误判为过切（进而拒绝框线回退）。
+    """
     if not cells or not text_boxes:
         return False
     n_boxes = len(text_boxes)
     n_cols, n_rows, n = cell_grid_stats(cells)
     if n_cols >= 32:
         return True
-    if n_rows >= 32 and n_rows > max(16, n_boxes // 6):
+    # 行过切：逻辑行显著多于「每行约 3 个 OCR 框」的上限，且至少 40 行
+    if n_rows >= 40 and n_rows > max(24, n_boxes // 3):
         return True
     if n > n_boxes * 1.05 and (n_cols >= 28 or n_rows >= 40):
         return True
