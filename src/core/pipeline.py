@@ -26,8 +26,8 @@ from ..ocr.ocr_post import postprocess_text_boxes
 from ..ocr.reocr import apply_reocr_to_cells, recover_empty_vertical_headers
 from ..output.formatter import format_free_texts
 from ..output.html2md import html_to_markdown
-from ..output.html_formatter import build_html_output
-from ..preprocess.orient import apply_orientation_axis, ensure_upright_axis, maybe_flip_180_by_ocr
+from ..output.html_formatter import build_html_output, html_output_looks_broken
+from ..preprocess.orient import apply_orientation_axis, ensure_upright_axis, maybe_flip_180_by_ocr, parse_orientation_mode
 from ..structure.grid_fusion import fuse_tsr_with_lines
 from ..structure.lines import (
     DetectedTable,
@@ -638,6 +638,7 @@ def extract_table_output(
     tsr_aggressive: bool = False,
     save_vis: bool = True,
     vis_dir: Optional[Union[str, Path]] = None,
+    _allow_orient_retry: bool = True,
 ) -> Dict[str, Any]:
     """
     复杂表格解耦提取 Pipeline。
@@ -806,13 +807,54 @@ def extract_table_output(
     html = outputs.get("html") or ""
     md = html_to_markdown(html) if html.strip() else ""
 
-    return {
+    result = {
         "html": html,
         "md": md,
         "structure": structure,
         "orientation": int(orient_angle),
         "vis_paths": vis_paths,
     }
+
+    # 误转 90°/270° 时 HTML 会大量空行 + 异常 rowspan；用 0° 重试一次（不递归）。
+    parsed_orient = parse_orientation_mode(orientation)
+    can_retry_upright = (
+        parsed_orient in {90, 270}
+        or (parsed_orient == "auto" and int(orient_angle) % 180 == 90)
+    )
+    if can_retry_upright and _allow_orient_retry and html_output_looks_broken(html):
+        logger.warning(
+            "输出疑似侧躺损坏(orient=%s)，改用 orientation=0 重试",
+            orient_angle,
+        )
+        retry = extract_table_output(
+            image_path,
+            ioa_threshold=ioa_threshold,
+            deskew=deskew,
+            max_skew_angle=max_skew_angle,
+            lore_pipe=lore_pipe,
+            ocr_engine=ocr,
+            structure=structure,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+            compress_empty_cols=compress_empty_cols,
+            fallback_lines=fallback_lines,
+            orientation=0,
+            debug=debug,
+            debug_dir=debug_dir,
+            debug_stem=debug_stem,
+            reocr=reocr,
+            reocr_max_cells=reocr_max_cells,
+            tsr_kind=tsr_kind,
+            tsr_aggressive=tsr_aggressive,
+            save_vis=save_vis,
+            vis_dir=vis_dir,
+            _allow_orient_retry=False,
+        )
+        if not html_output_looks_broken(retry.get("html") or ""):
+            return retry
+        logger.warning("orientation=0 重试仍异常，保留原结果")
+
+    return result
 
 
 def extract_table_markdown(

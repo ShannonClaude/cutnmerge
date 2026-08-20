@@ -2290,3 +2290,39 @@ def build_html_output(
     if prefix_html and table:
         return prefix_html + "\n\n" + table
     return prefix_html or table or ""
+
+
+def html_output_looks_broken(html_text: str) -> bool:
+    """
+    检测侧躺/行列颠倒等灾难性 HTML（大量空行、异常 rowspan、实施例横排成表）。
+
+    用于在误转 90° 等场景下触发 0° 重试，避免污染正常表格输出。
+    """
+    if not html_text or "<table" not in html_text:
+        return False
+    empty_tr = html_text.count("<tr>\n</tr>") + html_text.count("<tr></tr>")
+    # 大量空 <tr>：rowspan 把整行撑空，是侧躺碎网格的强信号
+    if empty_tr >= 5:
+        return True
+    # 大量游离短段落（侧躺后 OCR 掉出表外）
+    free_paras = re.findall(r"<p>([^<]{1,12})</p>", html_text)
+    if len(free_paras) >= 8 and sum(1 for p in free_paras if re.fullmatch(r"[A-Za-z0-9+＋.]+|100|A\+?", p)) >= 6:
+        return True
+    first_table = re.search(r"<table[^>]*>(.*?)</table>", html_text, re.DOTALL)
+    if first_table:
+        chunk = first_table.group(1)[:2500]
+        ex_hits = len(re.findall(r"实[施試]例", chunk))
+        # 首表几乎全是实施例横排、没有正常表头词
+        if ex_hits >= 8 and "组合物" not in chunk and "灵敏度" not in chunk:
+            return True
+        # 首行连续多个「实施例」单元格（侧躺列头），即使下文误入「组合物」也判坏
+        first_tr = re.search(r"<tr>(.*?)</tr>", chunk, re.DOTALL)
+        if first_tr:
+            row0 = first_tr.group(1)
+            row0_ex = len(re.findall(r">[^<]*实[施試]例[^<]*<", row0))
+            if row0_ex >= 6:
+                return True
+        large_rowspan = len(re.findall(r'rowspan="(?:[6-9]|1[0-9]+)"', chunk))
+        if large_rowspan >= 8 and empty_tr >= 2:
+            return True
+    return False

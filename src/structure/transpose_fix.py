@@ -21,7 +21,54 @@ _MIN_ROW0_EXAMPLES = 8
 _COL_ROW_RATIO = 1.5
 
 
-def _example_label_count(cells: Sequence[Dict[str, Any]], *, row: int | None = None) -> int:
+def _tb_center(tb: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    poly = np.asarray(tb.get("polygon"), dtype=np.float64).reshape(-1, 2)
+    if poly.size < 4:
+        return None
+    return float(poly[:, 0].mean()), float(poly[:, 1].mean())
+
+
+def _cell_bbox(cell: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+    poly = np.asarray(cell.get("polygon"), dtype=np.float64).reshape(-1, 2)
+    if poly.size < 4:
+        return None
+    return (
+        float(poly[:, 0].min()),
+        float(poly[:, 1].min()),
+        float(poly[:, 0].max()),
+        float(poly[:, 1].max()),
+    )
+
+
+def _cell_containing_point(
+    cells: Sequence[Dict[str, Any]],
+    x: float,
+    y: float,
+) -> Optional[Dict[str, Any]]:
+    """点落入的最小面积单元格（用于把 OCR 框映射到逻辑格）。"""
+    best = None
+    best_area = float("inf")
+    for c in cells:
+        bb = _cell_bbox(c)
+        if bb is None:
+            continue
+        x1, y1, x2, y2 = bb
+        if not (x1 <= x <= x2 and y1 <= y <= y2):
+            continue
+        area = max(x2 - x1, 1.0) * max(y2 - y1, 1.0)
+        if area < best_area:
+            best_area = area
+            best = c
+    return best
+
+
+def _example_label_count(
+    cells: Sequence[Dict[str, Any]],
+    *,
+    row: int | None = None,
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> int:
+    """统计实施例/比较例：优先 cell.text；无文本时用 OCR 框中心映射到逻辑行。"""
     n = 0
     for c in cells:
         rs, re_ = int(c["row_start"]), int(c["row_end"])
@@ -30,10 +77,30 @@ def _example_label_count(cells: Sequence[Dict[str, Any]], *, row: int | None = N
         t = str(c.get("text") or "")
         if _EXAMPLE_LABEL_RE.search(t):
             n += 1
-    return n
+    if n > 0 or not text_boxes:
+        return n
+    # IoA 前：用 OCR 文本框映射
+    hit_cells: set[int] = set()
+    for tb in text_boxes:
+        if not _EXAMPLE_LABEL_RE.search(str(tb.get("text") or "")):
+            continue
+        ctr = _tb_center(tb)
+        if ctr is None:
+            continue
+        cell = _cell_containing_point(cells, ctr[0], ctr[1])
+        if cell is None:
+            continue
+        rs, re_ = int(cell["row_start"]), int(cell["row_end"])
+        if row is not None and not (rs <= row <= re_):
+            continue
+        hit_cells.add(id(cell))
+    return len(hit_cells)
 
 
-def _composition_labels_along_rows(cells: Sequence[Dict[str, Any]]) -> int:
+def _composition_labels_along_rows(
+    cells: Sequence[Dict[str, Any]],
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> int:
     """列头词落在「行方向」（转置后本应列头却在多行）。"""
     hits = 0
     for c in cells:
@@ -42,7 +109,75 @@ def _composition_labels_along_rows(cells: Sequence[Dict[str, Any]]) -> int:
         t = str(c.get("text") or "")
         if _COMPOSITION_HEADER_RE.search(t) and int(c["row_start"]) > 0:
             hits += 1
+    if hits > 0 or not text_boxes:
+        return hits
+    for tb in text_boxes:
+        if not _COMPOSITION_HEADER_RE.search(str(tb.get("text") or "")):
+            continue
+        ctr = _tb_center(tb)
+        if ctr is None:
+            continue
+        cell = _cell_containing_point(cells, ctr[0], ctr[1])
+        if cell is None:
+            continue
+        if int(cell.get("col_span") or 1) > 2:
+            continue
+        if int(cell["row_start"]) > 0:
+            hits += 1
     return hits
+
+
+def _example_labels_in_col0(
+    cells: Sequence[Dict[str, Any]],
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> int:
+    """首列（col_start==0）上的实施例/比较例行标签数。"""
+    n = 0
+    for c in cells:
+        if int(c["col_start"]) != 0:
+            continue
+        rsp = int(c.get("row_span") or (int(c["row_end"]) - int(c["row_start"]) + 1))
+        if rsp > 4 and int(c["row_start"]) == 0:
+            continue
+        if _EXAMPLE_LABEL_RE.search(str(c.get("text") or "")):
+            n += 1
+    if n > 0 or not text_boxes:
+        return n
+    hit_cells: set[int] = set()
+    for tb in text_boxes:
+        if not _EXAMPLE_LABEL_RE.search(str(tb.get("text") or "")):
+            continue
+        ctr = _tb_center(tb)
+        if ctr is None:
+            continue
+        cell = _cell_containing_point(cells, ctr[0], ctr[1])
+        if cell is None or int(cell["col_start"]) != 0:
+            continue
+        rsp = int(cell.get("row_span") or (int(cell["row_end"]) - int(cell["row_start"]) + 1))
+        if rsp > 4 and int(cell["row_start"]) == 0:
+            continue
+        hit_cells.add(id(cell))
+    return len(hit_cells)
+
+
+def detect_sideways_row_labels(
+    cells: Sequence[Dict[str, Any]],
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> bool:
+    """
+    实施例/比较例应在首列纵排；若首行横排 ≥6 且首列几乎无同类标签，判定侧躺/行列颠倒。
+
+    覆盖 P57X445 等：误转 90° 后 TSR 碎成 60+ 行，旧版 detect 因 n_cols < n_rows*1.5 漏检。
+    """
+    if not cells or len(cells) < 10:
+        return False
+    row0_examples = _example_label_count(cells, row=0, text_boxes=text_boxes)
+    if row0_examples < 6:
+        return False
+    col0_examples = _example_labels_in_col0(cells, text_boxes=text_boxes)
+    if col0_examples >= 3:
+        return False
+    return row0_examples >= col0_examples + 5
 
 
 def detect_transposed_table(
@@ -51,35 +186,38 @@ def detect_transposed_table(
 ) -> bool:
     """
     多信号门控：首行大量实施例/比较例、首列无同类标签、列数明显大于行数。
+
+    注意：TSR 路径在 IoA 填字前调用本函数，必须能用 text_boxes 完成判定。
     """
     if not cells or len(cells) < 12:
         return False
+
+    if detect_sideways_row_labels(cells, text_boxes):
+        return True
+
     max_row = max(int(c["row_end"]) for c in cells)
     max_col = max(int(c["col_end"]) for c in cells)
     n_rows = max_row + 1
     n_cols = max_col + 1
+
+    row0_examples = _example_label_count(cells, row=0, text_boxes=text_boxes)
+    col0_examples = _example_labels_in_col0(cells, text_boxes=text_boxes)
+    # 碎网格侧躺：行数膨胀但首行仍横排实施例
+    if n_rows >= 30 and row0_examples >= 4 and row0_examples > col0_examples + 2:
+        return True
+
     if n_cols < _MIN_ROW0_EXAMPLES:
         return False
     if n_cols < n_rows * _COL_ROW_RATIO:
         return False
 
-    row0_examples = _example_label_count(cells, row=0)
     if row0_examples < _MIN_ROW0_EXAMPLES:
         return False
 
-    col0_examples = 0
-    for c in cells:
-        if int(c["col_start"]) != 0:
-            continue
-        rsp = int(c.get("row_span") or (int(c["row_end"]) - int(c["row_start"]) + 1))
-        if rsp > 4 and int(c["row_start"]) == 0:
-            continue
-        if _EXAMPLE_LABEL_RE.search(str(c.get("text") or "")):
-            col0_examples += 1
     if col0_examples >= 3:
         return False
 
-    comp_rows = _composition_labels_along_rows(cells)
+    comp_rows = _composition_labels_along_rows(cells, text_boxes)
     if comp_rows >= 2:
         return True
     return row0_examples >= _MIN_ROW0_EXAMPLES and n_cols > n_rows * _COL_ROW_RATIO
