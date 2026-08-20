@@ -2020,20 +2020,8 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
             out.append(upper)
             continue
         if not upper_text or _is_frag_or_empty(upper_text):
-            # 新增：允许表头角落的上下层空角/碎片进行垂直合并，消除多余的横向分割线
-            lower_for_empty = by_key.get((ue + 1, uc_s, uc_e))
-            if lower_for_empty is not None:
-                lower_text = str(lower_for_empty.get("text") or "").strip()
-                if not lower_text or _is_frag_or_empty(lower_text):
-                    upper["row_end"] = int(lower_for_empty["row_end"])
-                    upper["row_span"] = int(upper["row_end"]) - int(upper["row_start"]) + 1
-                    dropped_ids.add(id(lower_for_empty))
-            else:
-                # 下方若是没有 cell 对象的空位，直接延伸占位
-                next_row = ue + 1
-                if not _occupied_by_nonempty(next_row, uc_s, uc_e):
-                    upper["row_end"] = next_row
-                    upper["row_span"] = int(upper["row_end"]) - int(upper["row_start"]) + 1
+            # 空角/碎片不在这里纵向合并：上下皆空就消横线会误伤「应保留的空角格线」。
+            # 与右侧 rowspan 对齐的空角占位改由渲染阶段 _empty_td_rowspan_for_gap 处理。
             out.append(upper)
             continue
         # 上层 colspan 组头覆盖多列 → 子列头不得纵向叠字合并（P32 溶解性/粘度）
@@ -2116,6 +2104,37 @@ def _escape_cell_text(text: str) -> str:
     # 保留格内换行
     parts = t.split("\n")
     return "<br>".join(html.escape(p) for p in parts)
+
+
+def _empty_td_rowspan_for_gap(
+    r: int,
+    c: int,
+    *,
+    n_rows: int,
+    origin: Dict[Tuple[int, int], Dict[str, Any]],
+    covered: Set[Tuple[int, int]],
+) -> int:
+    """空位占位 rowspan：仅当右侧邻格从本行起 rowspan>1，且本列对应行均为空位。
+
+    用于消除「聚合物」左侧被拆成两个空 td 而凭空产生的横线；
+    不根据「上下皆空」消线——右侧若是两行独立格，仍输出两个空 td。
+    """
+    right = origin.get((r, c + 1))
+    if right is None:
+        return 1
+    if not str(right.get("text") or "").strip():
+        return 1
+    rs = int(right["row_start"])
+    re = int(right["row_end"])
+    if rs != r:
+        return 1
+    span = re - rs + 1
+    if span <= 1:
+        return 1
+    for rr in range(r, min(re, n_rows - 1) + 1):
+        if (rr, c) in covered or (rr, c) in origin:
+            return 1
+    return min(span, n_rows - r)
 
 
 def cells_to_html_table(
@@ -2220,7 +2239,17 @@ def cells_to_html_table(
                 continue
             cell = origin.get((r, c))
             if cell is None:
-                lines.append("<td></td>")
+                # 右侧邻格已 rowspan 覆盖多行、且本列对应行均为空位时，空角与之对齐，
+                # 避免在「聚合物」左侧画出原稿没有的横线。依据邻格结构，非「上下空→消线」。
+                stub_span = _empty_td_rowspan_for_gap(
+                    r, c, n_rows=n_rows, origin=origin, covered=covered
+                )
+                if stub_span > 1:
+                    lines.append(f'<td rowspan="{stub_span}"></td>')
+                    for rr in range(r + 1, r + stub_span):
+                        covered.add((rr, c))
+                else:
+                    lines.append("<td></td>")
                 continue
             rs, re = int(cell["row_start"]), int(cell["row_end"])
             cs, ce = int(cell["col_start"]), int(cell["col_end"])
