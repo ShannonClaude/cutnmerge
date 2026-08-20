@@ -27,10 +27,12 @@ logger = logging.getLogger(__name__)
 _NOISE_CELL_RE = re.compile(r"^[A-Za-z]$|^[·•\.\,;:]$")
 # 身列数据值：纯数字、比率、缺测横线、单字母等级代号（A/B/C…）。
 # 不含 jER-604 / 实施例1 / 4,4'-DAE。
+# 身列数据值：纯数字、比率、缺测横线、单字母等级代号（A/B/C…）。
+# 不含 jER-604 / 实施例1 / 4,4'-DAE。
 _DATA_VALUE_RE = re.compile(
-    r"^(?:[-–—−~～]|[-–—−]?\d+(?:\.\d+)?(?:\s*[\/／]\s*\d+(?:\.\d+)?)?|[A-Za-z][+＋]?)$"
+    r"^(?:[-–—−~～]|[-–—−]?\d+(?:\.\d+)?(?:\s*[\/／]\s*\d+(?:\.\d+)?)?|[A-Za-z][+＋]?|[A-Z]{2,3}|[A-Za-z]\d{1,2})$"
 )
-_LETTER_DATA_RE = re.compile(r"^[A-Za-z][+＋]?$")
+_LETTER_DATA_RE = re.compile(r"^(?:[A-Za-z][+＋]?|[A-Z]{2,3}|[A-Za-z]\d{1,2})$")
 _EXAMPLE_COL_HEADER_RE = re.compile(
     r"(合成例|实施例|実施例|比較例|比较例|对照例|参考例)"
 )
@@ -813,23 +815,6 @@ def _split_header_over_index_column(cells: List[Dict[str, Any]]) -> List[Dict[st
     return cells
 
 
-def _column_has_body_content(
-    cells: Sequence[Dict[str, Any]],
-    col: int,
-    header_end: int,
-) -> bool:
-    """表头带以下该列是否有实质文本（如实施例索引列）。"""
-    for cell in cells:
-        if int(cell["row_start"]) <= header_end:
-            continue
-        cs, ce = int(cell["col_start"]), int(cell["col_end"])
-        if cs <= col <= ce:
-            t = str(cell.get("text") or "").strip()
-            if t and not _is_cell_frag(t):
-                return True
-    return False
-
-
 def _body_anchors_between(
     cells: Sequence[Dict[str, Any]],
     lo: int,
@@ -1251,8 +1236,14 @@ def drop_evidenceless_columns(cells: List[Dict[str, Any]], *, narrow_ratio: floa
         narrow = float(np.median(widths)) < narrow_ratio * median_w
         # 窄列碎片，或非窄但整列仅孤立数字/单字且多数格为空
         empty_n = sum(1 for t in texts if not t)
+        
+        # 【修改】增加整列全空的绝对判断
+        is_completely_empty = (empty_n == len(texts))
+        
         frag_only_sparse = only_frag and empty_n >= max(1, len(texts) // 2)
-        if (narrow and only_frag) or (frag_only_sparse and not spans_cross):
+        
+        # 【修改】将 is_completely_empty 加入删除条件
+        if is_completely_empty or (narrow and only_frag) or (frag_only_sparse and not spans_cross):
             # 碎片文本并入左侧邻列（若存在）
             if any_text and col > 0:
                 frag_bits = [t for t in texts if t]
@@ -2034,6 +2025,23 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
                 if pce > pcs and pcs <= uc_s <= pce:
                     under_colspan_parent = True
                     break
+
+        # ==================== 【新增改动点 开始】 ====================
+        # 如果当前行（ur）同时存在其他 colspan > 1 的表头格（如 P40 中的“酸二酐 (colspan=3)”和“二胺 (colspan=5)”），
+        # 说明这一行属于多层级的“中间混合行”。
+        # 此时像“二苯基醚”这种被排版挤压断开的单列标签，其下方的“二甲酰氯”必定是同一格截断文本，
+        # 因此解除 under_colspan_parent 的拦截，允许它们垂直合并。
+        has_sibling_colspan = False
+        for c in cells:
+            if int(c["row_start"]) <= ur <= int(c["row_end"]):
+                if int(c.get("col_span", int(c["col_end"]) - int(c["col_start"]) + 1)) > 1:
+                    has_sibling_colspan = True
+                    break
+
+        if has_sibling_colspan:
+            under_colspan_parent = False
+        # ==================== 【新增改动点 结束】 ====================
+
         # 实施例/比较例列头不得向下吞并（下层常为 A/B/C 等数据字母）
         if _EXAMPLE_COL_HEADER_RE.search(upper_text):
             out.append(upper)
@@ -2078,7 +2086,6 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
         out.append(upper)
 
     return out
-
 
 def _escape_cell_text(text: str) -> str:
     t = (text or "").strip()

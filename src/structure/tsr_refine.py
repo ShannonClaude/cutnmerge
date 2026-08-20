@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 _CJK_RE = re.compile(
     r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]"
 )
+# 【新增】支持 2-3 个大写字母或字母加数字的合法代码识别
+_LETTER_DATA_RE = re.compile(r"^(?:[A-Za-z][+＋]?|[A-Z]{2,3}|[A-Za-z]\d{1,2})$")
 
 
 def _tb_bbox(tb: Dict[str, Any]) -> Tuple[float, float, float, float]:
@@ -270,7 +272,7 @@ def _drop_contained_empty_fragments(
     for j, child in enumerate(cells):
         if j in drop:
             continue
-        if not _looks_like_ocr_fragment(str(child.get("text") or "")):
+        if not _looks_like_ocr_fragment(str(child.get("text") or "")) :
             continue
         aj = areas[j]
         if aj <= 0:
@@ -315,6 +317,11 @@ def _looks_like_ocr_fragment(text: str) -> bool:
     if not t:
         return True
     compact = re.sub(r"\s+", "", t)
+    
+    # 【新增】如果完全匹配合法的字母代号（如 AA, A1, B+），则绝不是碎片
+    if _LETTER_DATA_RE.fullmatch(compact):
+        return False
+        
     if len(compact) <= 2:
         # 两汉字表体词（溶解/不溶/判定等）不是 OCR 碎片
         if re.fullmatch(r"[\u4e00-\u9fff]{2}", compact):
@@ -370,6 +377,11 @@ def merge_ghost_columns(
     # 标记幽灵列：窄 + 无文本，或窄 + 仅碎片且邻列有实质文本
     ghost = []
     for c in range(n_cols):
+        # 【修正】若完全无文本命中，无视宽度直接判定为幽灵列
+        if hits[c] == 0:
+            ghost.append(True)
+            continue
+            
         narrow = widths[c] < min_width_ratio * median_w
         if not narrow:
             ghost.append(False)
@@ -377,9 +389,6 @@ def merge_ghost_columns(
         # 整列多为行序号：保留（与 html drop_evidenceless 一致）
         if is_index_column(col_texts[c]):
             ghost.append(False)
-            continue
-        if hits[c] == 0:
-            ghost.append(True)
             continue
         only_frag = bool(col_texts[c]) and all(
             _looks_like_ocr_fragment(t) for t in col_texts[c]
@@ -1413,7 +1422,7 @@ def reconstruct_header_cells(
     """
     按子表分段，用表头 OCR 的 Y/X 聚类重建多级表头结构。
 
-    - 相对行号在表头带内的宽格才处理（不再硬编码全局 rs<=2）
+    - 相对行号在表头带内的宽格才处理（不再硬编码只处理 row_start==row_end，允许跨行宽表头拆分）
     - Y 向多带 → 拆成多级表头行（如「单体[mol%]」+「三官能/四官能…」）
     - 每带内仅 1 个 X 簇 → 保持合并格（避免单标签被拆散串行）
     - 每带内 ≥2 个 X 簇 → 吸附到身列边界拆成若干格（可保留 colspan>1）
@@ -1451,13 +1460,8 @@ def reconstruct_header_cells(
     y_gap = max(6.0, 0.85 * median_h)
     x_gap = max(12.0, 0.55 * median_w)
 
-    # 计划中的行插入：row_idx 之后插入 split_y（升序处理时从大行号开始）
-    # cell_replacements: id(cell) -> list of new cells (in old coords before row remap)
-    # 先收集每个段内要处理的宽格改造，统一做行插入重映射
-
     # 工作副本
     work = [dict(c) for c in cells]
-    # 按段处理；可能多次插入行，每次插入后刷新 seps / 段边界
     total_y_splits = 0
     total_x_splits = 0
 
@@ -1483,12 +1487,11 @@ def reconstruct_header_cells(
             if body_rows:
                 header_hi = min(header_hi, max(body_rows[0] - 1, seg_lo))
 
-            # 找该段要处理的宽格（单行宽 colspan）
+            # 找该段要处理的宽格（不再要求单行，支持处理 TSR 返回的跨多行的大表头）
             candidates = [
                 c
                 for c in work
                 if seg_lo <= int(c["row_start"]) <= header_hi
-                and int(c["row_start"]) == int(c["row_end"])
                 and int(c["col_end"]) - int(c["col_start"]) + 1 >= 2
             ]
             if not candidates:
@@ -1497,6 +1500,7 @@ def reconstruct_header_cells(
             for cell in candidates:
                 cs, ce = int(cell["col_start"]), int(cell["col_end"])
                 rs = int(cell["row_start"])
+                re = int(cell["row_end"])
                 cx1, cy1, cx2, cy2 = _cell_bbox(cell)
                 # 落入宽格的 OCR
                 hits: List[Tuple[float, float, float, float, Dict[str, Any]]] = []
@@ -1568,6 +1572,7 @@ def reconstruct_header_cells(
                             for c2 in work:
                                 if (
                                     int(c2["row_start"]) == rs
+                                    and int(c2["row_end"]) == re
                                     and int(c2["col_start"]) == cs
                                     and int(c2["col_end"]) == ce
                                 ):
@@ -1582,17 +1587,17 @@ def reconstruct_header_cells(
                 next_row_overlap = [
                     c2
                     for c2 in work
-                    if int(c2["row_start"]) == rs + 1
+                    if int(c2["row_start"]) == re + 1
                     and int(c2["col_end"]) >= cs
                     and int(c2["col_start"]) <= ce
                 ]
                 next_is_subheader = False
                 if len(next_row_overlap) >= 2:
                     # 用 OCR 判断下一行是子表头还是数据行
-                    y0 = float(row_seps[rs + 1]) if rs + 1 < len(row_seps) else 0.0
+                    y0 = float(row_seps[re + 1]) if re + 1 < len(row_seps) else 0.0
                     y1 = (
-                        float(row_seps[rs + 2])
-                        if rs + 2 < len(row_seps)
+                        float(row_seps[re + 2])
+                        if re + 2 < len(row_seps)
                         else y0 + 1.0
                     )
                     next_texts = []
@@ -1642,9 +1647,11 @@ def reconstruct_header_cells(
                     max(len(g) for g in band_xgroups[1:]) if n_y >= 2 else 0
                 )
 
-                # 仅当「上带父级标题 + 下带多列标签」时插行；避免把折行长标签拆成多行
+                # 仅当「上带父级标题 + 下带多列标签」且当前是单行表头时才插行；
+                # 避免把已经跨越多行的宽格强行打断
                 need_y_split = (
-                    n_y >= 2
+                    rs == re
+                    and n_y >= 2
                     and not children_already_exist
                     and top_is_parent
                     and len(band_xgroups[0]) == 1
@@ -1660,14 +1667,15 @@ def reconstruct_header_cells(
                         changed = True
                     continue
 
-                # 单带多 X：只做列拆，不插行
+                # 单带多 X，或者已经是跨多行的大表头且有多X：只做列拆，不插行
                 if not need_y_split and max_xgroups >= 2 and allow_x_split:
-                    groups = band_xgroups[0]
+                    # 对于多带情况，取 X 分组最多的那个带作为切分基准
+                    groups = max(band_xgroups, key=len)
                     new_cells: List[Dict[str, Any]] = []
                     y1 = float(row_seps[rs]) if rs < len(row_seps) else cy1
                     y2 = (
-                        float(row_seps[rs + 1])
-                        if rs + 1 < len(row_seps)
+                        float(row_seps[re + 1])
+                        if re + 1 < len(row_seps)
                         else cy2
                     )
                     for g in groups:
@@ -1687,7 +1695,7 @@ def reconstruct_header_cells(
                                 x2=x2,
                                 y2=y2,
                                 row_start=rs,
-                                row_end=rs,
+                                row_end=re,
                                 col_start=ncs,
                                 col_end=nce,
                             )
@@ -1698,7 +1706,7 @@ def reconstruct_header_cells(
                             for c in work
                             if not (
                                 int(c["row_start"]) == rs
-                                and int(c["row_end"]) == rs
+                                and int(c["row_end"]) == re
                                 and int(c["col_start"]) == cs
                                 and int(c["col_end"]) == ce
                             )
@@ -1720,15 +1728,14 @@ def reconstruct_header_cells(
                         # 丢弃原宽格，后面按 Y/X 簇重建
                         if (
                             int(c["row_start"]) == rs
-                            and int(c["row_end"]) == rs
+                            and int(c["row_end"]) == re
                             and int(c["col_start"]) == cs
                             and int(c["col_end"]) == ce
                         ):
                             continue
                         nc = dict(c)
                         crs, cre = int(c["row_start"]), int(c["row_end"])
-                        # 同行其它表头格：扩展为跨两级表头的 rowspan。
-                        # 实施例/比较例列头保持单行，避免吞掉下层 A/B/C 数据行。
+                        
                         peer_text = str(c.get("text") or "")
                         is_example_peer = bool(
                             re.search(
@@ -1736,24 +1743,24 @@ def reconstruct_header_cells(
                                 peer_text,
                             )
                         )
-                        if (
-                            crs == insert_at
-                            and cre == insert_at
-                            and not is_example_peer
-                        ):
-                            nc["row_end"] = insert_at + 1
-                            _refresh_spans(nc)
-                            x1, y1, x2, y2 = _cell_bbox(c)
-                            nc["polygon"] = _rebuild_polygon(
-                                x1, y1, x2, max(y2, cy2)
-                            )
-                            remapped.append(nc)
-                            continue
+                        
+                        if crs == insert_at and is_example_peer:
+                            # 实施例列头不跨多级表头行，保持原样
+                            pass
+                        elif cre >= insert_at:
+                            # 被切分的行或跨过切分行的单元格，row_end 顺延一行
+                            nc["row_end"] = cre + 1
+                            if crs == insert_at and not is_example_peer:
+                                _refresh_spans(nc)
+                                x1, py1, x2, py2 = _cell_bbox(c)
+                                nc["polygon"] = _rebuild_polygon(x1, py1, x2, max(py2, cy2))
+                                remapped.append(nc)
+                                continue
+
                         if crs > insert_at:
                             nc["row_start"] = crs + 1
                             nc["row_end"] = cre + 1
-                        elif cre > insert_at:
-                            nc["row_end"] = cre + 1
+                        
                         _refresh_spans(nc)
                         remapped.append(nc)
 
@@ -1815,7 +1822,7 @@ def reconstruct_header_cells(
                                 x2=float(col_seps[ce + 1]),
                                 y2=y2_bot,
                                 row_start=rs + 1,
-                                row_end=rs + 1,
+                                row_end=re + 1,
                                 col_start=cs,
                                 col_end=ce,
                             )
@@ -1849,7 +1856,7 @@ def reconstruct_header_cells(
                                     x2=float(col_seps[nce + 1]),
                                     y2=y2_bot,
                                     row_start=rs + 1,
-                                    row_end=rs + 1,
+                                    row_end=re + 1,
                                     col_start=ncs,
                                     col_end=nce,
                                 )
@@ -2164,4 +2171,10 @@ def refine_tsr_cells(
     cells = split_underspanned_rows(cells, boxes)
     cells = split_bad_colspans(cells, boxes)
     cells = dedupe_overlapping_cells(cells)
+    
+    # ======= 新增以下这行核心修复 =======
+    # 将 TSR 误判合并的多列表头（colspan>=2），根据文本的 X 轴聚类拆分为多个独立的单元格
+    cells = reconstruct_header_cells(cells, boxes)
+    # ====================================
+    
     return cells
