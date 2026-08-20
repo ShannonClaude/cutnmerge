@@ -49,6 +49,8 @@ from ..structure.tsr_refine import (
     logic_conflict_ratio,
     looks_oversegmented,
     merge_ghost_columns,
+    merge_stacked_chem_amount_cells,
+    normalize_oversegmented_table_rows,
     reconstruct_header_cells,
     refine_tsr_cells,
     refine_tsr_cells_light,
@@ -600,6 +602,7 @@ def _extract_via_tsr(
         col_seps=col_seps,
         v_separators=v_separators,
     )
+    cells = merge_stacked_chem_amount_cells(cells)
     cells = _fix_dash_column_consistency(cells, binary=binary)
     cells = detect_eval_symbols_in_empty_cells(cells, binary)
     cells = upgrade_o_to_double_circle(cells, binary)
@@ -608,6 +611,8 @@ def _extract_via_tsr(
     cells, caption_texts = strip_caption_cells(cells)
     if caption_texts:
         free_texts.extend(caption_texts)
+    # 表题剥离后再压行，避免 [表1-2] 落在子表头行触发分段
+    cells = normalize_oversegmented_table_rows(cells)
     cells = recover_empty_vertical_headers(
         image,
         cells,

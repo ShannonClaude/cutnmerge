@@ -1936,6 +1936,12 @@ _MONOMER_LEFT_ANCHOR_RE = re.compile(r"聚合物")
 _MONOMER_RIGHT_ANCHOR_RE = re.compile(
     r"(含有比率|酸当量|双键当量|含有率)"
 )
+# 表体化学代号（含可选括号用量）：BFE / MeTMS / cyEpoTMS / NA(40)
+_CHEM_BODY_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9\-\+']{1,24}"
+    r"(?:\s*[\(（]\s*\d+(?:\.\d+)?\s*[\)）])?$"
+)
+_PAREN_AMOUNT_RE = re.compile(r"^[\(（]\s*\d+(?:\.\d+)?\s*[\)）]$")
 
 
 def _cell_label_text(
@@ -1969,6 +1975,88 @@ def _set_cell_cols(
         cell["polygon"] = _rebuild_polygon(x1, y1, x2, y2)
 
 
+def _set_cell_rows(
+    cell: Dict[str, Any],
+    rs: int,
+    re: int,
+    row_seps: Sequence[float],
+) -> None:
+    """更新逻辑行并按 row_seps 重写多边形 y 范围（保留原 x）。"""
+    rs = int(rs)
+    re = int(re)
+    if re < rs:
+        return
+    cell["row_start"] = rs
+    cell["row_end"] = re
+    _refresh_spans(cell)
+    if len(row_seps) > re + 1:
+        y1 = float(row_seps[rs])
+        y2 = float(row_seps[re + 1])
+        x1, _, x2, _ = _cell_bbox(cell)
+        cell["polygon"] = _rebuild_polygon(x1, y1, x2, y2)
+
+
+def _cell_x_center(cell: Dict[str, Any]) -> float:
+    x1, _y1, x2, _y2 = _cell_bbox(cell)
+    return 0.5 * (x1 + x2)
+
+
+def _align_monomer_children_to_body(
+    children: List[Dict[str, Any]],
+    body_cells: List[Dict[str, Any]],
+    col_seps: Sequence[float],
+    *,
+    band_lo: int,
+    band_hi: int,
+) -> int:
+    """按物理 x 把单体子表头对齐到表体列并集（如「三官能」盖住 MeTMS/PhTMS/…）。"""
+    if len(children) < 1 or len(body_cells) < 2:
+        return 0
+    bodies = sorted(
+        [
+            c
+            for c in body_cells
+            if band_lo <= int(c["col_start"]) <= band_hi
+            or band_lo <= int(c["col_end"]) <= band_hi
+        ],
+        key=_cell_x_center,
+    )
+    kids = sorted(children, key=_cell_x_center)
+    if len(bodies) < 2 or not kids:
+        return 0
+
+    # 每个表体原子列分给最近的子表头
+    assignments: Dict[int, List[int]] = {id(k): [] for k in kids}
+    for b in bodies:
+        bx = _cell_x_center(b)
+        nearest = min(kids, key=lambda k: abs(_cell_x_center(k) - bx))
+        assignments[id(nearest)].append(int(b["col_start"]))
+        if int(b["col_end"]) != int(b["col_start"]):
+            assignments[id(nearest)].append(int(b["col_end"]))
+
+    changed = 0
+    for kid in kids:
+        cols = sorted(set(assignments.get(id(kid)) or []))
+        if not cols:
+            continue
+        new_cs = max(min(cols), band_lo)
+        new_ce = min(max(cols), band_hi)
+        if new_ce < new_cs:
+            continue
+        old_cs, old_ce = int(kid["col_start"]), int(kid["col_end"])
+        if (old_cs, old_ce) != (new_cs, new_ce):
+            _set_cell_cols(kid, new_cs, new_ce, col_seps)
+            changed += 1
+            logger.info(
+                "repair_monomer_parent_spans: child align %d-%d → %d-%d",
+                old_cs,
+                old_ce,
+                new_cs,
+                new_ce,
+            )
+    return changed
+
+
 def repair_monomer_parent_spans(
     cells: List[Dict[str, Any]],
     boxes: Optional[Sequence[Dict[str, Any]]] = None,
@@ -1977,7 +2065,8 @@ def repair_monomer_parent_spans(
     按子表分段，把过窄/错位的「单体[…]」父格对齐到同段单体子列并集。
 
     只改已有格子的 col_start/col_end 与多边形，不插列、不融合框线。
-    用于轻量 TSR 路径修复 P98 类分段异形表。
+    用于轻量 TSR 路径修复 P98 类分段异形表；亦覆盖无右侧「含有比率」
+    锚点、单体带到表缘结束的 P46/P47 类表。
     """
     if not cells:
         return cells
@@ -2035,52 +2124,130 @@ def repair_monomer_parent_spans(
             if _MONOMER_RIGHT_ANCHOR_RE.search(label):
                 right_anchor_cs = min(right_anchor_cs, int(c["col_start"]))
 
-        if left_anchor_ce < 0 or right_anchor_cs >= 10**9:
-            continue
-        if right_anchor_cs <= left_anchor_ce + 1:
+        if left_anchor_ce < 0:
             continue
 
-        band_lo = left_anchor_ce + 1
-        band_hi = right_anchor_cs - 1
+        # 无右侧「含有比率」等锚点时：单体带到段内最右列（P46/P47）
+        max_seg_col = max(int(c["col_end"]) for c in seg_cells)
+        if right_anchor_cs >= 10**9:
+            band_lo = left_anchor_ce + 1
+            band_hi = max_seg_col
+        else:
+            if right_anchor_cs <= left_anchor_ce + 1:
+                continue
+            band_lo = left_anchor_ce + 1
+            band_hi = right_anchor_cs - 1
 
-        # 子表头行：父格下一行（多级表头）
+        if band_hi < band_lo:
+            continue
+
+        def _in_band(c: Dict[str, Any]) -> bool:
+            return int(c["col_end"]) >= band_lo and int(c["col_start"]) <= band_hi
+
+        def _is_body_label(label: str) -> bool:
+            t = (label or "").strip()
+            if not t:
+                return False
+            if re.search(r"(合成例|实施例|実施例|比較例|比较例)", t):
+                return True
+            compact = re.sub(r"\s+", "", t)
+            return bool(_CHEM_BODY_RE.fullmatch(compact) or _PAREN_AMOUNT_RE.fullmatch(compact))
+
+        def _is_child_header_label(label: str) -> bool:
+            t = (label or "").strip()
+            if not t or _is_body_label(t):
+                return False
+            if _MONOMER_PARENT_RE.search(t) or _MONOMER_LEFT_ANCHOR_RE.search(t):
+                return False
+            # 中文子表头或封端剂等
+            return bool(
+                re.search(r"[\u4e00-\u9fff]", t)
+                or re.search(r"(封端剂|硅烷|衍生物|化合物|共聚)", t)
+            )
+
+        # 子表头行：父格之后、第一个带内 ≥2 个非体数据格的行（不要求紧邻 pre+1）
+        children: List[Dict[str, Any]] = []
         child_row = pre + 1
-        if child_row > seg_hi:
-            child_row = prs + 1
-        children = [
-            c
-            for c in seg_cells
-            if int(c["row_start"]) == child_row
-            and int(c["col_end"]) >= band_lo
-            and int(c["col_start"]) <= band_hi
-            and c is not parent
-            and max(int(c.get("row_span") or 1), 1) == 1
-        ]
+        for r in range(pre + 1, seg_hi + 1):
+            cand = [
+                c
+                for c in seg_cells
+                if int(c["row_start"]) == r
+                and c is not parent
+                and _in_band(c)
+                and not _MONOMER_PARENT_RE.search(_cell_label_text(c, boxes))
+                and not _MONOMER_LEFT_ANCHOR_RE.search(_cell_label_text(c, boxes))
+            ]
+            if len(cand) < 2:
+                continue
+            # 若该行已是表体化学代号，则不是子表头
+            if any(_is_body_label(_cell_label_text(c, boxes)) for c in cand):
+                break
+            if any(_is_child_header_label(_cell_label_text(c, boxes)) for c in cand):
+                children = cand
+                child_row = r
+                break
 
-        # 表体行：段内第一个「非表头」行上的中间带格子
+        # 表体行：优先含合成例/化学代号的行
         body_rows = sorted(
             {
                 int(c["row_start"])
                 for c in seg_cells
-                if int(c["row_start"]) == int(c["row_end"])
-                and int(c["row_start"]) > child_row
+                if int(c["row_start"]) > child_row
             }
         )
         body_cells: List[Dict[str, Any]] = []
+        fallback_body: List[Dict[str, Any]] = []
+        first_body_row: Optional[int] = None
         for br in body_rows:
             cand = [
                 c
                 for c in seg_cells
-                if int(c["row_start"]) == br == int(c["row_end"])
-                and int(c["col_end"]) >= band_lo
-                and int(c["col_start"]) <= band_hi
+                if int(c["row_start"]) == br and _in_band(c)
             ]
-            # 至少两格才像单体数据带
-            if len(cand) >= 2:
+            if len(cand) < 2:
+                continue
+            if any(_is_body_label(_cell_label_text(c, boxes)) for c in cand):
                 body_cells = cand
+                first_body_row = br
                 break
+            if not fallback_body and not any(
+                _is_child_header_label(_cell_label_text(c, boxes)) for c in cand
+            ):
+                fallback_body = cand
+                first_body_row = br
+        if not body_cells:
+            body_cells = fallback_body
 
-        span_cells = children if len(children) >= 2 else body_cells
+        # 子表头可能跨多逻辑行（P46：二羧酸@r4 + 封端剂@r5）：收齐首表体行之前带内表头格
+        if first_body_row is not None:
+            header_kids = [
+                c
+                for c in seg_cells
+                if c is not parent
+                and pre < int(c["row_start"]) < first_body_row
+                and _in_band(c)
+                and _is_child_header_label(_cell_label_text(c, boxes))
+            ]
+            if len(header_kids) >= 2:
+                children = header_kids
+            elif len(header_kids) > len(children):
+                children = header_kids
+
+        # 父格列范围：子表头并集优先，否则表体并集；二者皆有时取并集更稳
+        span_cells: List[Dict[str, Any]] = []
+        if len(children) >= 2:
+            span_cells.extend(children)
+        if len(body_cells) >= 2:
+            span_cells.extend(body_cells)
+        if len(span_cells) < 2:
+            span_cells = [
+                c
+                for c in seg_cells
+                if c is not parent
+                and _in_band(c)
+                and not _MONOMER_LEFT_ANCHOR_RE.search(_cell_label_text(c, boxes))
+            ]
         if len(span_cells) < 2:
             continue
 
@@ -2104,6 +2271,35 @@ def repair_monomer_parent_spans(
                 target_cs,
                 target_ce,
             )
+
+        # 子表头按表体列物理位置对齐（修复「三官能」只占 1 列等）
+        if children and body_cells:
+            changed += _align_monomer_children_to_body(
+                children,
+                body_cells,
+                col_seps,
+                band_lo=target_cs,
+                band_hi=target_ce,
+            )
+
+        # 聚合物行起点若低于单体父格，上延 rowspan 盖住父行，避免左侧空角被并进「单体」
+        for c in seg_cells:
+            if c is parent or id(c) in removed:
+                continue
+            label = _cell_label_text(c, boxes)
+            if not _MONOMER_LEFT_ANCHOR_RE.search(label):
+                continue
+            if int(c["col_end"]) > left_anchor_ce:
+                continue
+            old_rs = int(c["row_start"])
+            if old_rs > prs:
+                _set_cell_rows(c, prs, int(c["row_end"]), row_seps)
+                changed += 1
+                logger.info(
+                    "repair_monomer_parent_spans: 聚合物上延 row %d → %d",
+                    old_rs,
+                    prs,
+                )
 
         # 去掉父行上落在新父格内部的空壳占位格
         for c in list(seg_cells):
@@ -2157,6 +2353,283 @@ def repair_monomer_parent_spans(
     if changed:
         work = dedupe_overlapping_cells(work)
     return work
+
+
+
+def merge_stacked_chem_amount_cells(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """合并同列上下拆开的化学代号与括号用量：STR + (30) → STR\n(30)。
+
+    仅处理表体原子列；中间可夹空逻辑行。避免把已含用量的格再次拼接。
+    """
+    if len(cells) < 2:
+        return cells
+
+    work = [dict(c) for c in cells]
+    by_col: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for c in work:
+        if int(c["col_start"]) != int(c["col_end"]):
+            continue
+        by_col[int(c["col_start"])].append(c)
+
+    dropped: set = set()
+    changed = 0
+    for _col, group in by_col.items():
+        group = sorted(group, key=lambda c: (int(c["row_start"]), int(c["row_end"])))
+        i = 0
+        while i < len(group):
+            upper = group[i]
+            if id(upper) in dropped:
+                i += 1
+                continue
+            ut = re.sub(r"\s+", "", str(upper.get("text") or ""))
+            if not ut or _PAREN_AMOUNT_RE.fullmatch(ut):
+                i += 1
+                continue
+            if _CHEM_BODY_RE.fullmatch(ut) and _PAREN_AMOUNT_RE.search(ut):
+                i += 1
+                continue
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9\-\+']{1,24}", ut):
+                i += 1
+                continue
+            lower = None
+            for j in range(i + 1, len(group)):
+                cand = group[j]
+                if id(cand) in dropped:
+                    continue
+                ct = re.sub(r"\s+", "", str(cand.get("text") or ""))
+                if not ct:
+                    continue
+                if int(cand["row_start"]) > int(upper["row_end"]) + 3:
+                    break
+                if _PAREN_AMOUNT_RE.fullmatch(ct):
+                    lower = cand
+                break
+            if lower is None:
+                i += 1
+                continue
+            lt = str(lower.get("text") or "").strip()
+            prev = str(upper.get("text") or "").strip()
+            upper["text"] = f"{prev}\n{lt}" if prev else lt
+            upper["row_end"] = max(int(upper["row_end"]), int(lower["row_end"]))
+            _refresh_spans(upper)
+            ux1, uy1, ux2, uy2 = _cell_bbox(upper)
+            lx1, ly1, lx2, ly2 = _cell_bbox(lower)
+            upper["polygon"] = _rebuild_polygon(
+                min(ux1, lx1), min(uy1, ly1), max(ux2, lx2), max(uy2, ly2)
+            )
+            dropped.add(id(lower))
+            changed += 1
+            i += 1
+
+    if not changed:
+        return cells
+    out = [c for c in work if id(c) not in dropped]
+    logger.info("合并化学代号+用量竖拆格: %d", changed)
+    return dedupe_overlapping_cells(out)
+
+
+
+_SYNTHESIS_LABEL_RE = re.compile(
+    r"(合成例|实施例|実施例|比較例|比较例|对照例|参考例)\s*\d*"
+)
+
+
+def _set_logic_rows(cell: Dict[str, Any], rs: int, re: int) -> None:
+    """只改逻辑行号，保留物理多边形（避免用错 row_seps 扭曲几何）。"""
+    rs, re = int(rs), int(re)
+    if re < rs:
+        return
+    cell["row_start"] = rs
+    cell["row_end"] = re
+    _refresh_spans(cell)
+
+
+def normalize_oversegmented_table_rows(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """压缩 TSR 过切行：表头压成 2 级，合成例与同行数据对齐为单行。
+
+    针对「聚合物 / 单体[…] / 合成例」专利表：去掉表头空行、把跨行
+    代号+用量格收回单行，并把错位的合成例标签拉到数据行起点。
+    """
+    if len(cells) < 3:
+        return cells
+
+    joined = " ".join(str(c.get("text") or "") for c in cells)
+    if not (
+        _MONOMER_PARENT_RE.search(joined)
+        and _MONOMER_LEFT_ANCHOR_RE.search(joined)
+        and _SYNTHESIS_LABEL_RE.search(joined)
+    ):
+        return cells
+
+    from ..utils.segments import _HEADER_CAPTION_RE, find_row_segments
+
+    work = [dict(c) for c in cells]
+    segments = find_row_segments(work)
+    if not segments:
+        min_r = min(int(c["row_start"]) for c in work)
+        max_r = max(int(c["row_end"]) for c in work)
+        segments = [(min_r, max_r)]
+
+    rebuilt_segs: List[List[Dict[str, Any]]] = []
+    changed = 0
+
+    for seg_lo, seg_hi in segments:
+        seg = [c for c in work if seg_lo <= int(c["row_start"]) <= seg_hi]
+        if not seg:
+            continue
+
+        # 1) 合成例与右侧近邻数据同行对齐，并压成单行（勿把上方表头当 peer）
+        labels = [
+            c
+            for c in seg
+            if _SYNTHESIS_LABEL_RE.search(str(c.get("text") or ""))
+        ]
+        for lab in labels:
+            lr = int(lab["row_start"])
+            peers = []
+            for c in seg:
+                if c is lab:
+                    continue
+                t = str(c.get("text") or "").strip()
+                if not t:
+                    continue
+                if int(c["col_start"]) <= int(lab["col_end"]):
+                    continue
+                # 必须起点落在合成例附近，排除上方跨很多行的表头格
+                crs = int(c["row_start"])
+                if abs(crs - lr) > 2:
+                    continue
+                if _MONOMER_PARENT_RE.search(t) or _MONOMER_LEFT_ANCHOR_RE.search(t):
+                    continue
+                if re.search(
+                    r"(衍生物|化合物|共聚成分|有机硅烷|封端剂|低聚物)", t
+                ) and not _CHEM_BODY_RE.fullmatch(re.sub(r"\s+", "", t)):
+                    # 中文子表头
+                    continue
+                peers.append(c)
+            if not peers:
+                if int(lab["row_end"]) != int(lab["row_start"]):
+                    _set_logic_rows(lab, lr, lr)
+                    changed += 1
+                continue
+            target = min([lr] + [int(c["row_start"]) for c in peers])
+            for c in [lab, *peers]:
+                if int(c["row_start"]) != target or int(c["row_end"]) != target:
+                    _set_logic_rows(c, target, target)
+                    changed += 1
+
+        # 2) 划分表头 / 表体：以合成例行为表体起点
+        body_starts = sorted(
+            {
+                int(c["row_start"])
+                for c in seg
+                if _SYNTHESIS_LABEL_RE.search(str(c.get("text") or ""))
+            }
+        )
+        if not body_starts:
+            rebuilt_segs.append(seg)
+            continue
+        first_body = body_starts[0]
+
+        header_cells = [
+            c
+            for c in seg
+            if int(c["row_start"]) < first_body and str(c.get("text") or "").strip()
+        ]
+        body_cells = [
+            c
+            for c in seg
+            if int(c["row_start"]) >= first_body and str(c.get("text") or "").strip()
+        ]
+        empty_header = [
+            c
+            for c in seg
+            if int(c["row_start"]) < first_body
+            and not str(c.get("text") or "").strip()
+        ]
+        if empty_header:
+            changed += len(empty_header)
+
+        parents = []
+        children = []
+        for c in header_cells:
+            t = str(c.get("text") or "").strip()
+            # 表题不应进入子表头行（会触发 find_row_segments 按 caption 切开）
+            if _HEADER_CAPTION_RE.search(t):
+                continue
+            if _MONOMER_LEFT_ANCHOR_RE.search(t):
+                parents.append(("polymer", c))
+            elif _MONOMER_PARENT_RE.search(t):
+                parents.append(("monomer", c))
+            else:
+                children.append(c)
+
+        local: List[Dict[str, Any]] = []
+
+        for kind, c in parents:
+            nc = dict(c)
+            if kind == "polymer":
+                _set_logic_rows(nc, 0, 1 if children else 0)
+            else:
+                _set_logic_rows(nc, 0, 0)
+            local.append(nc)
+            changed += 1
+
+        for c in children:
+            nc = dict(c)
+            _set_logic_rows(nc, 1, 1)
+            local.append(nc)
+            changed += 1
+
+        # 表体按当前 row_start 分组，压成连续局部行
+        body_groups: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        for c in body_cells:
+            body_groups[int(c["row_start"])].append(c)
+
+        local_r = 2 if (parents and children) else (1 if parents or children else 0)
+        for old_r in sorted(body_groups.keys()):
+            for c in body_groups[old_r]:
+                nc = dict(c)
+                _set_logic_rows(nc, local_r, local_r)
+                local.append(nc)
+                changed += 1
+            local_r += 1
+
+        rebuilt_segs.append(local)
+
+    if not changed:
+        return cells
+
+    # 3) 段拼接为全局连续行号
+    final: List[Dict[str, Any]] = []
+    global_row = 0
+    for seg_cells in rebuilt_segs:
+        if not seg_cells:
+            continue
+        max_local = max(int(c["row_end"]) for c in seg_cells)
+        for c in seg_cells:
+            nc = dict(c)
+            _set_logic_rows(
+                nc,
+                global_row + int(c["row_start"]),
+                global_row + int(c["row_end"]),
+            )
+            final.append(nc)
+        global_row += max_local + 1
+
+    if not final:
+        return cells
+
+    logger.info(
+        "normalize_oversegmented_table_rows: %d → %d cells",
+        len(cells),
+        len(final),
+    )
+    return dedupe_overlapping_cells(final)
 
 
 def refine_tsr_cells(

@@ -36,6 +36,7 @@ _LETTER_DATA_RE = re.compile(r"^(?:[A-Za-z][+＋]?|[A-Z]{2,3}|[A-Za-z]\d{1,2})$"
 _EXAMPLE_COL_HEADER_RE = re.compile(
     r"(合成例|实施例|実施例|比較例|比较例|对照例|参考例)"
 )
+_MONOMER_PARENT_LABEL_RE = re.compile(r"单体\s*[\[［]")
 
 
 def _cell_key(cell: Dict[str, Any]) -> Tuple[int, int, int, int]:
@@ -721,6 +722,8 @@ def _collapse_header_empty_corners(cells: List[Dict[str, Any]]) -> List[Dict[str
         if label_idx is None:
             continue
         label = row_cells[label_idx]
+        if _MONOMER_PARENT_LABEL_RE.search(str(label.get("text") or "")):
+            continue
         orig_cs = int(label["col_start"])
         absorbed: List[Dict[str, Any]] = []
         for j in range(label_idx):
@@ -752,6 +755,8 @@ def _collapse_header_empty_corners(cells: List[Dict[str, Any]]) -> List[Dict[str
             if not c.get("_drop_render")
         )
         if not has_left and orig_cs >= min_label_col:
+            if _MONOMER_PARENT_LABEL_RE.search(str(label.get("text") or "")):
+                continue
             label["col_start"] = 0
             label["col_span"] = int(label["col_end"]) + 1
             changed += 1
@@ -924,6 +929,9 @@ def _merge_leading_empty_into_label(cells: List[Dict[str, Any]]) -> List[Dict[st
         if label_idx is None or label_idx == 0:
             continue
         label = row_cells[label_idx]
+        # 「单体[…]」父格左侧常是聚合物/空角，不可左扩吞列
+        if _MONOMER_PARENT_LABEL_RE.search(str(label.get("text") or "")):
+            continue
         orig_cs = int(label["col_start"])
         new_start = orig_cs
         absorbed: List[Dict[str, Any]] = []

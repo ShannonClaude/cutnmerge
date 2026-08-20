@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 _EXAMPLE_LABEL_RE = re.compile(r"实[施試]例|比[较較]例|参考例")
 _COMPOSITION_HEADER_RE = re.compile(r"清漆|树脂|感光剂|溶剂|显影|判定|组成")
-_CAPTION_CELL_RE = re.compile(r"^\[表\s*\d+\]$")
+_CAPTION_CELL_RE = re.compile(r"^\[?\s*表\s*[\d\-ー－]+\s*\]?$")
 _MIN_ROW0_EXAMPLES = 8
 _COL_ROW_RATIO = 1.5
 

@@ -141,34 +141,51 @@ def find_row_segments(
     header_tokens: set = set()
     # 本段是否已出现表体行：未出现前，禁止用「像表头」切开（避免多级子表头误切）
     segment_seen_data = False
+    # 本段是否已见聚合物/单体等表头信号：用于抑制 TSR 行框间隙误切表体
+    segment_seen_header = False
 
     for rs, y_top, y_bot, row_cells in row_meta:
         joined = _row_joined_text(
             row_cells, y_top=y_top, y_bot=y_bot, text_boxes=text_boxes
         )
         toks = _tokenize_row_text(joined)
+        is_data_row = bool(_DATA_ROW_RE.search(joined))
+        is_section_hdr = bool(_SECTION_HEADER_RE.search(joined))
+        is_caption = bool(_HEADER_CAPTION_RE.search(joined))
         should_split = False
         if seg_start is not None and prev_y_bot is not None:
-            if (y_top - prev_y_bot) > y_gap_thresh:
-                should_split = True
-            elif (not is_first_row) and _HEADER_CAPTION_RE.search(joined):
+            gap = y_top - prev_y_bot
+            if gap > y_gap_thresh:
+                # TSR 常把同行名/数值拆成相距数十 px 的逻辑行；表内勿仅凭间距切开。
+                # 表题始终切；段首表头仅在已见表体后切（避免多级表头「单体」与「聚合物」互切）；
+                # 超大空隙（约 2.5×）才当作物理分表。
+                if is_caption:
+                    should_split = True
+                elif is_section_hdr and segment_seen_data:
+                    should_split = True
+                elif segment_seen_header or segment_seen_data:
+                    should_split = gap > y_gap_thresh * 2.5
+                else:
+                    should_split = True
+            elif (not is_first_row) and is_caption:
                 should_split = True
             elif (
                 segment_seen_data
                 and (not is_first_row)
-                and _SECTION_HEADER_RE.search(joined)
+                and is_section_hdr
+                and not is_data_row
             ):
                 # 表体后再遇「聚合物/单体[」才切；表头带内的子表头不切
-                if not _DATA_ROW_RE.search(joined):
-                    should_split = True
+                should_split = True
             elif (
                 segment_seen_data
                 and (not is_first_row)
+                and not is_data_row
                 and header_tokens
                 and len(toks) >= 2
                 and _jaccard(toks, header_tokens) >= _HEADER_JACCARD_THRESH
             ):
-                # 同上：Jaccard 重复表头仅在已见过表体后生效
+                # Jaccard 重复表头：跳过合成例等表体行，避免相邻数据行互切
                 should_split = True
 
         if should_split and seg_start is not None and seg_end is not None:
@@ -181,6 +198,7 @@ def find_row_segments(
             is_first_row = True
             header_tokens = set()
             segment_seen_data = False
+            segment_seen_header = False
 
         if is_first_row:
             header_tokens = toks
@@ -189,8 +207,10 @@ def find_row_segments(
         # 也覆盖本行起点（row_end 可能小于后续行）
         if seg_end < rs:
             seg_end = rs
-        if _DATA_ROW_RE.search(joined):
+        if is_data_row:
             segment_seen_data = True
+        if is_section_hdr:
+            segment_seen_header = True
         prev_y_bot = y_bot
         is_first_row = False
 

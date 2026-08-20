@@ -108,10 +108,61 @@ def test_split_clamp_no_row_overlap() -> None:
     assert len(segs) >= 2, segs
 
 
+def test_data_rows_not_split_by_jaccard_or_small_gap() -> None:
+    """P46 类：相邻合成例数据行不得因 Jaccard/小间距被切成多段。"""
+    cells = [
+        _cell(0, 0, 0, 0, "聚合物", y0=0, y1=20),
+        _cell(0, 0, 1, 4, "单体[mol比]", y0=0, y1=20),
+        _cell(1, 1, 1, 1, "二羧酸及其衍生物", y0=20, y1=40),
+        _cell(1, 1, 2, 3, "双氨基酚化合物及其衍生物", y0=20, y1=40),
+        _cell(1, 1, 4, 4, "封端剂", y0=20, y1=40),
+        # 表体：两行相似单体组成，物理间距略超默认 48 但仍属同表
+        _cell(2, 2, 0, 0, "合成例3", y0=50, y1=90),
+        _cell(2, 2, 1, 1, "聚苯并噁唑(PBO-1)", y0=50, y1=90),
+        _cell(2, 2, 2, 2, "BFE(80)", y0=50, y1=90),
+        _cell(2, 2, 3, 3, "BAHF(95)", y0=50, y1=90),
+        _cell(2, 2, 4, 4, "NA(40)", y0=50, y1=90),
+        _cell(3, 3, 0, 0, "合成例4", y0=140, y1=180),
+        _cell(3, 3, 1, 1, "聚苯并噁唑前体(PBOP-1)", y0=140, y1=180),
+        _cell(3, 3, 2, 2, "BFE(80)", y0=140, y1=180),
+        _cell(3, 3, 3, 3, "BAHF(95)", y0=140, y1=180),
+        _cell(3, 3, 4, 4, "NA(40)", y0=140, y1=180),
+        # 段后重复表头：仍应切开
+        _cell(4, 4, 0, 0, "聚合物", y0=190, y1=210),
+        _cell(4, 4, 1, 4, "单体[mol%]", y0=190, y1=210),
+        _cell(5, 5, 0, 0, "合成例5", y0=210, y1=230),
+        _cell(5, 5, 1, 1, "聚硅氧烷溶液(PS-1)", y0=210, y1=230),
+    ]
+    segs = find_row_segments(cells)
+    _assert_no_overlap(segs)
+    assert len(segs) == 2, f"expected 2 segments (mid header), got {segs}"
+    assert segs[0][0] == 0 and segs[0][1] >= 3, segs
+    assert segs[1][0] == 4, segs
+
+
+def test_multilevel_header_monomer_polymer_not_split_by_gap() -> None:
+    """P47 类：多级表头「单体」与「聚合物」夹缝 >48px 时不得互切。"""
+    cells = [
+        _cell(0, 0, 2, 5, "单体 [mol比]", y0=0, y1=18),
+        # 间隙 60px：旧逻辑会把「聚合物」当段首表头切开
+        _cell(1, 2, 1, 1, "聚合物", y0=78, y1=110),
+        _cell(2, 2, 2, 2, "具有酸性基团的共聚成分", y0=90, y1=110),
+        _cell(2, 2, 3, 3, "具有芳香族基团的共聚成分", y0=90, y1=110),
+        _cell(3, 3, 0, 0, "合成例6", y0=110, y1=130),
+        _cell(3, 3, 1, 1, "丙烯酸树脂溶液(AC-1)", y0=110, y1=130),
+        _cell(3, 3, 2, 2, "MAA(50)", y0=110, y1=130),
+    ]
+    segs = find_row_segments(cells)
+    _assert_no_overlap(segs)
+    assert len(segs) == 1, f"expected single segment, got {segs}"
+
+
 def main() -> int:
     test_multilevel_header_not_split()
     test_repeat_header_after_body_still_splits()
     test_split_clamp_no_row_overlap()
+    test_data_rows_not_split_by_jaccard_or_small_gap()
+    test_multilevel_header_monomer_polymer_not_split_by_gap()
     print("OK: all find_row_segments regressions passed")
     return 0
 
