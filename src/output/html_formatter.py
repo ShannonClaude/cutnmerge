@@ -2012,6 +2012,20 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
             out.append(upper)
             continue
         if not upper_text or _is_frag_or_empty(upper_text):
+            # 新增：允许表头角落的上下层空角/碎片进行垂直合并，消除多余的横向分割线
+            lower_for_empty = by_key.get((ue + 1, uc_s, uc_e))
+            if lower_for_empty is not None:
+                lower_text = str(lower_for_empty.get("text") or "").strip()
+                if not lower_text or _is_frag_or_empty(lower_text):
+                    upper["row_end"] = int(lower_for_empty["row_end"])
+                    upper["row_span"] = int(upper["row_end"]) - int(upper["row_start"]) + 1
+                    dropped_ids.add(id(lower_for_empty))
+            else:
+                # 下方若是没有 cell 对象的空位，直接延伸占位
+                next_row = ue + 1
+                if not _occupied_by_nonempty(next_row, uc_s, uc_e):
+                    upper["row_end"] = next_row
+                    upper["row_span"] = int(upper["row_end"]) - int(upper["row_start"]) + 1
             out.append(upper)
             continue
         # 上层 colspan 组头覆盖多列 → 子列头不得纵向叠字合并（P32 溶解性/粘度）
