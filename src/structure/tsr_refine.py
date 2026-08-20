@@ -1500,7 +1500,7 @@ def reconstruct_header_cells(
             for cell in candidates:
                 cs, ce = int(cell["col_start"]), int(cell["col_end"])
                 rs = int(cell["row_start"])
-                re = int(cell["row_end"])
+                re_ = int(cell["row_end"])  # 修复冲突，改为 re_
                 cx1, cy1, cx2, cy2 = _cell_bbox(cell)
                 # 落入宽格的 OCR
                 hits: List[Tuple[float, float, float, float, Dict[str, Any]]] = []
@@ -1572,7 +1572,7 @@ def reconstruct_header_cells(
                             for c2 in work:
                                 if (
                                     int(c2["row_start"]) == rs
-                                    and int(c2["row_end"]) == re
+                                    and int(c2["row_end"]) == re_
                                     and int(c2["col_start"]) == cs
                                     and int(c2["col_end"]) == ce
                                 ):
@@ -1587,17 +1587,17 @@ def reconstruct_header_cells(
                 next_row_overlap = [
                     c2
                     for c2 in work
-                    if int(c2["row_start"]) == re + 1
+                    if int(c2["row_start"]) == re_ + 1
                     and int(c2["col_end"]) >= cs
                     and int(c2["col_start"]) <= ce
                 ]
                 next_is_subheader = False
                 if len(next_row_overlap) >= 2:
                     # 用 OCR 判断下一行是子表头还是数据行
-                    y0 = float(row_seps[re + 1]) if re + 1 < len(row_seps) else 0.0
+                    y0 = float(row_seps[re_ + 1]) if re_ + 1 < len(row_seps) else 0.0
                     y1 = (
-                        float(row_seps[re + 2])
-                        if re + 2 < len(row_seps)
+                        float(row_seps[re_ + 2])
+                        if re_ + 2 < len(row_seps)
                         else y0 + 1.0
                     )
                     next_texts = []
@@ -1650,7 +1650,7 @@ def reconstruct_header_cells(
                 # 仅当「上带父级标题 + 下带多列标签」且当前是单行表头时才插行；
                 # 避免把已经跨越多行的宽格强行打断
                 need_y_split = (
-                    rs == re
+                    rs == re_
                     and n_y >= 2
                     and not children_already_exist
                     and top_is_parent
@@ -1674,8 +1674,8 @@ def reconstruct_header_cells(
                     new_cells: List[Dict[str, Any]] = []
                     y1 = float(row_seps[rs]) if rs < len(row_seps) else cy1
                     y2 = (
-                        float(row_seps[re + 1])
-                        if re + 1 < len(row_seps)
+                        float(row_seps[re_ + 1])
+                        if re_ + 1 < len(row_seps)
                         else cy2
                     )
                     for g in groups:
@@ -1695,7 +1695,7 @@ def reconstruct_header_cells(
                                 x2=x2,
                                 y2=y2,
                                 row_start=rs,
-                                row_end=re,
+                                row_end=re_,
                                 col_start=ncs,
                                 col_end=nce,
                             )
@@ -1706,7 +1706,7 @@ def reconstruct_header_cells(
                             for c in work
                             if not (
                                 int(c["row_start"]) == rs
-                                and int(c["row_end"]) == re
+                                and int(c["row_end"]) == re_
                                 and int(c["col_start"]) == cs
                                 and int(c["col_end"]) == ce
                             )
@@ -1728,7 +1728,7 @@ def reconstruct_header_cells(
                         # 丢弃原宽格，后面按 Y/X 簇重建
                         if (
                             int(c["row_start"]) == rs
-                            and int(c["row_end"]) == re
+                            and int(c["row_end"]) == re_
                             and int(c["col_start"]) == cs
                             and int(c["col_end"]) == ce
                         ):
@@ -1822,7 +1822,7 @@ def reconstruct_header_cells(
                                 x2=float(col_seps[ce + 1]),
                                 y2=y2_bot,
                                 row_start=rs + 1,
-                                row_end=re + 1,
+                                row_end=re_ + 1,
                                 col_start=cs,
                                 col_end=ce,
                             )
@@ -1856,7 +1856,7 @@ def reconstruct_header_cells(
                                     x2=float(col_seps[nce + 1]),
                                     y2=y2_bot,
                                     row_start=rs + 1,
-                                    row_end=re + 1,
+                                    row_end=re_ + 1,
                                     col_start=ncs,
                                     col_end=nce,
                                 )
@@ -1881,7 +1881,6 @@ def reconstruct_header_cells(
             len(work),
         )
     return dedupe_overlapping_cells(work)
-
 
 def explode_header_colspans_by_body(
     cells: List[Dict[str, Any]],
@@ -2172,9 +2171,9 @@ def refine_tsr_cells(
     cells = split_bad_colspans(cells, boxes)
     cells = dedupe_overlapping_cells(cells)
     
-    # ======= 新增以下这行核心修复 =======
+    # ======= 此前漏掉的修复：多列表头拆分 =======
     # 将 TSR 误判合并的多列表头（colspan>=2），根据文本的 X 轴聚类拆分为多个独立的单元格
     cells = reconstruct_header_cells(cells, boxes)
-    # ====================================
-    
+    # ============================================
+
     return cells
