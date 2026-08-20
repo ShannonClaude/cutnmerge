@@ -86,9 +86,22 @@ def main() -> None:
                     html,
                 )
             )
+            collapsed = "组成[质量%]<br>" in html
+            has_sub = bool(re.search(r">着色剂", html)) and bool(
+                re.search(r"第一树脂", html)
+            )
+            compose_top = bool(
+                re.search(r'colspan="[4-9]"[^>]*>组成\[质量%\]<', html)
+            ) or bool(re.search(r">组成\[质量%\]<", html))
             print(
                 "P100 ghost_line",
                 ghost,
+                "collapsed_hdr",
+                collapsed,
+                "has_sub",
+                has_sub,
+                "compose_top",
+                compose_top,
                 "has_fensan",
                 "分散液" in html,
                 "n_zhizao",

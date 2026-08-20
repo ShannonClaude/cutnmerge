@@ -439,17 +439,19 @@ def merge_ghost_columns(
     for cell in cells:
         nc = dict(cell)
         cs, ce = int(cell["col_start"]), int(cell["col_end"])
-        new_cs = min(map_col(i) for i in range(cs, ce + 1))
-        new_ce = max(map_col(i) for i in range(cs, ce + 1))
+        # 只按本格覆盖的「非幽灵列」重映射。若把格内幽灵列跟随并入右侧邻列，
+        # 会把左侧 colspan（如 P100「分散液」c1-3）错误扩进「组成」列，
+        # 引发逻辑重叠 → light 误升级 aggressive，二级表头被压扁。
+        own_survivors = [i for i in range(cs, ce + 1) if not ghost[i]]
+        if own_survivors:
+            new_cs = min(old_to_new[i] for i in own_survivors)
+            new_ce = max(old_to_new[i] for i in own_survivors)
+        else:
+            new_cs = min(map_col(i) for i in range(cs, ce + 1))
+            new_ce = max(map_col(i) for i in range(cs, ce + 1))
         nc["col_start"] = new_cs
         nc["col_end"] = new_ce
         _refresh_spans(nc)
-        # 更新物理框到新 col_seps 子集
-        new_col_seps = [col_seps[survivors[0]]]
-        for s in survivors:
-            new_col_seps.append(col_seps[s + 1])
-        # 简化：用 survivors 边界重建
-        xs0 = col_seps[survivors[new_cs]] if new_cs < len(survivors) else col_seps[0]
         # survivors[i] 是旧列号；左边界 = col_seps[survivors[new_cs]]
         left = float(col_seps[survivors[new_cs]])
         right_old = survivors[new_ce]
