@@ -2262,46 +2262,6 @@ def _child_header_category(label: str) -> str:
     return "other"
 
 
-_DASH_OR_BLANK_RE = re.compile(r"^[-—–−~～]+$")
-
-
-def _body_col_has_substance(
-    col: int,
-    bodies: Sequence[Dict[str, Any]],
-    boxes: Sequence[Dict[str, Any]],
-    col_seps: Sequence[float],
-) -> bool:
-    """表体列是否含化学代号/数值等实质内容（短横/空不算）。"""
-    texts: List[str] = []
-    for b in bodies:
-        if int(b["col_start"]) <= col <= int(b["col_end"]):
-            t = re.sub(r"\s+", "", str(b.get("text") or ""))
-            if t:
-                texts.append(t)
-    if col + 1 < len(col_seps) and bodies:
-        x1 = float(col_seps[col])
-        x2 = float(col_seps[col + 1])
-        y_lo = min(_cell_bbox(b)[1] for b in bodies)
-        y_hi = max(_cell_bbox(b)[3] for b in bodies)
-        for tb in boxes:
-            tx1, ty1, tx2, ty2 = _tb_bbox(tb)
-            mx, my = 0.5 * (tx1 + tx2), 0.5 * (ty1 + ty2)
-            if x1 <= mx <= x2 and y_lo <= my <= y_hi:
-                t = re.sub(r"\s+", "", str(tb.get("text") or ""))
-                if t:
-                    texts.append(t)
-    for t in texts:
-        if not t or _DASH_OR_BLANK_RE.fullmatch(t):
-            continue
-        if _CHEM_BODY_RE.fullmatch(t) or _PAREN_AMOUNT_RE.fullmatch(t):
-            return True
-        if re.fullmatch(r"\d+(?:\.\d+)?", t):
-            return True
-        if re.search(r"[A-Za-z]{2,}", t):
-            return True
-    return False
-
-
 def _cell_label_text(
     cell: Dict[str, Any], boxes: Sequence[Dict[str, Any]]
 ) -> str:
@@ -2359,6 +2319,40 @@ def _cell_x_center(cell: Dict[str, Any]) -> float:
     return 0.5 * (x1 + x2)
 
 
+def _monomer_child_partition_trustworthy(
+    ordered_kids: Sequence[Dict[str, Any]],
+    *,
+    band_lo: int,
+    band_hi: int,
+    gap_tol: float = 24.0,
+) -> bool:
+    """子头列带已无缝铺满且多边形左右相接时，信任 TSR，勿用 OCR 左墙重切。
+
+    P92：酸/胺/封端剂格子已是 2+3+1 且框线相接；若仍按缩进文案左缘切墙，
+    会把 BAHF 误划给四羧酸。P93：三官能已含短横预留槽时同理应保留 4+1+1。
+    """
+    if len(ordered_kids) < 2:
+        return False
+    cursor = band_lo
+    prev_x2: Optional[float] = None
+    for kid in ordered_kids:
+        cs, ce = int(kid["col_start"]), int(kid["col_end"])
+        if cs != cursor or ce < cs:
+            return False
+        cursor = ce + 1
+        x1, _y1, x2, _y2 = _cell_bbox(kid)
+        if prev_x2 is not None:
+            gap = float(x1) - float(prev_x2)
+            # 相接或小缝；明显大缝说明多边形只盖住文案区，span 可能仍错
+            if gap > gap_tol:
+                return False
+            # 大幅重叠也不信
+            if gap < -gap_tol:
+                return False
+        prev_x2 = float(x2)
+    return cursor == band_hi + 1
+
+
 def _align_monomer_children_to_body(
     children: List[Dict[str, Any]],
     body_cells: List[Dict[str, Any]],
@@ -2370,9 +2364,9 @@ def _align_monomer_children_to_body(
 ) -> int:
     """按表体列把单体子表头对齐到连续列带。
 
-    1) 下一子头 OCR/多边形左缘作硬墙（左对齐跨列头：SiDA 归二胺而非封端剂）；
-    2) 收尾：左子头右缘若拖着已越过其文案、且更靠近右邻的「仅短横/空」列，
-       则让给右邻（P93：三官能不得吞四官能前空列；P97：含 AcrTMS 的列保留）。
+    1) 若子头列带已无缝且多边形首尾相接 → 信任现有划分（P92/P93 已正确时勿破坏）；
+    2) 否则以下一子头左缘为硬墙重切：优先格子多边形左缘，无框时用 OCR 文案左缘。
+       空列/短横只要落在墙左侧即归左类（预留槽，不得按文案远近让给右类）。
     """
     if len(children) < 1 or len(body_cells) < 2:
         return 0
@@ -2406,18 +2400,17 @@ def _align_monomer_children_to_body(
             return 0.5 * (float(col_seps[col]) + float(col_seps[col + 1]))
         return float(col_seps[min(col, len(col_seps) - 1)])
 
-    def _kid_left_x(kid: Dict[str, Any]) -> float:
-        # 左对齐跨列头：左缘才是本列带起点；中心会偏到右邻类
+    def _kid_wall_x(kid: Dict[str, Any]) -> float:
+        """下一子头列带起点：整格左缘优先于缩进文案左缘。"""
+        poly_left = float(_cell_bbox(kid)[0])
         tbs = _texts_in_cell(kid, boxes)
-        if tbs:
-            return min(float(_tb_bbox(tb)[0]) for tb in tbs)
-        return float(_cell_bbox(kid)[0])
-
-    def _kid_text_right(kid: Dict[str, Any]) -> float:
-        tbs = _texts_in_cell(kid, boxes)
-        if tbs:
-            return max(float(_tb_bbox(tb)[2]) for tb in tbs)
-        return float(_cell_bbox(kid)[2])
+        if not tbs:
+            return poly_left
+        ocr_left = min(float(_tb_bbox(tb)[0]) for tb in tbs)
+        # 文案在格内右缩时，墙用多边形左缘，避免左邻吞掉本类首列
+        if ocr_left > poly_left + 6.0:
+            return poly_left
+        return ocr_left
 
     def _kid_label(kid: Dict[str, Any]) -> str:
         t = _cell_label_text(kid, boxes)
@@ -2428,19 +2421,27 @@ def _align_monomer_children_to_body(
             return "".join(str(tb.get("text") or "") for tb in tbs)
         return t
 
+    ordered_kids = sorted(
+        kids, key=lambda k: (int(k["col_start"]), float(_cell_bbox(k)[0]))
+    )
+    if _monomer_child_partition_trustworthy(
+        ordered_kids, band_lo=band_lo, band_hi=band_hi
+    ):
+        return 0
+
     kid_meta = [
         (
             k,
-            _kid_left_x(k),
+            _kid_wall_x(k),
             _child_header_category(_kid_label(k)),
         )
-        for k in kids
+        for k in ordered_kids
     ]
     ordered_meta = sorted(
         kid_meta, key=lambda t: (int(t[0]["col_start"]), t[1])
     )
 
-    # 下一子头左缘为墙：左子头吃到墙左侧最后一列
+    # 下一子头左缘为墙：左子头吃到墙左侧最后一列（含其间短横/空预留槽）
     cuts: List[int] = []
     for i in range(len(ordered_meta) - 1):
         wall_x = float(ordered_meta[i + 1][1])
@@ -2464,25 +2465,6 @@ def _align_monomer_children_to_body(
             hi = lo
         spans.append((kid, lo, hi))
         lo = hi + 1
-
-    # 收尾：左子头不得拖着越过文案、更靠右邻的短横/空列（P93）
-    for i in range(len(spans) - 1):
-        left_kid, l_lo, l_hi = spans[i]
-        right_kid, r_lo, r_hi = spans[i + 1]
-        ltr = _kid_text_right(left_kid)
-        rtl = _kid_left_x(right_kid)
-        while l_hi > l_lo:
-            cx = _col_x(l_hi)
-            if cx <= ltr + 1.0:
-                break
-            if _body_col_has_substance(l_hi, bodies, boxes, col_seps):
-                break
-            if abs(cx - rtl) > abs(cx - ltr):
-                break
-            l_hi -= 1
-            r_lo = l_hi + 1
-        spans[i] = (left_kid, l_lo, l_hi)
-        spans[i + 1] = (right_kid, r_lo, r_hi)
 
     changed = 0
     for kid, new_cs, new_ce in spans:

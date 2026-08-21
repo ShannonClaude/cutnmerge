@@ -145,16 +145,16 @@ def test_align_diamine_vs_endcap_left_wall():
     print("ok test_align_diamine_vs_endcap_left_wall", "changed=", n)
 
 
-def test_align_trifunctional_silane_trim_dash():
-    """P93：左墙会把四官能前短横列划给三官能；收尾应让出 → 3+2+1。"""
+def test_align_trifunctional_keeps_dash_slot():
+    """P93：四官能前短横是三官能预留槽；左墙应保留 → 4+1+1（不得让成 3+2+1）。"""
     from src.structure.tsr_refine import _align_monomer_children_to_body
 
     # c2 MeTMS | c3 PhTMS | c4 cyEpo | c5 - | c6 TMOS | c7 -
     col_seps = [0, 40, 80, 200, 320, 440, 520, 640, 760]
     kids = [
-        # TSR 误把三官能扩到含短横列
-        _cell(80, 20, 520, 40, 1, 1, 2, 5, "三官能有机硅烷"),
-        _cell(520, 20, 640, 40, 1, 1, 6, 6, "四官能有机硅烷"),
+        # 模拟错误初始 span：三官能过窄，短横被算进四官能
+        _cell(80, 20, 440, 40, 1, 1, 2, 4, "三官能有机硅烷"),
+        _cell(440, 20, 640, 40, 1, 1, 5, 6, "四官能有机硅烷"),
         _cell(640, 20, 760, 40, 1, 1, 7, 7, "二官能有机硅烷"),
     ]
     # 文案左对齐：三官能只印在前三列区域，四官能文案从 TMOS 列起
@@ -175,11 +175,43 @@ def test_align_trifunctional_silane_trim_dash():
     tri = next(c for c in kids if "三官能" in str(c.get("text") or ""))
     tetra = next(c for c in kids if "四官能" in str(c.get("text") or ""))
     di = next(c for c in kids if "二官能" in str(c.get("text") or ""))
-    assert (int(tri["col_start"]), int(tri["col_end"])) == (2, 4), tri
-    assert (int(tetra["col_start"]), int(tetra["col_end"])) == (5, 6), tetra
+    assert (int(tri["col_start"]), int(tri["col_end"])) == (2, 5), tri
+    assert (int(tetra["col_start"]), int(tetra["col_end"])) == (6, 6), tetra
     assert (int(di["col_start"]), int(di["col_end"])) == (7, 7), di
     assert n >= 1
-    print("ok test_align_trifunctional_silane_trim_dash", "changed=", n)
+    print("ok test_align_trifunctional_keeps_dash_slot", "changed=", n)
+
+
+def test_align_skips_when_partition_trustworthy():
+    """列带已无缝且多边形相接时不得重切（P92：酸2+胺3+封端1）。"""
+    from src.structure.tsr_refine import _align_monomer_children_to_body
+
+    col_seps = [0, 40, 80, 120, 200, 280, 360, 420, 480]
+    kids = [
+        _cell(80, 20, 200, 40, 1, 1, 2, 3, "四羧酸及其衍生物"),
+        _cell(200, 20, 420, 40, 1, 1, 4, 6, "二胺及其衍生物"),
+        _cell(420, 20, 480, 40, 1, 1, 7, 7, "封端剂"),
+    ]
+    # 多边形与列带一致、首尾相接（非整格缩成文案条）
+    bodies = [
+        _cell(80, 40, 120, 60, 2, 2, 2, 2, "ODPA(100)"),
+        _cell(120, 40, 200, 60, 2, 2, 3, 3, "-"),
+        _cell(200, 40, 280, 60, 2, 2, 4, 4, "BAHF(85)"),
+        _cell(280, 40, 360, 60, 2, 2, 5, 5, "-"),
+        _cell(360, 40, 420, 60, 2, 2, 6, 6, "SiDA(5)"),
+        _cell(420, 40, 480, 60, 2, 2, 7, 7, "MAP(20)"),
+    ]
+    n = _align_monomer_children_to_body(
+        kids, bodies, col_seps, band_lo=2, band_hi=7
+    )
+    acid = next(c for c in kids if "四羧酸" in str(c.get("text") or ""))
+    diam = next(c for c in kids if "二胺" in str(c.get("text") or ""))
+    cap = next(c for c in kids if "封端剂" in str(c.get("text") or ""))
+    assert (int(acid["col_start"]), int(acid["col_end"])) == (2, 3), acid
+    assert (int(diam["col_start"]), int(diam["col_end"])) == (4, 6), diam
+    assert (int(cap["col_start"]), int(cap["col_end"])) == (7, 7), cap
+    assert n == 0
+    print("ok test_align_skips_when_partition_trustworthy")
 
 
 def test_align_trifunctional_keeps_chem_fourth_col():
@@ -219,6 +251,7 @@ if __name__ == "__main__":
     test_no_cross_synth_peer_collapse()
     test_lift_keeps_numeric_body()
     test_align_diamine_vs_endcap_left_wall()
-    test_align_trifunctional_silane_trim_dash()
+    test_align_trifunctional_keeps_dash_slot()
+    test_align_skips_when_partition_trustworthy()
     test_align_trifunctional_keeps_chem_fourth_col()
     print("ALL PASS")
