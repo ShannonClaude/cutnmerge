@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 from src.structure.tsr_refine import (
     lift_misplaced_header_labels,
     promote_side_header_rowspans,
+    repair_monomer_parent_spans,
 )
 
 
@@ -98,8 +99,45 @@ def test_lift_acid_equiv_from_body():
     print("ok lift_acid_equiv_from_body")
 
 
+def test_right_anchor_laiyuan_not_swallowed():
+    """CN111「来源于具有…」须作单体右硬锚，不可被扩进单体 colspan（P92）。"""
+    # 列：0空 1聚合物 2-7单体子列 8-10来源于 11酸当量
+    cells = [
+        _cell(0, 0, 20, 40, 0, 1, 0, 0, ""),
+        _cell(20, 0, 40, 40, 0, 1, 1, 1, "聚合物"),
+        _cell(40, 0, 160, 20, 0, 0, 2, 10, "单体[mol比]"),  # 错误过宽
+        _cell(40, 20, 60, 40, 1, 1, 2, 3, "四羧酸及其衍生物"),
+        _cell(60, 20, 100, 40, 1, 1, 4, 6, "二胺及其衍生物"),
+        _cell(100, 20, 120, 40, 1, 1, 7, 7, "封端剂"),
+        _cell(120, 20, 140, 40, 1, 1, 8, 8, "来源于具有氟原子的单体的结构单元在全部结构单元中所占的比率[mol%]"),
+        _cell(140, 20, 160, 40, 1, 1, 9, 9, "来源于具有氟原子的单体的结构单元在来源于全部羧酸衍生物的结构单元中所占的比率[mol%]"),
+        _cell(160, 20, 180, 40, 1, 1, 10, 10, "来源于具有氟原子的单体的结构单元在来源于全部胺衍生物的结构单元中所占的比率[mol%]"),
+        _cell(180, 0, 200, 40, 0, 1, 11, 11, "酸当量[g/mol]"),
+        _cell(0, 40, 20, 60, 2, 2, 0, 0, "合成例1"),
+        _cell(20, 40, 40, 60, 2, 2, 1, 1, "PI-1"),
+        _cell(40, 40, 50, 60, 2, 2, 2, 2, "ODPA(100)"),
+        _cell(50, 40, 60, 60, 2, 2, 3, 3, "-"),
+        _cell(60, 40, 70, 60, 2, 2, 4, 4, "BAHF(85)"),
+        _cell(70, 40, 80, 60, 2, 2, 5, 5, "-"),
+        _cell(80, 40, 90, 60, 2, 2, 6, 6, "SiDA(5)"),
+        _cell(90, 40, 100, 60, 2, 2, 7, 7, "MAP(20)"),
+        _cell(100, 40, 120, 60, 2, 2, 8, 8, "40.5"),
+        _cell(120, 40, 140, 60, 2, 2, 9, 9, "0.0"),
+        _cell(140, 40, 160, 60, 2, 2, 10, 10, "77.3"),
+        _cell(160, 40, 180, 60, 2, 2, 11, 11, "350"),
+    ]
+    out = repair_monomer_parent_spans(cells)
+    parent = [c for c in out if "单体" in str(c.get("text") or "")][0]
+    assert int(parent["col_start"]) == 2 and int(parent["col_end"]) == 7, (
+        parent["col_start"],
+        parent["col_end"],
+    )
+    print("ok test_right_anchor_laiyuan_not_swallowed")
+
+
 if __name__ == "__main__":
     test_promote_ene_rowspan()
     test_no_promote_ene_inside_monomer()
     test_lift_acid_equiv_from_body()
+    test_right_anchor_laiyuan_not_swallowed()
     print("ALL PASS")

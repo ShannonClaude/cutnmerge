@@ -2218,9 +2218,12 @@ def logic_conflict_ratio(cells: Sequence[Dict[str, Any]]) -> float:
 
 _MONOMER_PARENT_RE = re.compile(r"单体\s*[\[［]")
 _MONOMER_LEFT_ANCHOR_RE = re.compile(r"聚合物")
-# 单体带右侧硬锚点：比率/当量等指标列（不含烯键式——P98 烯键式是单体子列）
+# 单体带右侧硬锚点：比率/当量等指标列（不含烯键式——P98/P94 烯键式是单体子列）
+# 「来自/来源于具有…」覆盖 CN110（来自）与 CN111（来源于）两种 OCR 写法；
+# 勿只锚「酸当量」——否则子表头行上的比率列会被当成单体子列（P92）。
 _MONOMER_RIGHT_ANCHOR_RE = re.compile(
-    r"(含有比率|含有比例|含有率|氟比率|酸当量|双键当量)"
+    r"(含有比率|含有比例|含有率|氟比率|酸当量|双键当量|"
+    r"来自具有|来源于具有|所占的比率|所占比率)"
 )
 # 烯键式列：P96 为外侧整列（封端剂右侧单列）；P98 为单体子列
 _ENE_HEADER_RE = re.compile(r"(烯键式|烯属不饱和|不饱和双键)")
@@ -2422,9 +2425,8 @@ def repair_monomer_parent_spans(
     """
     if not cells:
         return cells
+    # 允许无 OCR boxes：单元测试与已写入 cell.text 的拓扑修复仍可用
     boxes = list(boxes) if boxes else []
-    if not boxes:
-        return cells
 
     from ..utils.segments import find_row_segments
 
@@ -2435,7 +2437,9 @@ def repair_monomer_parent_spans(
 
     segments = find_row_segments(work, text_boxes=boxes)
     if not segments:
-        return work
+        # 无分段信息时整表当作一段（有 text 的拓扑仍可修）
+        max_r = max(int(c["row_end"]) for c in work)
+        segments = [(0, max_r)]
 
     removed: set = set()
     changed = 0
