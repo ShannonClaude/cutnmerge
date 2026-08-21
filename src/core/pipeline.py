@@ -74,11 +74,17 @@ def _is_degenerate_grid(
     触发条件（需同时满足多个强信号）：
     - 格子数极少而文本框极多（结构基本丢失）
     - 或逻辑冲突比极高（>0.25）且格子数远少于文本框数
+
+    已有大量文字归属时不触发：兜底融合常生成无字空壳，会把整表抹掉。
     """
     if not cells:
         return len(text_boxes) > 20
     n_cells = len(cells)
     n_boxes = max(len(text_boxes), 1)
+    n_text = sum(1 for c in cells if str(c.get("text") or "").strip())
+    # 文字覆盖尚可 → 宁可保留当前结果，勿用空结构替换
+    if n_text >= max(8, int(n_boxes * 0.25)):
+        return False
     # 信号1：格子极少、文本框极多——结构几乎完全丢失
     if n_cells < 4 and n_boxes > 20:
         return True
@@ -639,15 +645,34 @@ def _extract_via_tsr(
     if _is_degenerate_grid(cells, text_boxes):
         logger.warning("检测到退化网格(cells=%d boxes=%d)，尝试兜底", len(cells), len(text_boxes))
         if not tsr_aggressive:
+            prev_ne = sum(1 for c in cells if str(c.get("text") or "").strip())
             try:
                 agg_cells = refine_tsr_cells(cells, text_boxes)
                 probe_lines = detect_tables(image, confidence_thresh=0.0, text_boxes=text_boxes)
                 fused = fuse_tsr_with_lines(agg_cells, probe_lines) if probe_lines else agg_cells
-                if not _is_degenerate_grid(fused, text_boxes):
+                # 融合后结构无字，必须重新归属；否则会输出空壳表
+                fused, _fused_free = assign_texts_to_cells(
+                    fused,
+                    text_boxes,
+                    ioa_threshold=ioa_threshold,
+                    split_cross_cell=split_cross,
+                    table_bboxes=None,
+                    binary=binary,
+                    col_seps=col_seps,
+                    v_separators=v_separators,
+                )
+                fused_ne = sum(1 for c in fused if str(c.get("text") or "").strip())
+                if fused_ne > prev_ne and not _is_degenerate_grid(fused, text_boxes):
                     cells = fused
-                    logger.info("退化网格升级 aggressive+fused 成功")
+                    logger.info(
+                        "退化网格升级 aggressive+fused 成功 (ne %d→%d)",
+                        prev_ne,
+                        fused_ne,
+                    )
                 else:
-                    raise ValueError("aggressive 仍退化")
+                    raise ValueError(
+                        f"aggressive 未改善文字覆盖 (ne {prev_ne}→{fused_ne})"
+                    )
             except Exception:
                 logger.info("aggressive 路径未改善，尝试 LORE 兜底")
                 try:

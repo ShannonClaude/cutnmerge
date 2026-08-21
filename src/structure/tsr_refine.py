@@ -2817,12 +2817,42 @@ def normalize_oversegmented_table_rows(
     if not final:
         return cells
 
+    out = dedupe_overlapping_cells(final)
+    # 误伤回退：P96/P97/P98 等多段合成例表会被压成残缺表头+丢行；
+    # 非空格大幅下降时保留原文归属结果。
+    def _ne(cs: List[Dict[str, Any]]) -> int:
+        return sum(1 for c in cs if str(c.get("text") or "").strip())
+
+    ne_in, ne_out = _ne(cells), _ne(out)
+    synth_in = sum(
+        1 for c in cells if _SYNTHESIS_LABEL_RE.search(str(c.get("text") or ""))
+    )
+    synth_out = sum(
+        1 for c in out if _SYNTHESIS_LABEL_RE.search(str(c.get("text") or ""))
+    )
+    # 非空格或合成例标签掉太多 → 回退（P96/P97/P98 多段表易被压残）
+    if ne_in >= 12 and (
+        ne_out < max(8, int(ne_in * 0.70))
+        or len(out) < max(12, int(len(cells) * 0.50))
+        or (synth_in >= 3 and synth_out < max(2, synth_in - 1))
+    ):
+        logger.info(
+            "normalize_oversegmented_table_rows: 回退 %d→%d cells (ne %d→%d synth %d→%d)",
+            len(cells),
+            len(out),
+            ne_in,
+            ne_out,
+            synth_in,
+            synth_out,
+        )
+        return cells
+
     logger.info(
         "normalize_oversegmented_table_rows: %d → %d cells",
         len(cells),
-        len(final),
+        len(out),
     )
-    return dedupe_overlapping_cells(final)
+    return out
 
 
 def refine_tsr_cells(
