@@ -1,0 +1,24 @@
+﻿==== D:/Download/cutnmerge/data/cache/71e21788d61431ea68fb6b0d74f88b487ddc5e3e.json <class 'dict'>
+keys ['key', 'text_boxes']
+姣旇緝渚?count 8
+  姣旇緝渚?86|Bk-1
+  姣旇緝渚?2|87|Bk-2
+  姣旇緝渚?3|88
+  姣旇緝渚?489
+  姣旇緝渚?5|90|Bk-2
+  姣旇緝渚?691
+  姣旇緝渚?792|Bk-6
+  姣旇緝渚?893
+ COMP 缁勬垚[璐ㄩ噺浠絔
+==== D:/Download/cutnmerge/data/cache/e89ccbc6af6c66b61abd77550cc0982f8c05a700.json <class 'dict'>
+keys ['key', 'text_boxes']
+姣旇緝渚?count 8
+  姣旇緝渚?86|Bk-1
+  姣旇緝渚?2|87|Bk-2
+  姣旇緝渚?3|88
+  姣旇緝渚?489
+  姣旇緝渚?5|90|Bk-2
+  姣旇緝渚?691
+  姣旇緝渚?792|Bk-6
+  姣旇緝渚?893
+ COMP 缁勬垚[璐ㄩ噺浠絔

@@ -23,6 +23,7 @@ from ..utils.geometry import compute_ioa, polygon_to_shapely
 from ..utils.label_patterns import (
     _CAPTION_CHUNK_RE,
     are_independent_row_labels,
+    best_digit_split_for_example_label,
     complete_truncated_component_header,
     extract_independent_labels_from_joined,
     fix_iii_ocr,
@@ -150,39 +151,10 @@ def _best_digit_split_for_label(
     *,
     local_frac: Optional[float] = None,
 ) -> Optional[int]:
-    """
-    在数字串上选切开点：左侧须构成独立行标，右侧优先 2–3 位组合物编号。
-    """
-    if len(digits) < 2:
-        return None
-    ideal = (
-        _digit_split_at_frac(digits, local_frac)
-        if local_frac is not None
-        else None
+    """委托 label_patterns：左侧独立行标，右侧优先 2–3 位组合物编号。"""
+    return best_digit_split_for_example_label(
+        head, digits, local_frac=local_frac
     )
-    scored: List[Tuple[int, int]] = []
-    for split_at in range(1, len(digits)):
-        left_d = digits[:split_at]
-        right_d = digits[split_at:]
-        label = f"{head}{left_d}"
-        if not is_independent_row_label(label):
-            continue
-        score = 0
-        if len(right_d) in (2, 3):
-            score += 10
-        elif len(right_d) == 1:
-            score -= 2
-        if len(left_d) <= 2:
-            score += 3
-        if right_d.startswith("0") and len(right_d) > 1:
-            score -= 6
-        if ideal is not None:
-            score -= abs(split_at - ideal)
-        scored.append((score, split_at))
-    if not scored:
-        return None
-    scored.sort(key=lambda t: (-t[0], t[1]))
-    return scored[0][1]
 
 
 def _parse_sticky_row_parts(
@@ -239,8 +211,10 @@ def _parse_sticky_row_parts(
         return (fracs[0] - d0) / max(d1 - d0, 1e-6)
 
     if code and n_cols >= 3:
-        if len(digits) < 2:
-            return None
+        # 至少 3 位数字才拆 local|compId|code；「比较例86Bk-1」只有 2 位时
+        # 强行拆成 8|6|Bk 会错（局部号被 OCR 吃掉或本就只有组合物号）。
+        if len(digits) < 3:
+            return [f"{head} {digits}".strip(), code]
         split_at = _best_digit_split_for_label(
             head, digits, local_frac=_local_frac_in_digits()
         )
@@ -250,6 +224,18 @@ def _parse_sticky_row_parts(
         return [f"{head} {left_d}".strip(), right_d, code]
 
     if code and n_cols == 2:
+        # 几何只有标签列+配方码列：仍须切开 local|compId，避免「比较例287|Bk-2」。
+        # 组合物号暂留在标签内（带空格），供后续 peel 插入序号列或填入空列。
+        if len(digits) >= 3:
+            split_at = _best_digit_split_for_label(
+                head, digits, local_frac=_local_frac_in_digits()
+            )
+            if split_at is not None:
+                left_d, right_d = digits[:split_at], digits[split_at:]
+                return [
+                    f"{head} {left_d} {right_d}".strip(),
+                    code,
+                ]
         return [f"{head} {digits}".strip(), code]
 
     if not code and n_cols >= 2 and len(digits) >= 2:

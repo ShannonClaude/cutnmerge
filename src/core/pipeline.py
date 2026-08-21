@@ -30,8 +30,18 @@ from ..ocr.ocr_post import postprocess_text_boxes
 from ..ocr.reocr import apply_reocr_to_cells, recover_empty_vertical_headers
 from ..output.formatter import format_free_texts
 from ..output.html2md import html_to_markdown
-from ..output.html_formatter import build_html_output, html_output_looks_broken
-from ..preprocess.orient import apply_orientation_axis, ensure_upright_axis, maybe_flip_180_by_ocr, parse_orientation_mode
+from ..output.html_formatter import (
+    build_html_output,
+    html_output_looks_broken,
+    html_structure_health,
+)
+from ..preprocess.orient import (
+    apply_orientation_axis,
+    ensure_upright_axis,
+    looks_sideways,
+    maybe_flip_180_by_ocr,
+    parse_orientation_mode,
+)
 from ..structure.grid_fusion import fuse_tsr_with_lines
 from ..structure.lines import (
     DetectedTable,
@@ -1014,6 +1024,7 @@ def extract_table_output(
 
     # 误转 90°/270° 时 HTML 会大量空行 + 异常 rowspan；用 0° 重试一次（不递归）。
     # 若当前已是 0° 仍破碎，再试 90°（横置图被当成直立）。
+    # 采纳重试须结构健康分明显更高，避免「误报 broken 的好表」被侧躺碎表替换（P26X199）。
     parsed_orient = parse_orientation_mode(orientation)
     can_retry_upright = (
         parsed_orient in {90, 270}
@@ -1028,7 +1039,16 @@ def extract_table_output(
         if can_retry_upright:
             retry_angles.append(0)
         if can_retry_sideways:
-            retry_angles.extend([90, 270])
+            # OCR 已直立时强行试 90/270 极易把正常竖表拧成配方倾倒宽表
+            if looks_sideways(text_boxes):
+                retry_angles.extend([90, 270])
+            else:
+                logger.info(
+                    "跳过 90/270 定向重试：当前 OCR 框已直立 (orient=%s)",
+                    orient_angle,
+                )
+        best = result
+        best_score = html_structure_health(html)
         for retry_angle in retry_angles:
             logger.warning(
                 "输出疑似侧躺损坏(orient=%s)，改用 orientation=%s 重试",
@@ -1059,8 +1079,23 @@ def extract_table_output(
                 vis_dir=vis_dir,
                 _allow_orient_retry=False,
             )
-            if not html_output_looks_broken(retry.get("html") or ""):
-                return retry
+            retry_html = retry.get("html") or ""
+            retry_score = html_structure_health(retry_html)
+            logger.info(
+                "定向重试比对: angle=%s score=%.1f → %.1f broken=%s",
+                retry_angle,
+                best_score,
+                retry_score,
+                html_output_looks_broken(retry_html),
+            )
+            # 明显更健康才采纳；单纯「不 broken」不够（漏报侧躺时会误换）
+            if retry_score > best_score + 3.0:
+                best = retry
+                best_score = retry_score
+                if not html_output_looks_broken(retry_html):
+                    return best
+        if best is not result and best_score > html_structure_health(html) + 3.0:
+            return best
         logger.warning("定向重试仍异常，保留原结果")
 
     return result

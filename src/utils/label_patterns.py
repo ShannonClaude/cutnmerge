@@ -98,6 +98,161 @@ def is_index_column(
     return (n_idx / len(nonempty)) >= min_ratio
 
 
+# 实施例/比较例 等行标签 + 右侧纯序号列（组合物表常见双列）
+_EXAMPLE_ROW_HEAD = (
+    r"(?:实[施試]例|実[施試]例|比較例|比较例|合成例|对照例|参考例)"
+)
+_CLEAN_EXAMPLE_LABEL_RE = re.compile(
+    rf"^(?P<head>{_EXAMPLE_ROW_HEAD})\s*(?P<num>\d{{1,3}})\s*$"
+)
+# 「实施例 32 32」：标签内尾号与自身序号重复
+_DUP_EXAMPLE_INDEX_RE = re.compile(
+    rf"^(?P<head>{_EXAMPLE_ROW_HEAD})\s*(?P<num>\d{{1,3}})(?:\s+|\n+)(?P=num)\s*$"
+)
+# 「实施例 2 3」/「实施例 3 2」：序号被空格拆碎
+_FRAG_EXAMPLE_INDEX_RE = re.compile(
+    rf"^(?P<head>{_EXAMPLE_ROW_HEAD})\s+"
+    rf"(?P<digits>(?:\d{{1,3}}(?:\s+|\n+))+\d{{1,3}})\s*$"
+)
+
+
+def parse_clean_example_label(text: str) -> Optional[Tuple[str, str]]:
+    """「实施例 33」→ (head, num)；否则 None。"""
+    m = _CLEAN_EXAMPLE_LABEL_RE.fullmatch((text or "").strip())
+    if not m:
+        return None
+    return m.group("head"), m.group("num")
+
+
+def best_digit_split_for_example_label(
+    head: str,
+    digits: str,
+    *,
+    local_frac: Optional[float] = None,
+) -> Optional[int]:
+    """
+    在数字串上选切开点：左侧构成独立行标，右侧优先 2–3 位组合物编号。
+
+    例：比较例 + 186 → split_at=1（1|86）；比较例 + 489 → 4|89。
+    """
+    if len(digits) < 2:
+        return None
+    ideal: Optional[int] = None
+    if local_frac is not None:
+        n = len(digits)
+        idx = int(round(max(0.0, min(1.0, local_frac)) * n))
+        ideal = max(1, min(n - 1, idx))
+    scored: List[Tuple[int, int]] = []
+    for split_at in range(1, len(digits)):
+        left_d = digits[:split_at]
+        right_d = digits[split_at:]
+        label = f"{head}{left_d}"
+        if not is_independent_row_label(label):
+            continue
+        score = 0
+        if len(right_d) in (2, 3):
+            score += 10
+        elif len(right_d) == 1:
+            score -= 2
+        if len(left_d) <= 2:
+            score += 3
+        if right_d.startswith("0") and len(right_d) > 1:
+            score -= 6
+        if ideal is not None:
+            score -= abs(split_at - ideal)
+        scored.append((score, split_at))
+    if not scored:
+        return None
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return scored[0][1]
+
+
+def split_example_local_and_composition_id(
+    text: str,
+) -> Optional[Tuple[str, str]]:
+    """
+    从粘连行标中剥离「局部序号 | 组合物编号」。
+
+    - 「比较例186」「比较例489」→ (「比较例 1」,「86」) / (「比较例 4」,「89」)
+    - 「比较例 3 88」「比较例 1 86」→ (「比较例 3」,「88」) / (「比较例 1」,「86」)
+    - 已干净的「比较例 1」「比较例 86」→ None（避免误剥）
+    """
+    lab = (text or "").strip()
+    if not lab:
+        return None
+
+    spaced = re.fullmatch(
+        rf"^(?P<head>{_EXAMPLE_ROW_HEAD})\s+"
+        rf"(?P<local>\d{{1,3}})\s+(?P<comp>\d{{2,3}})\s*$",
+        lab,
+    )
+    if spaced:
+        head = spaced.group("head")
+        local, comp = spaced.group("local"), spaced.group("comp")
+        if not is_independent_row_label(f"{head}{local}"):
+            return None
+        return f"{head} {local}", comp
+
+    clean = _CLEAN_EXAMPLE_LABEL_RE.fullmatch(lab)
+    if not clean:
+        return None
+    head, num = clean.group("head"), clean.group("num")
+    # 少于 3 位：比较例1 / 比较例86 —— 无法可靠区分「局部+组合物」
+    if len(num) < 3:
+        return None
+    split_at = best_digit_split_for_example_label(head, num)
+    if split_at is None:
+        return None
+    local, comp = num[:split_at], num[split_at:]
+    if len(comp) not in (2, 3) or len(local) > 2:
+        return None
+    if not is_independent_row_label(f"{head}{local}"):
+        return None
+    return f"{head} {local}", comp
+
+
+def repair_glued_example_label_index(
+    label: str,
+    index: str,
+) -> Optional[Tuple[str, str]]:
+    """
+    纠正标签列与相邻序号列的串位（需列级多数干净对作门控后再调用）。
+
+    - 「实施例 32 32」+ 空 → 「实施例 32」|「32」
+    - 「实施例 32 32」+「32」→ 去掉标签尾部重复
+    - 「实施例 2 3」+「23」/「实施例 3 2」+「32」→ 标签数字拼回与序号列一致
+
+    组合物号粘连（比较例186|Bk-1）由 split_example_local_and_composition_id
+    + html_formatter Path B 处理，不在此函数。
+    """
+    lab = (label or "").strip()
+    idx = (index or "").strip()
+    if not lab:
+        return None
+
+    dup = _DUP_EXAMPLE_INDEX_RE.fullmatch(lab)
+    if dup:
+        head, num = dup.group("head"), dup.group("num")
+        fixed_lab = f"{head} {num}"
+        if not idx:
+            return fixed_lab, num
+        if idx == num:
+            return fixed_lab, idx
+        return None
+
+    if not is_row_index_text(idx):
+        return None
+    frag = _FRAG_EXAMPLE_INDEX_RE.fullmatch(lab)
+    if not frag:
+        return None
+    digits = re.findall(r"\d{1,3}", frag.group("digits"))
+    if len(digits) < 2:
+        return None
+    if "".join(digits) != idx:
+        return None
+    return f"{frag.group('head')} {idx}", idx
+
+
 def split_value_grade(text: str) -> Optional[Tuple[str, str]]:
     """
     将「40A」「40 A」「100A+」拆成 (数值, 等级)。
