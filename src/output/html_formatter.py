@@ -206,6 +206,57 @@ def _place_cell_rect(
             occupancy[(r, c)] = nc
 
 
+def _monomer_subheader_merge_forbidden(a: str, b: str) -> bool:
+    """「单体[…]」父格与中段子表头不得互相拼字（P97）。"""
+    mon = re.compile(r"单体\s*[\[［]")
+    sub = re.compile(
+        r"(二羧酸|双氨基|封端剂|三官能|四官能|四羧酸|二胺及其|二羟基|二甲酰|有机硅烷)"
+    )
+    return bool((mon.search(a) and sub.search(b)) or (mon.search(b) and sub.search(a)))
+
+
+def _clip_monomer_parent_row_overlap(
+    cell: Dict[str, Any],
+    unique_owners: List[Dict[str, Any]],
+    occupancy: Dict[Tuple[int, int], Dict[str, Any]],
+    out: List[Dict[str, Any]],
+) -> bool:
+    """单体父格 rowspan 盖住子表头行时：裁父格到单行，让子头独立占位。"""
+    mon = re.compile(r"单体\s*[\[［]")
+    sub = re.compile(
+        r"(二羧酸|双氨基|封端剂|三官能|四官能|四羧酸|二胺及其|二羟基|二甲酰|有机硅烷)"
+    )
+    ct = str(cell.get("text") or "")
+    # incoming 是子表头、owner 是跨行单体父
+    for o in unique_owners:
+        ot = str(o.get("text") or "")
+        if sub.search(ct) and mon.search(ot) and int(o["row_end"]) > int(o["row_start"]):
+            ors, ore = int(o["row_start"]), int(o["row_end"])
+            ocs, oce = int(o["col_start"]), int(o["col_end"])
+            for r in range(ors + 1, ore + 1):
+                for c in range(ocs, oce + 1):
+                    if occupancy.get((r, c)) is o:
+                        del occupancy[(r, c)]
+            o["row_end"] = ors
+            o["row_span"] = 1
+            # 再试放置 incoming
+            rs, re_ = int(cell["row_start"]), int(cell["row_end"])
+            cs, ce = int(cell["col_start"]), int(cell["col_end"])
+            if all(occupancy.get((r, c)) is None for r in range(rs, re_ + 1) for c in range(cs, ce + 1)):
+                _place_cell_rect(cell, occupancy, out)
+                return True
+        # incoming 是单体父、owner 已是子表头：裁 incoming 到单行
+        if mon.search(ct) and sub.search(ot) and int(cell["row_end"]) > int(cell["row_start"]):
+            cell["row_end"] = int(cell["row_start"])
+            cell["row_span"] = 1
+            rs, re_ = int(cell["row_start"]), int(cell["row_end"])
+            cs, ce = int(cell["col_start"]), int(cell["col_end"])
+            if all(occupancy.get((r, c)) is None for r in range(rs, re_ + 1) for c in range(cs, ce + 1)):
+                _place_cell_rect(cell, occupancy, out)
+                return True
+    return False
+
+
 def _clip_row_header_logic_overlap(
     cell: Dict[str, Any],
     unique_owners: List[Dict[str, Any]],
@@ -356,6 +407,9 @@ def _resolve_logic_overlaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         )
         if placed:
             continue
+        # P97：单体父 rowspan 盖中段子表头 → 裁父行，禁止拼字
+        if _clip_monomer_parent_row_overlap(cell, unique_owners, occupancy, out):
+            continue
         rs, re = int(cell["row_start"]), int(cell["row_end"])
         cs, ce = int(cell["col_start"]), int(cell["col_end"])
         conflict_owners = []
@@ -388,6 +442,12 @@ def _resolve_logic_overlaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 continue
             owner = conflict_owners[0]
             prev = str(owner.get("text") or "").strip()
+            if _monomer_subheader_merge_forbidden(prev, text):
+                # 仍冲突：保留双方文本，尝试 L 形剩余，绝不拼进单体父格
+                _try_place_rect_remainder(
+                    cell, free_positions, occupancy, out, clear_text=False
+                )
+                continue
             if text and text not in prev:
                 owner["text"] = (prev + " " + text).strip() if prev else text
                 logger.warning(

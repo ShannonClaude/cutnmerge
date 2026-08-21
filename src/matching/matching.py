@@ -2367,9 +2367,14 @@ def _cell_texts_on_col(cells: List[Dict[str, Any]], col: int) -> List[str]:
 
 
 def _skip_eval_symbol_fill(cells: List[Dict[str, Any]], cell: Dict[str, Any]) -> bool:
-    """数值/分辨率行或「无法评价」+数字混排列上不填 ○/◎/△。"""
+    """数值/分辨率行或「无法评价」+数字混排列上不填 ○/◎/△。
+
+    表头左上角斜线框（P97）易被误检为 ×，跳过。
+    """
     row = int(cell.get("row_start") or 0)
     col = int(cell.get("col_start") or 0)
+    if row <= 1 and col <= 1:
+        return True
     row_texts = _cell_texts_on_row(cells, row)
     if any("无法评价" in t for t in row_texts):
         return True

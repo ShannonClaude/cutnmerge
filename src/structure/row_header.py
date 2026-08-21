@@ -783,12 +783,43 @@ def peel_row_header_text(
 # _CATEGORY_LABELS / _SUBROW_LABELS 定义见文件顶部
 
 
+_MONOMER_BAND_RE = re.compile(r"单体\s*[\[［]")
+_MONOMER_MID_HEADER_RE = re.compile(r"(四羧酸|二胺|二羧酸|双氨基酚|衍生物)")
+
+
+def _category_label_under_monomer_band(cells: Sequence[Dict[str, Any]], cell: Dict[str, Any]) -> bool:
+    """封端剂落在「单体[…]」列带内（或与四羧酸/二胺等同子表头行）→ 勿当左侧行头挪走。"""
+    cs = int(cell["col_start"])
+    ce = int(cell["col_end"])
+    rs = int(cell["row_start"])
+    for p in cells:
+        if p is cell:
+            continue
+        t = str(p.get("text") or "")
+        if not _MONOMER_BAND_RE.search(t):
+            continue
+        pcs, pce = int(p["col_start"]), int(p["col_end"])
+        if cs <= pce and ce >= pcs:
+            return True
+    # 同行已有单体中段子表头 → 也视为列中表头
+    for sib in cells:
+        if sib is cell:
+            continue
+        if int(sib["row_start"]) != rs:
+            continue
+        if _MONOMER_MID_HEADER_RE.search(str(sib.get("text") or "")):
+            return True
+    return False
+
+
 def relocate_misplaced_category_labels(
     cells: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
     把误入数据列的行头类别标签（如 OCR 截断的「封剂」）移回空 rowspan 父格，
     并规范为「封端剂」。
+
+    P96 类：封端剂本是「单体」下中段子表头，不得迁到左上角空 rowspan。
     """
     if len(cells) < 2:
         return cells
@@ -801,6 +832,11 @@ def relocate_misplaced_category_labels(
             continue
         cs = int(c["col_start"])
         if cs <= 2:
+            if compact == "封剂":
+                c["text"] = "封端剂"
+            continue
+        # 单体列带内的封端剂是列中表头，不是左侧行头
+        if _category_label_under_monomer_band(cells, c):
             if compact == "封剂":
                 c["text"] = "封端剂"
             continue

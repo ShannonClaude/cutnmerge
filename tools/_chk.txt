@@ -1,0 +1,17 @@
+head=94 fix=94 wip=94
+diff_head_vs_fix=10
+  DIFF P96X874
+  DIFF P97X876
+  DIFF P98X878
+  DIFF 物、固化膜以及有机EL显示器及其制造方法_[IMG_P109X1086].png
+  DIFF 合物、固化膜以及有机EL显示器及其制造方法_[IMG_P92X1066].png
+  DIFF 合物、固化膜以及有机EL显示器及其制造方法_[IMG_P93X1068].png
+  DIFF 合物、固化膜以及有机EL显示器及其制造方法_[IMG_P94X1070].png
+  DIFF 膜、具备固化膜的元件及显示装置以及其制造方法_[IMG_P45X431].png
+  DIFF 膜、具备固化膜的元件及显示装置以及其制造方法_[IMG_P46X433].png
+  DIFF 膜、具备固化膜的元件及显示装置以及其制造方法_[IMG_P47X435].png
+P98 has 合成例 14: True
+P98 has 810: True
+P98 has 470: True
+P98 has 430: True
+P98 has 740: True

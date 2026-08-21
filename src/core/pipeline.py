@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -57,6 +58,9 @@ from ..structure.tsr_refine import (
     refine_tsr_cells,
     refine_tsr_cells_light,
     repair_monomer_parent_spans,
+    lift_misplaced_header_labels,
+    promote_side_header_rowspans,
+    needs_monomer_header_reconstruct,
     structure_quality_score,
 )
 
@@ -98,6 +102,63 @@ def _is_degenerate_grid(
 _LINES_CONF_THRESH = 0.35
 # 轻量路径逻辑格重叠比例过高时，自动升级到 aggressive + 线融合
 _LIGHT_ESCALATE_CONFLICT_RATIO = 0.02
+
+
+def _light_has_monomer_subheaders(cells: List[Dict[str, Any]]) -> bool:
+    """轻量结果已有「单体」父格 + 下一行列向子表头 → 勿为微小冲突升级毁掉表头。"""
+    if not cells:
+        return False
+    monomer_re = re.compile(r"单体\s*[\[［]")
+    for parent in cells:
+        if not monomer_re.search(str(parent.get("text") or "")):
+            # 归属前无字：用宽格 + 下一行列数判断
+            span = int(parent.get("col_span") or 1)
+            if span < 3:
+                continue
+        else:
+            span = int(parent.get("col_span") or 1)
+            if span < 2:
+                continue
+        pcs, pce = int(parent["col_start"]), int(parent["col_end"])
+        pre = int(parent["row_end"])
+        kids = [
+            c
+            for c in cells
+            if int(c["row_start"]) == pre + 1
+            and int(c["col_end"]) >= pcs
+            and int(c["col_start"]) <= pce
+            and int(c.get("col_span") or 1) >= 1
+        ]
+        # 子表头行应切成 ≥2 格，且覆盖父带大半列
+        if len(kids) < 2:
+            continue
+        covered = set()
+        for k in kids:
+            for col in range(int(k["col_start"]), int(k["col_end"]) + 1):
+                if pcs <= col <= pce:
+                    covered.add(col)
+        if len(covered) >= max(2, int(0.5 * (pce - pcs + 1) + 0.5)):
+            return True
+    # 无字宽格：仅靠拓扑（P97 归属前）
+    for parent in cells:
+        span = int(
+            parent.get("col_span")
+            or (int(parent["col_end"]) - int(parent["col_start"]) + 1)
+        )
+        if span < 3:
+            continue
+        pcs, pce = int(parent["col_start"]), int(parent["col_end"])
+        pre = int(parent["row_end"])
+        kids = [
+            c
+            for c in cells
+            if int(c["row_start"]) == pre + 1
+            and int(c["col_end"]) >= pcs
+            and int(c["col_start"]) <= pce
+        ]
+        if len(kids) >= 2:
+            return True
+    return False
 
 
 def _imread_unicode(path: str) -> np.ndarray:
@@ -417,7 +478,11 @@ def _extract_via_tsr(
             light_cells = dedupe_overlapping_cells(light_cells)
             light_cells = repair_monomer_parent_spans(light_cells, text_boxes)
             conflict_ratio = logic_conflict_ratio(light_cells)
-            if conflict_ratio > _LIGHT_ESCALATE_CONFLICT_RATIO:
+            keep_light_headers = _light_has_monomer_subheaders(light_cells)
+            if (
+                conflict_ratio > _LIGHT_ESCALATE_CONFLICT_RATIO
+                and not keep_light_headers
+            ):
                 logger.info(
                     "TSR-light 逻辑格重叠比例过高(%.3f)，自动升级 aggressive 融合",
                     conflict_ratio,
@@ -445,9 +510,16 @@ def _extract_via_tsr(
                     cells = light_cells
             else:
                 cells = light_cells
-                logger.info(
-                    "TSR-first 轻量路径：跳过激进 refine / 线融合；已尝试单体父格对齐"
-                )
+                if keep_light_headers and conflict_ratio > _LIGHT_ESCALATE_CONFLICT_RATIO:
+                    logger.info(
+                        "TSR-first 轻量路径：保留单体子表头拓扑"
+                        "（conflict=%.3f，跳过升级）",
+                        conflict_ratio,
+                    )
+                else:
+                    logger.info(
+                        "TSR-first 轻量路径：跳过激进 refine / 线融合；已尝试单体父格对齐"
+                    )
 
     cov = coverage_score(cells, text_boxes) if cells else 0.0
     # 覆盖率偏低或格子过少时回退（竖排表头等场景常出现「有格但几乎填不进」）
@@ -602,6 +674,17 @@ def _extract_via_tsr(
     cells = clip_row_header_child_overlaps(cells)
     cells = clip_narrow_label_colspans(cells)
 
+    # 轻量/轻量升级路径：归属前拆「单体」父子表头（激进路径已在上文重建）
+    if (not tsr_aggressive) and needs_monomer_header_reconstruct(cells, text_boxes):
+        before_n = len(cells)
+        cells = reconstruct_header_cells(cells, text_boxes)
+        logger.info(
+            "轻量路径表头重建(归属前%s): cells %d→%d",
+            "+escalated" if escalated_from_light else "",
+            before_n,
+            len(cells),
+        )
+
     cells, free_texts = assign_texts_to_cells(
         cells,
         text_boxes,
@@ -623,6 +706,9 @@ def _extract_via_tsr(
         free_texts.extend(caption_texts)
     # 表题剥离后再压行，避免 [表1-2] 落在子表头行触发分段
     cells = normalize_oversegmented_table_rows(cells)
+    # 压行之后再上提误落表头 / 侧栏 rowspan，避免 normalize 把表头拽回合成例行
+    cells = lift_misplaced_header_labels(cells)
+    cells = promote_side_header_rowspans(cells)
     cells = recover_empty_vertical_headers(
         image,
         cells,
