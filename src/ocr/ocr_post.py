@@ -221,6 +221,85 @@ def _has_horizontal_ink_band(
     )
 
 
+def _has_vertical_ink_band(
+    binary: np.ndarray,
+    tb: Dict[str, Any],
+) -> bool:
+    """框内墨迹是否像居中竖带（数字 1 / 竖笔特征）。"""
+    roi = _tb_roi(binary, tb)
+    if roi.size == 0:
+        return False
+    fg = (roi > 0).astype(np.uint8)
+    if fg.size == 0 or int(fg.sum()) == 0:
+        return False
+    rows = fg.sum(axis=1).astype(np.float64)
+    cols = fg.sum(axis=0).astype(np.float64)
+    col_thresh = max(1.0, 0.18 * fg.shape[0])
+    hot_cols = np.flatnonzero(cols >= col_thresh)
+    if hot_cols.size == 0:
+        return False
+    band_left = int(hot_cols[0])
+    band_right = int(hot_cols[-1])
+    band_w = band_right - band_left + 1
+    band_center = (band_left + band_right) / 2.0
+    roi_center = (fg.shape[1] - 1) / 2.0
+    row_thresh = max(1.0, 0.10 * fg.shape[1])
+    hot_rows = np.flatnonzero(rows >= row_thresh)
+    if hot_rows.size == 0:
+        return False
+    span_h = int(hot_rows[-1] - hot_rows[0] + 1)
+    return (
+        band_w <= max(1, int(round(fg.shape[1] * 0.35)))
+        and abs(band_center - roi_center) <= max(1.5, 0.22 * fg.shape[1])
+        and span_h >= max(6, int(round(fg.shape[0] * 0.45)))
+    )
+
+
+def roi_looks_like_short_dash(roi: np.ndarray) -> bool:
+    """
+    单元格内 ROI 是否像短缺测横线（非通栏框线）。
+
+    要求：居中细横带，且水平跨度明显短于单元格宽，避免把格线当 '-'。
+    """
+    if roi is None or roi.size == 0:
+        return False
+    h, w = int(roi.shape[0]), int(roi.shape[1])
+    if h < 6 or w < 8:
+        return False
+    # 内缩避开四边框线
+    iy = max(2, h // 6)
+    ix = max(2, w // 6)
+    if h - 2 * iy < 4 or w - 2 * ix < 6:
+        return False
+    inner = roi[iy : h - iy, ix : w - ix]
+    fg = (inner > 0).astype(np.uint8)
+    if int(fg.sum()) < 4:
+        return False
+    rows = fg.sum(axis=1).astype(np.float64)
+    cols = fg.sum(axis=0).astype(np.float64)
+    row_thresh = max(1.0, 0.12 * fg.shape[1])
+    hot_rows = np.flatnonzero(rows >= row_thresh)
+    if hot_rows.size == 0:
+        return False
+    band_h = int(hot_rows[-1] - hot_rows[0] + 1)
+    band_center = (float(hot_rows[0]) + float(hot_rows[-1])) / 2.0
+    roi_center = (fg.shape[0] - 1) / 2.0
+    # 空单元格 ROI 往往远高于笔画厚度，列阈值按 band 高度而非整格高
+    col_thresh = max(1.0, 0.35 * max(band_h, 1))
+    hot_cols = np.flatnonzero(cols >= col_thresh)
+    if hot_cols.size == 0:
+        return False
+    span_w = int(hot_cols[-1] - hot_cols[0] + 1)
+    # 短横线：相对内框宽度不超过约 60%；通栏格线会被拒
+    max_span = max(8, int(round(fg.shape[1] * 0.60)))
+    min_span = max(5, int(round(fg.shape[1] * 0.08)))
+    return (
+        band_h <= max(2, int(round(fg.shape[0] * 0.40)))
+        and abs(band_center - roi_center) <= max(2.0, 0.28 * fg.shape[0])
+        and min_span <= span_w <= max_span
+    )
+
+
 def _maybe_tiny_one_to_dash(
     tb: Dict[str, Any],
     text: str,
@@ -229,10 +308,10 @@ def _maybe_tiny_one_to_dash(
     binary: Optional[np.ndarray] = None,
 ) -> str:
     """
-    「—」被 OCR 成极小偏扁的 1/|/l 时改回 '-'。
+    「—」被 OCR 成 1/|/l 时改回 '-'。
 
-    极小框（短边<10）仅靠尺寸；稍大时再要求横带墨迹。
-    低置信 + 宽扁框也按横带墨迹兜底。
+    优先信墨迹：框内居中横带 → '-'（覆盖高置信误识，如 P93 酸当量）。
+    其次：极小扁框 / 低置信扁框兜底。
     """
     t = (text or "").strip()
     if t not in {"1", "l", "I", "|", "丨"}:
@@ -243,16 +322,55 @@ def _maybe_tiny_one_to_dash(
     if h <= 0:
         return text
     score = float(tb.get("score") if tb.get("score") is not None else 1.0)
-    # 原有路径：极小框
-    if h <= 0.35 * median_box_h and w / h >= 1.10:
+    aspect = w / h
+    # 墨迹优先：横带明确时，短框或略扁框都收成 '-'（避免被高 score 挡住）
+    if binary is not None and _has_horizontal_ink_band(binary, tb):
+        if h <= 0.70 * median_box_h or aspect >= 1.05:
+            return "-"
+    # 原有路径：极小框（阈值略放宽到 0.50×中位高）
+    if h <= 0.50 * median_box_h and aspect >= 1.10:
         if max(w, h) >= 10.0 and binary is not None:
             if not _has_horizontal_ink_band(binary, tb):
                 return text
         return "-"
     # 补充路径：低置信且宽扁，按墨迹判定
-    if score < 0.70 and w / h >= 1.10 and binary is not None:
+    if score < 0.70 and aspect >= 1.10 and binary is not None:
         if _has_horizontal_ink_band(binary, tb):
             return "-"
+    return text
+
+
+def _maybe_dash_to_one(
+    tb: Dict[str, Any],
+    text: str,
+    *,
+    median_box_h: float,
+    binary: Optional[np.ndarray] = None,
+) -> str:
+    """
+    缺测横线 '-' / 「一」被 OCR 成破折号、但墨迹实为竖笔时改回 '1'。
+
+    仅在「有竖带且无横带」且偏瘦高时触发，避免误伤真破折号。
+    """
+    t = (text or "").strip()
+    if t not in {"-", "—", "–", "−", "ー", "―", "─", "－", "一", "~", "～"}:
+        return text
+    if binary is None or median_box_h <= 0:
+        return text
+    w, h = _tb_wh(tb)
+    if h <= 0 or w <= 0:
+        return text
+    aspect = w / h
+    # 真破折号通常扁；瘦高才可能是竖笔 1
+    if aspect > 0.95:
+        return text
+    # 超高框多为竖排多字碎片，不在此翻成单位数字
+    if h > 1.80 * median_box_h:
+        return text
+    if _has_horizontal_ink_band(binary, tb):
+        return text
+    if _has_vertical_ink_band(binary, tb):
+        return "1"
     return text
 
 
@@ -463,6 +581,9 @@ def postprocess_text_boxes(
         norm = normalize_ocr_text(raw)
         norm = _maybe_geometric_dash(tb, norm, binary=binary)
         norm = _maybe_tiny_one_to_dash(
+            tb, norm, median_box_h=median_box_h, binary=binary
+        )
+        norm = _maybe_dash_to_one(
             tb, norm, median_box_h=median_box_h, binary=binary
         )
         norm = _strip_leading_pipe_digits(norm)

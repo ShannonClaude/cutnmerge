@@ -2493,6 +2493,53 @@ def detect_eval_symbols_in_empty_cells(
     return cells
 
 
+def detect_dashes_in_empty_cells(
+    cells: List[Dict[str, Any]],
+    binary: Optional[np.ndarray],
+) -> List[Dict[str, Any]]:
+    """OCR 漏检的短缺测横线：空格内居中短横带 → '-'。
+
+    与列级 dash 一致性互补：混合数值列（如酸当量既有 330 又有 '-'）
+    无法靠列多数投票补空，只能靠墨迹。
+    """
+    if binary is None or binary.size == 0:
+        return cells
+    from ..ocr.ocr_post import roi_looks_like_short_dash
+
+    h_img, w_img = binary.shape[:2]
+    for cell in cells:
+        txt = (cell.get("text") or "").strip()
+        if txt:
+            continue
+        if int(cell.get("col_span", 1) or 1) != 1:
+            continue
+        if int(cell.get("row_span", 1) or 1) != 1:
+            continue
+        # 跳过表头角与明显表头行（与评价符号同策略）
+        row = int(cell.get("row_start") or 0)
+        col = int(cell.get("col_start") or 0)
+        if row <= 1 and col <= 1:
+            continue
+        poly = np.asarray(cell.get("polygon"), dtype=np.float64).reshape(-1, 2)
+        if poly.size < 4:
+            continue
+        x1 = int(max(0, np.floor(poly[:, 0].min())))
+        y1 = int(max(0, np.floor(poly[:, 1].min())))
+        x2 = int(min(w_img, np.ceil(poly[:, 0].max())))
+        y2 = int(min(h_img, np.ceil(poly[:, 1].max())))
+        if x2 - x1 < 10 or y2 - y1 < 8:
+            continue
+        roi = binary[y1:y2, x1:x2]
+        if roi_looks_like_short_dash(roi):
+            cell["text"] = "-"
+            logger.debug(
+                "空格 dash 墨迹补全: cell (%d,%d)",
+                cell.get("row_start", -1),
+                cell.get("col_start", -1),
+            )
+    return cells
+
+
 _EVAL_SYMBOL_CHARS = {"O", "o", "○", "×", "◎", "△"}
 
 

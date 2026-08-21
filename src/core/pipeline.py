@@ -22,6 +22,7 @@ from ..matching.matching import (
     cells_union_bbox,
     filter_absorbed_free_texts,
     _fix_dash_column_consistency,
+    detect_dashes_in_empty_cells,
     detect_eval_symbols_in_empty_cells,
     upgrade_o_to_double_circle,
 )
@@ -329,6 +330,7 @@ def _extract_via_lines(
             v_separators=table.v_separators,
         )
         cells = _fix_dash_column_consistency(cells, binary=binary)
+        cells = detect_dashes_in_empty_cells(cells, binary)
         cells = detect_eval_symbols_in_empty_cells(cells, binary)
         cells = upgrade_o_to_double_circle(cells, binary)
         cells = recover_empty_vertical_headers(
@@ -423,6 +425,7 @@ def _extract_via_lore(
         binary=lore_binary,
     )
     cells = _fix_dash_column_consistency(cells, binary=lore_binary)
+    cells = detect_dashes_in_empty_cells(cells, lore_binary)
     cells = detect_eval_symbols_in_empty_cells(cells, lore_binary)
     cells = upgrade_o_to_double_circle(cells, lore_binary)
     cells = recover_empty_vertical_headers(
@@ -710,6 +713,7 @@ def _extract_via_tsr(
     )
     cells = merge_stacked_chem_amount_cells(cells)
     cells = _fix_dash_column_consistency(cells, binary=binary)
+    cells = detect_dashes_in_empty_cells(cells, binary)
     cells = detect_eval_symbols_in_empty_cells(cells, binary)
     cells = upgrade_o_to_double_circle(cells, binary)
     cells = peel_row_header_text(cells, text_boxes)
