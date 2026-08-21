@@ -19,6 +19,8 @@ from .config import ROOT
 from .models import load_lore_model, load_ocr, predict_cells, predict_texts
 from ..matching.matching import (
     assign_texts_to_cells,
+    cells_union_bbox,
+    filter_absorbed_free_texts,
     _fix_dash_column_consistency,
     detect_eval_symbols_in_empty_cells,
     upgrade_o_to_double_circle,
@@ -60,6 +62,15 @@ from ..structure.tsr_refine import (
     repair_monomer_parent_spans,
     lift_misplaced_header_labels,
     promote_side_header_rowspans,
+    demote_ene_inside_monomer_band,
+    split_glued_side_headers,
+    refill_short_side_headers_from_ocr,
+    fill_empty_child_headers_from_ocr,
+    refill_truncated_monomer_child_headers_from_ocr,
+    absorb_empty_child_header_gaps,
+    sanitize_side_header_texts,
+    split_left_anchor_subheader_leak,
+    split_undersplit_monomer_child_headers,
     needs_monomer_header_reconstruct,
     structure_quality_score,
 )
@@ -402,12 +413,13 @@ def _extract_via_lore(
         )
         return outs, []
     lore_binary = binarize_otsu(image)
+    table_bb = cells_union_bbox(cells)
     cells, free_texts = assign_texts_to_cells(
         cells,
         text_boxes,
         ioa_threshold=ioa_threshold,
         split_cross_cell=True,
-        table_bboxes=None,
+        table_bboxes=[table_bb] if table_bb else None,
         binary=lore_binary,
     )
     cells = _fix_dash_column_consistency(cells, binary=lore_binary)
@@ -685,12 +697,13 @@ def _extract_via_tsr(
             len(cells),
         )
 
+    table_bb = cells_union_bbox(cells)
     cells, free_texts = assign_texts_to_cells(
         cells,
         text_boxes,
         ioa_threshold=ioa_threshold,
         split_cross_cell=split_cross,
-        table_bboxes=None,
+        table_bboxes=[table_bb] if table_bb else None,
         binary=binary,
         col_seps=col_seps,
         v_separators=v_separators,
@@ -708,7 +721,15 @@ def _extract_via_tsr(
     cells = normalize_oversegmented_table_rows(cells)
     # 压行之后再上提误落表头 / 侧栏 rowspan，避免 normalize 把表头拽回合成例行
     cells = lift_misplaced_header_labels(cells)
+    cells = demote_ene_inside_monomer_band(cells)
     cells = promote_side_header_rowspans(cells)
+    cells = split_glued_side_headers(cells)
+    cells = refill_short_side_headers_from_ocr(cells, text_boxes)
+    cells = fill_empty_child_headers_from_ocr(cells, text_boxes)
+    cells = refill_truncated_monomer_child_headers_from_ocr(cells, text_boxes)
+    cells = split_left_anchor_subheader_leak(cells)
+    cells = split_undersplit_monomer_child_headers(cells)
+    cells = sanitize_side_header_texts(cells)
     cells = recover_empty_vertical_headers(
         image,
         cells,
@@ -737,12 +758,13 @@ def _extract_via_tsr(
                 probe_lines = detect_tables(image, confidence_thresh=0.0, text_boxes=text_boxes)
                 fused = fuse_tsr_with_lines(agg_cells, probe_lines) if probe_lines else agg_cells
                 # 融合后结构无字，必须重新归属；否则会输出空壳表
+                fused_bb = cells_union_bbox(fused)
                 fused, _fused_free = assign_texts_to_cells(
                     fused,
                     text_boxes,
                     ioa_threshold=ioa_threshold,
                     split_cross_cell=split_cross,
-                    table_bboxes=None,
+                    table_bboxes=[fused_bb] if fused_bb else None,
                     binary=binary,
                     col_seps=col_seps,
                     v_separators=v_separators,
@@ -775,6 +797,11 @@ def _extract_via_tsr(
                 except Exception:
                     logger.warning("LORE 兜底失败，使用当前退化结果")
 
+    cells = split_glued_side_headers(cells)
+    cells = refill_short_side_headers_from_ocr(cells, text_boxes)
+    cells = refill_truncated_monomer_child_headers_from_ocr(cells, text_boxes)
+    cells = sanitize_side_header_texts(cells)
+    free_texts = filter_absorbed_free_texts(cells, free_texts)
     outs = _render_outputs(
         cells, free_texts, compress_empty_cols=compress_empty_cols
     )
@@ -982,43 +1009,55 @@ def extract_table_output(
     }
 
     # 误转 90°/270° 时 HTML 会大量空行 + 异常 rowspan；用 0° 重试一次（不递归）。
+    # 若当前已是 0° 仍破碎，再试 90°（横置图被当成直立）。
     parsed_orient = parse_orientation_mode(orientation)
     can_retry_upright = (
         parsed_orient in {90, 270}
         or (parsed_orient == "auto" and int(orient_angle) % 180 == 90)
     )
-    if can_retry_upright and _allow_orient_retry and html_output_looks_broken(html):
-        logger.warning(
-            "输出疑似侧躺损坏(orient=%s)，改用 orientation=0 重试",
-            orient_angle,
-        )
-        retry = extract_table_output(
-            image_path,
-            ioa_threshold=ioa_threshold,
-            deskew=deskew,
-            max_skew_angle=max_skew_angle,
-            lore_pipe=lore_pipe,
-            ocr_engine=ocr,
-            structure=structure,
-            use_cache=use_cache,
-            refresh_cache=refresh_cache,
-            compress_empty_cols=compress_empty_cols,
-            fallback_lines=fallback_lines,
-            orientation=0,
-            debug=debug,
-            debug_dir=debug_dir,
-            debug_stem=debug_stem,
-            reocr=reocr,
-            reocr_max_cells=reocr_max_cells,
-            tsr_kind=tsr_kind,
-            tsr_aggressive=tsr_aggressive,
-            save_vis=save_vis,
-            vis_dir=vis_dir,
-            _allow_orient_retry=False,
-        )
-        if not html_output_looks_broken(retry.get("html") or ""):
-            return retry
-        logger.warning("orientation=0 重试仍异常，保留原结果")
+    can_retry_sideways = (
+        parsed_orient in {0, "none"}
+        or (parsed_orient == "auto" and int(orient_angle) % 180 == 0)
+    )
+    if _allow_orient_retry and html_output_looks_broken(html):
+        retry_angles: list = []
+        if can_retry_upright:
+            retry_angles.append(0)
+        if can_retry_sideways:
+            retry_angles.extend([90, 270])
+        for retry_angle in retry_angles:
+            logger.warning(
+                "输出疑似侧躺损坏(orient=%s)，改用 orientation=%s 重试",
+                orient_angle,
+                retry_angle,
+            )
+            retry = extract_table_output(
+                image_path,
+                ioa_threshold=ioa_threshold,
+                deskew=deskew,
+                max_skew_angle=max_skew_angle,
+                lore_pipe=lore_pipe,
+                ocr_engine=ocr,
+                structure=structure,
+                use_cache=use_cache,
+                refresh_cache=refresh_cache,
+                compress_empty_cols=compress_empty_cols,
+                fallback_lines=fallback_lines,
+                orientation=retry_angle,
+                debug=debug,
+                debug_dir=debug_dir,
+                debug_stem=debug_stem,
+                reocr=reocr,
+                reocr_max_cells=reocr_max_cells,
+                tsr_kind=tsr_kind,
+                tsr_aggressive=tsr_aggressive,
+                save_vis=save_vis,
+                vis_dir=vis_dir,
+                _allow_orient_retry=False,
+            )
+            if not html_output_looks_broken(retry.get("html") or ""):
+                return retry
+        logger.warning("定向重试仍异常，保留原结果")
 
     return result
 

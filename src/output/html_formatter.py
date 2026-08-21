@@ -37,6 +37,15 @@ _EXAMPLE_COL_HEADER_RE = re.compile(
     r"(合成例|实施例|実施例|比較例|比较例|对照例|参考例)"
 )
 _MONOMER_PARENT_LABEL_RE = re.compile(r"单体\s*[\[［]")
+# 左锚「聚合物」孤列：表体侧常见树脂/溶液名（迁到左侧有字无头列）
+_LEFT_ANCHOR_HEADER_RE = re.compile(r"聚合物")
+_POLYMER_BODY_NAME_RE = re.compile(
+    r"(树脂|溶液|聚酰|聚硅|聚酰胺|聚苯|噁唑|酯|预聚|"
+    r"PI-|PBO-|PS-|AC-|CR-|AE-|Bk-)"
+)
+_BODY_INDEX_LABEL_RE = re.compile(
+    r"(合成例|实施例|実施例|比較例|比较例|对照例|参考例)"
+)
 
 
 def _cell_key(cell: Dict[str, Any]) -> Tuple[int, int, int, int]:
@@ -207,13 +216,29 @@ def _place_cell_rect(
 
 
 def _monomer_subheader_merge_forbidden(a: str, b: str) -> bool:
-    """「单体[…]」父格与中段子表头不得互相拼字（P97）。"""
+    """「单体[…]」父格与中段子表头不得互相拼字（P97）；共聚子头异类也不拼（P47）。"""
     mon = re.compile(r"单体\s*[\[［]")
     sub = re.compile(
         r"(二羧酸|双氨基|封端剂|三官能|四官能|四羧酸|二胺及其|二羟基|二甲酰|有机硅烷)"
     )
-    return bool((mon.search(a) and sub.search(b)) or (mon.search(b) and sub.search(a)))
-
+    if (mon.search(a) and sub.search(b)) or (mon.search(b) and sub.search(a)):
+        return True
+    # 酸性/芳香/脂环/烯键 互不拼
+    cats = []
+    for t in (a, b):
+        if re.search(r"烯键式|烯属", t):
+            cats.append("ene")
+        elif re.search(r"脂环式", t):
+            cats.append("alicyclic")
+        elif re.search(r"芳香族", t):
+            cats.append("aromatic")
+        elif re.search(r"酸性基团", t):
+            cats.append("acidic")
+        else:
+            cats.append("other")
+    if cats[0] != cats[1] and "other" not in cats:
+        return True
+    return False
 
 def _clip_monomer_parent_row_overlap(
     cell: Dict[str, Any],
@@ -1611,6 +1636,137 @@ def _split_merged_example_body_rows(cells: List[Dict[str, Any]]) -> List[Dict[st
     return work
 
 
+def _column_body_is_index_label(
+    cells: Sequence[Dict[str, Any]],
+    col: int,
+    header_end: int,
+) -> bool:
+    """表体该列是否主要是合成例/实施例索引。"""
+    for cell in cells:
+        if int(cell["row_start"]) <= header_end:
+            continue
+        if int(cell["col_start"]) != col or int(cell["col_end"]) != col:
+            continue
+        t = str(cell.get("text") or "").strip()
+        if t and _BODY_INDEX_LABEL_RE.search(t):
+            return True
+    return False
+
+
+def _column_body_looks_like_polymer_name(
+    cells: Sequence[Dict[str, Any]],
+    col: int,
+    header_end: int,
+) -> bool:
+    """表体该列是否像聚合物名（树脂溶液等），而非化学代号用量。"""
+    for cell in cells:
+        if int(cell["row_start"]) <= header_end:
+            continue
+        if int(cell["col_start"]) != col or int(cell["col_end"]) != col:
+            continue
+        t = re.sub(r"\s+", "", str(cell.get("text") or ""))
+        if not t or _is_cell_frag(t):
+            continue
+        if _BODY_INDEX_LABEL_RE.search(t):
+            continue
+        if _POLYMER_BODY_NAME_RE.search(t):
+            return True
+        # 含中文且非纯数值/代号行，也视为聚合物名候选
+        if re.search(r"[\u4e00-\u9fff]", t) and not _looks_like_data_value(t):
+            return True
+    return False
+
+
+def _align_orphan_left_anchor_headers(
+    cells: List[Dict[str, Any]],
+    *,
+    look_back: int = 2,
+) -> List[Dict[str, Any]]:
+    """
+    左锚表头「聚合物」落在无表体列、左侧近邻有聚合物名且无表头时，把表头迁到左侧。
+
+    与 `_migrate_orphan_header_to_body_column`（指标头迁右）对称：TSR 过分割时常把
+    「聚合物」偏右一列，而「丙烯酸树脂溶液」等落在其左的空头列，导致 HTML 中
+    树脂名不在聚合物正下方。
+    """
+    if not cells:
+        return cells
+    header_end = _effective_header_end(cells)
+    if header_end < 0:
+        return cells
+
+    # 候选：表头带内以「聚合物」为文案、单列、且该列无表体
+    anchors: List[Dict[str, Any]] = []
+    seen_cols: Set[int] = set()
+    for cell in cells:
+        if cell.get("_drop_render"):
+            continue
+        if int(cell["row_start"]) > header_end:
+            continue
+        t = re.sub(r"\s+", "", str(cell.get("text") or ""))
+        if not t or not _LEFT_ANCHOR_HEADER_RE.search(t):
+            continue
+        if _MONOMER_PARENT_LABEL_RE.search(t):
+            continue
+        cs, ce = int(cell["col_start"]), int(cell["col_end"])
+        if cs != ce:
+            continue
+        if cs in seen_cols:
+            continue
+        if _column_has_body_content(cells, cs, header_end):
+            continue
+        seen_cols.add(cs)
+        anchors.append(cell)
+
+    if not anchors:
+        return cells
+
+    changed = 0
+    for anchor in anchors:
+        cs = int(anchor["col_start"])
+        target: Optional[int] = None
+        for left in range(cs - 1, max(-1, cs - look_back - 1), -1):
+            if left < 0:
+                break
+            if _column_has_header_label(cells, left, header_end):
+                break
+            if not _column_has_body_content(cells, left, header_end):
+                continue
+            if _column_body_is_index_label(cells, left, header_end):
+                break
+            if not _column_body_looks_like_polymer_name(cells, left, header_end):
+                break
+            target = left
+            break
+        if target is None:
+            continue
+        moved = 0
+        for cell in cells:
+            if cell.get("_drop_render"):
+                continue
+            if int(cell["row_start"]) > header_end:
+                continue
+            if int(cell["col_start"]) != cs or int(cell["col_end"]) != cs:
+                continue
+            ct = re.sub(r"\s+", "", str(cell.get("text") or ""))
+            if ct and not _LEFT_ANCHOR_HEADER_RE.search(ct):
+                continue
+            cell["col_start"] = target
+            cell["col_end"] = target
+            cell["col_span"] = 1
+            moved += 1
+        if moved:
+            changed += 1
+            logger.info(
+                "左锚孤列表头对齐: 聚合物 col %d → %d",
+                cs,
+                target,
+            )
+    if changed:
+        logger.info("左锚孤列表头对齐: %d 处", changed)
+    return cells
+
+
 def _drop_body_empty_columns(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     删除表体（表头以下）所有原子格均为空/碎片的列。
@@ -2465,6 +2621,7 @@ def cells_to_html_table(
     work = _split_header_over_index_column(work)
     work = _collapse_header_empty_corners(work)
     work = drop_evidenceless_columns(work)
+    work = _align_orphan_left_anchor_headers(work)
     work = _drop_body_empty_columns(work)
     work = _merge_leading_empty_into_label(work)
     work = _merge_leading_label_gaps(work)
@@ -2640,7 +2797,7 @@ def html_output_looks_broken(html_text: str) -> bool:
     """
     检测侧躺/行列颠倒等灾难性 HTML（大量空行、异常 rowspan、实施例横排成表）。
 
-    用于在误转 90° 等场景下触发 0° 重试，避免污染正常表格输出。
+    用于在误转 90° 等场景下触发定向重试，避免污染正常表格输出。
     """
     if not html_text or "<table" not in html_text:
         return False
@@ -2652,12 +2809,21 @@ def html_output_looks_broken(html_text: str) -> bool:
     free_paras = re.findall(r"<p>([^<]{1,12})</p>", html_text)
     if len(free_paras) >= 8 and sum(1 for p in free_paras if re.fullmatch(r"[A-Za-z0-9+＋.]+|100|A\+?", p)) >= 6:
         return True
+    # 游离短中文垃圾段 + 表内缺少常见表头词（横置 OCR 乱码）
+    if len(free_paras) >= 5:
+        blob = re.sub(r"\s+", "", html_text)
+        if not re.search(r"(组合物|组成\[|聚合物|单体\s*[\[［]|实施例|合成例)", blob):
+            return True
     first_table = re.search(r"<table[^>]*>(.*?)</table>", html_text, re.DOTALL)
     if first_table:
         chunk = first_table.group(1)[:2500]
         ex_hits = len(re.findall(r"实[施試]例", chunk))
         # 首表几乎全是实施例横排、没有正常表头词
-        if ex_hits >= 8 and "组合物" not in chunk and "灵敏度" not in chunk:
+        # 「组成[」与「组合物」同等视为正常表头（竖排「组合物」偶发 OCR 缺失时不应误判侧躺）
+        has_normal_header = bool(
+            re.search(r"(组合物|组成\s*[\[［]|灵敏度|聚合物|单体)", chunk)
+        )
+        if ex_hits >= 8 and not has_normal_header:
             return True
         # 首行连续多个「实施例」单元格（侧躺列头），即使下文误入「组合物」也判坏
         first_tr = re.search(r"<tr>(.*?)</tr>", chunk, re.DOTALL)
@@ -2665,6 +2831,24 @@ def html_output_looks_broken(html_text: str) -> bool:
             row0 = first_tr.group(1)
             row0_ex = len(re.findall(r">[^<]*实[施試]例[^<]*<", row0))
             if row0_ex >= 6:
+                return True
+            # 首行多数为纯数字/空，且整表缺少表头词 → 横置碎表
+            tds = re.findall(r"<td[^>]*>([\s\S]*?)</td>", row0)
+            def _td_plain(s: str) -> str:
+                s = re.sub(r"<br\s*/?>", "", s)
+                return re.sub(r"\s+", "", s)
+
+            plains = [_td_plain(t) for t in tds]
+            num_or_empty = sum(
+                1
+                for p in plains
+                if not p or re.fullmatch(r"\d+(?:\.\d+)?", p)
+            )
+            if (
+                len(plains) >= 8
+                and num_or_empty >= max(6, int(len(plains) * 0.7))
+                and not re.search(r"(组合物|组成|聚合物|单体|实施例|合成例)", chunk)
+            ):
                 return True
         large_rowspan = len(re.findall(r'rowspan="(?:[6-9]|1[0-9]+)"', chunk))
         if large_rowspan >= 8 and empty_tr >= 2:

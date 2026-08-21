@@ -2225,9 +2225,13 @@ _MONOMER_RIGHT_ANCHOR_RE = re.compile(
     r"(含有比率|含有比例|含有率|氟比率|酸当量|双键当量|"
     r"来自具有|来源于具有|所占的比率|所占比率)"
 )
-# 烯键式列：P96 为外侧整列（封端剂右侧单列）；P98 为单体子列
+# 烯键式/烯属：子表头行且落在聚合物↔右硬锚之间 → 单体子列（不 promote）
 _ENE_HEADER_RE = re.compile(r"(烯键式|烯属不饱和|不饱和双键)")
 _CAP_AGENT_RE = re.compile(r"封端剂")
+# 子头类别（异类标签墙，避免彼此吞列）
+_CHILD_CAT_ACID_RE = re.compile(r"(四羧酸|二羧酸|酸酐)")
+_CHILD_CAT_AMINE_RE = re.compile(r"(二胺|双氨基|硅烷|羟基二胺)")
+_CHILD_CAT_COPOLY_RE = re.compile(r"(共聚成分|有机硅烷)")
 # 表体化学代号（含可选括号用量）：BFE / MeTMS / cyEpoTMS / NA(40)
 _CHEM_BODY_RE = re.compile(
     r"^[A-Za-z][A-Za-z0-9\-\+']{1,24}"
@@ -2236,47 +2240,66 @@ _CHEM_BODY_RE = re.compile(
 _PAREN_AMOUNT_RE = re.compile(r"^[\(（]\s*\d+(?:\.\d+)?\s*[\)）]$")
 
 
-def _clip_band_for_outside_ene(
-    band_lo: int,
-    band_hi: int,
-    children: List[Dict[str, Any]],
-    boxes: Sequence[Dict[str, Any]],
-) -> int:
-    """封端剂右侧仅一列烯键式、且紧贴硬右界 → P96 外侧，从单体带剔除。
+def _child_header_category(label: str) -> str:
+    """子表头粗分类，用于对齐时的异类硬墙。"""
+    t = label or ""
+    if _ENE_HEADER_RE.search(t):
+        return "ene"
+    if _CAP_AGENT_RE.search(t):
+        return "cap"
+    # 三/四/二官能硅烷互为异类（须先于泛「硅烷/有机硅烷」规则）
+    m_fn = re.search(r"([一二三四四五六七八九十\d]+)官能", t)
+    if m_fn and re.search(r"硅烷", t):
+        return f"silane_{m_fn.group(1)}"
+    if _CHILD_CAT_ACID_RE.search(t):
+        return "acid"
+    if _CHILD_CAT_AMINE_RE.search(t):
+        return "amine"
+    if _CHILD_CAT_COPOLY_RE.search(t):
+        return "copoly"
+    if re.search(r"[\u4e00-\u9fff]", t):
+        return "cjk"
+    return "other"
 
-    P98 表1 封端剂后有两列烯键式；表2/3 烯键式前不是封端剂 → 保留在带内。
-    """
-    if band_hi < band_lo or len(children) < 2:
-        return band_hi
-    labeled: List[Tuple[int, int, str]] = []
-    for c in children:
-        cs, ce = int(c["col_start"]), int(c["col_end"])
-        if ce < band_lo or cs > band_hi:
+
+_DASH_OR_BLANK_RE = re.compile(r"^[-—–−~～]+$")
+
+
+def _body_col_has_substance(
+    col: int,
+    bodies: Sequence[Dict[str, Any]],
+    boxes: Sequence[Dict[str, Any]],
+    col_seps: Sequence[float],
+) -> bool:
+    """表体列是否含化学代号/数值等实质内容（短横/空不算）。"""
+    texts: List[str] = []
+    for b in bodies:
+        if int(b["col_start"]) <= col <= int(b["col_end"]):
+            t = re.sub(r"\s+", "", str(b.get("text") or ""))
+            if t:
+                texts.append(t)
+    if col + 1 < len(col_seps) and bodies:
+        x1 = float(col_seps[col])
+        x2 = float(col_seps[col + 1])
+        y_lo = min(_cell_bbox(b)[1] for b in bodies)
+        y_hi = max(_cell_bbox(b)[3] for b in bodies)
+        for tb in boxes:
+            tx1, ty1, tx2, ty2 = _tb_bbox(tb)
+            mx, my = 0.5 * (tx1 + tx2), 0.5 * (ty1 + ty2)
+            if x1 <= mx <= x2 and y_lo <= my <= y_hi:
+                t = re.sub(r"\s+", "", str(tb.get("text") or ""))
+                if t:
+                    texts.append(t)
+    for t in texts:
+        if not t or _DASH_OR_BLANK_RE.fullmatch(t):
             continue
-        lab = _cell_label_text(c, boxes)
-        labeled.append((cs, ce, lab))
-    if not labeled:
-        return band_hi
-    labeled.sort(key=lambda t: t[0])
-    ene_runs = [
-        (cs, ce) for cs, ce, lab in labeled if _ENE_HEADER_RE.search(lab or "")
-    ]
-    if len(ene_runs) != 1:
-        return band_hi
-    ene_cs, ene_ce = ene_runs[0]
-    # 烯键式须贴在 band 右缘（其右即含有比率等）
-    if ene_ce != band_hi:
-        return band_hi
-    # 左侧紧邻须为封端剂
-    left = [t for t in labeled if t[1] < ene_cs]
-    if not left:
-        return band_hi
-    prev_cs, prev_ce, prev_lab = left[-1]
-    if prev_ce + 1 != ene_cs:
-        return band_hi
-    if not _CAP_AGENT_RE.search(prev_lab or ""):
-        return band_hi
-    return ene_cs - 1
+        if _CHEM_BODY_RE.fullmatch(t) or _PAREN_AMOUNT_RE.fullmatch(t):
+            return True
+        if re.fullmatch(r"\d+(?:\.\d+)?", t):
+            return True
+        if re.search(r"[A-Za-z]{2,}", t):
+            return True
+    return False
 
 
 def _cell_label_text(
@@ -2343,15 +2366,17 @@ def _align_monomer_children_to_body(
     *,
     band_lo: int,
     band_hi: int,
+    boxes: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> int:
     """按表体列把单体子表头对齐到连续列带。
 
-    优先把表体列分给「逻辑范围已覆盖该列」的子表头，避免表头 polygon
-    偏窄时（P96：二胺物理框只盖住 BAHF）把 SiDA 列错判给右侧封端剂。
-    只扩展、不收缩：空子列（四羧酸下空槽）不会被裁掉。
+    1) 下一子头 OCR/多边形左缘作硬墙（左对齐跨列头：SiDA 归二胺而非封端剂）；
+    2) 收尾：左子头右缘若拖着已越过其文案、且更靠近右邻的「仅短横/空」列，
+       则让给右邻（P93：三官能不得吞四官能前空列；P97：含 AcrTMS 的列保留）。
     """
     if len(children) < 1 or len(body_cells) < 2:
         return 0
+    boxes = list(boxes) if boxes else []
     bodies = sorted(
         [
             c
@@ -2365,40 +2390,103 @@ def _align_monomer_children_to_body(
     if len(bodies) < 2 or not kids:
         return 0
 
-    def _nearest_kid(col: int, bx: float) -> Dict[str, Any]:
-        # 已覆盖该逻辑列的子表头优先（解决 P96 二胺/封端剂边界）
-        covering = [
-            k
-            for k in kids
-            if int(k["col_start"]) <= col <= int(k["col_end"])
-        ]
-        if len(covering) == 1:
-            return covering[0]
-        if len(covering) > 1:
-            return min(covering, key=lambda k: abs(_cell_x_center(k) - bx))
-        return min(kids, key=lambda k: abs(_cell_x_center(k) - bx))
+    body_atom_cols = sorted(
+        {
+            col
+            for b in bodies
+            for col in range(int(b["col_start"]), int(b["col_end"]) + 1)
+            if band_lo <= col <= band_hi
+        }
+    )
+    if len(body_atom_cols) < 2:
+        return 0
 
-    # 每个表体原子列分给对应子表头
-    assignments: Dict[int, List[int]] = {id(k): [] for k in kids}
-    for b in bodies:
-        bx = _cell_x_center(b)
-        for col in range(int(b["col_start"]), int(b["col_end"]) + 1):
-            if col < band_lo or col > band_hi:
-                continue
-            nearest = _nearest_kid(col, bx)
-            assignments[id(nearest)].append(col)
+    def _col_x(col: int) -> float:
+        if col + 1 < len(col_seps):
+            return 0.5 * (float(col_seps[col]) + float(col_seps[col + 1]))
+        return float(col_seps[min(col, len(col_seps) - 1)])
+
+    def _kid_left_x(kid: Dict[str, Any]) -> float:
+        # 左对齐跨列头：左缘才是本列带起点；中心会偏到右邻类
+        tbs = _texts_in_cell(kid, boxes)
+        if tbs:
+            return min(float(_tb_bbox(tb)[0]) for tb in tbs)
+        return float(_cell_bbox(kid)[0])
+
+    def _kid_text_right(kid: Dict[str, Any]) -> float:
+        tbs = _texts_in_cell(kid, boxes)
+        if tbs:
+            return max(float(_tb_bbox(tb)[2]) for tb in tbs)
+        return float(_cell_bbox(kid)[2])
+
+    def _kid_label(kid: Dict[str, Any]) -> str:
+        t = _cell_label_text(kid, boxes)
+        if t.strip():
+            return t
+        tbs = _texts_in_cell(kid, boxes)
+        if tbs:
+            return "".join(str(tb.get("text") or "") for tb in tbs)
+        return t
+
+    kid_meta = [
+        (
+            k,
+            _kid_left_x(k),
+            _child_header_category(_kid_label(k)),
+        )
+        for k in kids
+    ]
+    ordered_meta = sorted(
+        kid_meta, key=lambda t: (int(t[0]["col_start"]), t[1])
+    )
+
+    # 下一子头左缘为墙：左子头吃到墙左侧最后一列
+    cuts: List[int] = []
+    for i in range(len(ordered_meta) - 1):
+        wall_x = float(ordered_meta[i + 1][1])
+        cut = band_lo - 1
+        for c in range(band_lo, band_hi + 1):
+            if _col_x(c) < wall_x:
+                cut = c
+        max_cut = band_hi - (len(ordered_meta) - 1 - i)
+        min_cut = band_lo + i
+        cut = max(min_cut, min(cut, max_cut))
+        cuts.append(cut)
+
+    spans: List[Tuple[Dict[str, Any], int, int]] = []
+    lo = band_lo
+    for i, (kid, _xc, _cat) in enumerate(ordered_meta):
+        if i < len(cuts):
+            hi = cuts[i]
+        else:
+            hi = band_hi
+        if hi < lo:
+            hi = lo
+        spans.append((kid, lo, hi))
+        lo = hi + 1
+
+    # 收尾：左子头不得拖着越过文案、更靠右邻的短横/空列（P93）
+    for i in range(len(spans) - 1):
+        left_kid, l_lo, l_hi = spans[i]
+        right_kid, r_lo, r_hi = spans[i + 1]
+        ltr = _kid_text_right(left_kid)
+        rtl = _kid_left_x(right_kid)
+        while l_hi > l_lo:
+            cx = _col_x(l_hi)
+            if cx <= ltr + 1.0:
+                break
+            if _body_col_has_substance(l_hi, bodies, boxes, col_seps):
+                break
+            if abs(cx - rtl) > abs(cx - ltr):
+                break
+            l_hi -= 1
+            r_lo = l_hi + 1
+        spans[i] = (left_kid, l_lo, l_hi)
+        spans[i + 1] = (right_kid, r_lo, r_hi)
 
     changed = 0
-    for kid in kids:
-        cols = sorted(set(assignments.get(id(kid)) or []))
-        if not cols:
-            continue
+    for kid, new_cs, new_ce in spans:
         old_cs, old_ce = int(kid["col_start"]), int(kid["col_end"])
-        # 只扩展：保留原子列空槽上的原 colspan
-        new_cs = max(min(old_cs, min(cols)), band_lo)
-        new_ce = min(max(old_ce, max(cols)), band_hi)
-        if new_ce < new_cs:
-            continue
         if (old_cs, old_ce) != (new_cs, new_ce):
             _set_cell_cols(kid, new_cs, new_ce, col_seps)
             changed += 1
@@ -2592,16 +2680,7 @@ def repair_monomer_parent_spans(
             elif len(header_kids) > len(children):
                 children = header_kids
 
-        # P96：封端剂右侧单列烯键式贴比率 → 剔出单体带；P98 两列烯键式或非封端剂后则保留
-        new_hi = _clip_band_for_outside_ene(band_lo, band_hi, children, boxes)
-        if new_hi < band_hi:
-            band_hi = new_hi
-            children = [c for c in children if _in_band(c)]
-            body_cells = [c for c in body_cells if _in_band(c)]
-            logger.info(
-                "repair_monomer_parent_spans: 外侧烯键式收带 → band_hi=%d",
-                band_hi,
-            )
+        # 烯键式若在子表头行且落在聚合物↔右硬锚之间，保留在带内（不再按封端剂门控剔出）
 
         # 父格列范围：子表头并集优先，否则表体并集；二者皆有时取并集更稳
         span_cells: List[Dict[str, Any]] = []
@@ -2649,7 +2728,24 @@ def repair_monomer_parent_spans(
                 col_seps,
                 band_lo=target_cs,
                 band_hi=target_ce,
+                boxes=boxes,
             )
+            # 清掉子表头行上空壳，避免对齐后 colspan 已被拉开、空格仍占位
+            for c in list(seg_cells):
+                if c is parent or id(c) in removed:
+                    continue
+                if int(c["row_start"]) != child_row:
+                    continue
+                if _cell_label_text(c, boxes).strip():
+                    continue
+                cs, ce = int(c["col_start"]), int(c["col_end"])
+                covered = any(
+                    int(k["col_start"]) <= ce and int(k["col_end"]) >= cs
+                    for k in children
+                )
+                if covered or (target_cs <= cs and ce <= target_ce):
+                    removed.add(id(c))
+                    changed += 1
 
         # 聚合物行起点若低于单体父格，上延 rowspan 盖住父行，避免左侧空角被并进「单体」
         for c in seg_cells:
@@ -2730,8 +2826,7 @@ _LIFTABLE_HEADER_RE = re.compile(
     r"具有.{2,40}(?:化合物|共聚成分|衍生物|不饱和羧酸|不饱和化合物))"
 )
 _SYNTHESIS_ROW_RE = re.compile(r"(合成例|实施例|実施例|比較例|比较例)")
-# 侧栏整列表头：应 rowspan 盖住父+子表头行
-# 注意：烯键式/烯属在表1-3 是「单体」子头，只有落在单体带右侧时才上延（见 promote）
+# 侧栏整列表头：仅比率/当量等强制上延；烯键式/烯属默认视为单体子头（见 promote）
 _SIDE_HEADER_RE = re.compile(
     r"(含有比率|含有率|烯键式|烯属不饱和|不饱和双键|氟比率|酸当量|双键当量|"
     r"来自具有|来源于具有)"
@@ -2901,13 +2996,16 @@ def _expand_monomer_over_child_headers(
         ]
         if not kids:
             continue
-        # 勿把 P96 外侧烯键式扩进单体
-        prov_hi = max(int(k["col_end"]) for k in kids)
-        clipped_hi = _clip_band_for_outside_ene(
-            int(parent["col_start"]), prov_hi, kids, []
-        )
-        if clipped_hi < prov_hi:
-            kids = [k for k in kids if int(k["col_end"]) <= clipped_hi]
+        # 勿把已是整列外侧的烯键式扩进单体（rowspan≥2 且已在父格右侧）
+        kids = [
+            k
+            for k in kids
+            if not (
+                _ENE_HEADER_RE.search(str(k.get("text") or ""))
+                and int(k["row_end"]) > int(k["row_start"])
+                and int(k["col_start"]) > int(parent["col_end"])
+            )
+        ]
         if not kids:
             continue
         new_ce = max(int(parent["col_end"]), max(int(k["col_end"]) for k in kids))
@@ -2923,9 +3021,10 @@ def promote_side_header_rowspans(
     cells: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
-    将侧栏整列表头（烯键式/含有比率/酸当量…）从仅占子表头行上延到父表头行。
+    将侧栏整列表头（含有比率/酸当量/来源于…）从仅占子表头行上延到父表头行。
 
-    P96：烯键式落在 r2、r1 同列空缺 → 与「聚合物」「含有比率」一样 rowspan=2。
+    烯键式/烯属：若仅占子表头行且落在单体带内（或将被单体覆盖），不上延；
+    仅对 `_SIDE_HEADER_FORCE_RE`（比率/当量/来源于）强制上延。
     """
     if not cells:
         return cells
@@ -2954,7 +3053,6 @@ def promote_side_header_rowspans(
                 continue
             if str(o.get("text") or "").strip():
                 return False
-            # 空壳占位可覆盖
         return True
 
     def _clear_empty_occupants(row: int, cs: int, ce: int, skip: Any) -> None:
@@ -2976,34 +3074,21 @@ def promote_side_header_rowspans(
     changed = 0
     for cell in work:
         t = _compact_cell_text(cell)
-        if not t or not _SIDE_HEADER_RE.search(t):
-            continue
+        if not t or not _SIDE_HEADER_FORCE_RE.search(t):
+            continue  # 烯键式等非强制侧栏：保持子表头行
         if _MONOMER_PARENT_RE.search(t) or _MONOMER_LEFT_ANCHOR_RE.search(t):
             continue
         rs, re_ = int(cell["row_start"]), int(cell["row_end"])
         if re_ > rs:
             continue  # 已跨行
         cs, ce = int(cell["col_start"]), int(cell["col_end"])
-        # 仅处理紧挨在某单体父行之下的子表头行
         target_parent = None
-        monomer_ce = None
         for pr in parent_rows:
             if rs == pr + 1:
                 target_parent = pr
                 break
         if target_parent is None:
             continue
-        # 单体父格右界：烯键式仅在其右侧才上延（P96）；带内子头（P98）不动
-        for c in work:
-            if int(c["row_start"]) > target_parent or int(c["row_end"]) < target_parent:
-                continue
-            if _MONOMER_PARENT_RE.search(str(c.get("text") or "")):
-                monomer_ce = int(c["col_end"])
-                break
-        if not _SIDE_HEADER_FORCE_RE.search(t):
-            # 烯键式/烯属等：必须在单体带右侧
-            if monomer_ce is None or cs <= monomer_ce:
-                continue
         if not _col_free(target_parent, cs, ce, skip=cell):
             continue
         _clear_empty_occupants(target_parent, cs, ce, skip=cell)
@@ -3017,6 +3102,1097 @@ def promote_side_header_rowspans(
             re_,
         )
 
+    if changed:
+        work = dedupe_overlapping_cells(work)
+    return work
+
+
+_RATIO_SIDE_RE = re.compile(
+    r"(来自具有|来源于具有|来源于|来自具有|含有比率|含有比例|含有率|所占的比率|所占比率)"
+)
+_EQUIV_SIDE_RE = re.compile(r"(?:全)?酸当量|双键当量")
+_SUBHEADER_LEAK_RE = re.compile(
+    r"(二羧酸|四羧酸|双氨基酚|封端剂|三官能|四官能|二官能|共聚成分|二甲酰|有机硅烷)"
+)
+_SHORT_SIDE_HEADER_RE = re.compile(
+    r"^(?:来源于具有|来自具有)(?:[\[［【]mo[l1]%\s*[\]］】]?)?.{0,10}$"
+)
+
+
+def demote_ene_inside_monomer_band(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """已跨父+子行的烯键式若落在右硬锚左侧，收回子表头行并扩单体父格覆盖之。"""
+    if not cells:
+        return cells
+    work = [dict(c) for c in cells]
+    row_seps, col_seps = _derive_seps(work)
+    if len(row_seps) < 3 or len(col_seps) < 3:
+        return work
+
+    parents = [
+        c
+        for c in work
+        if _MONOMER_PARENT_RE.search(str(c.get("text") or ""))
+    ]
+    if not parents:
+        return work
+
+    right_anchor_cols = []
+    for c in work:
+        t = _compact_cell_text(c)
+        if _MONOMER_RIGHT_ANCHOR_RE.search(t) and not _ENE_HEADER_RE.search(t):
+            right_anchor_cols.append(int(c["col_start"]))
+    min_right = min(right_anchor_cols) if right_anchor_cols else None
+
+    changed = 0
+    for parent in parents:
+        prs, pre = int(parent["row_start"]), int(parent["row_end"])
+        pcs, pce = int(parent["col_start"]), int(parent["col_end"])
+        child_row = pre + 1
+        for ene in work:
+            t = str(ene.get("text") or "")
+            if not _ENE_HEADER_RE.search(t):
+                continue
+            ers, ere = int(ene["row_start"]), int(ene["row_end"])
+            ecs, ece = int(ene["col_start"]), int(ene["col_end"])
+            # 仅处理已跨到父行、且紧挨单体右侧或已部分重叠的烯键式
+            if ere <= ers:
+                continue
+            if ers != prs:
+                continue
+            if min_right is not None and ecs >= min_right:
+                continue
+            if ece < pcs:
+                continue
+            # 收到子表头行
+            if ere >= child_row:
+                _set_cell_rows(ene, child_row, child_row, row_seps)
+            # 父格扩到覆盖烯键式
+            new_ce = max(pce, ece)
+            if new_ce > pce:
+                _set_cell_cols(parent, pcs, new_ce, col_seps)
+                pce = new_ce
+            changed += 1
+            logger.info(
+                "demote_ene_inside_monomer_band: ene %d-%d → child row %d, 单体→%d",
+                ecs,
+                ece,
+                child_row,
+                pce,
+            )
+    if changed:
+        work = dedupe_overlapping_cells(work)
+    return work
+
+
+def split_glued_side_headers(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """侧栏格同时含比率类与当量类，且右侧有空邻列/占位洞 → 当量挪到空列。"""
+    if not cells:
+        return cells
+    work = [dict(c) for c in cells]
+    row_seps, col_seps = _derive_seps(work)
+    changed = 0
+
+    def _full_text(c: Dict[str, Any]) -> str:
+        parts = [str(t.get("text") or "") for t in (c.get("texts") or [])]
+        own = str(c.get("text") or "")
+        if own:
+            parts.append(own)
+        return "\n".join(p for p in parts if p)
+
+    for cell in list(work):
+        raw = _full_text(cell)
+        compact = re.sub(r"\s+", "", raw)
+        if not (_RATIO_SIDE_RE.search(compact) and _EQUIV_SIDE_RE.search(compact)):
+            continue
+        rs, re_ = int(cell["row_start"]), int(cell["row_end"])
+        ce = int(cell["col_end"])
+        empty = None
+        for o in work:
+            if o is cell:
+                continue
+            if int(o["row_start"]) > re_ or int(o["row_end"]) < rs:
+                continue
+            ocs = int(o["col_start"])
+            if ocs < ce + 1 or ocs > ce + 2:
+                continue
+            ot = re.sub(r"\s+", "", _full_text(o))
+            # 可接收当量：空、或无比率/当量主标签的占位
+            if _RATIO_SIDE_RE.search(ot) and len(ot) > 8:
+                continue
+            if _EQUIV_SIDE_RE.search(ot) and not _RATIO_SIDE_RE.search(ot):
+                continue
+            if _MONOMER_PARENT_RE.search(ot) or _MONOMER_LEFT_ANCHOR_RE.search(ot):
+                continue
+            if _ENE_HEADER_RE.search(ot) or _CAP_AGENT_RE.search(ot):
+                continue
+            if _SYNTHESIS_ROW_RE.search(ot) or _looks_like_body_value(ot):
+                continue
+            empty = o
+            break
+        # 右侧无空格对象、但与「双键当量」之间有占位洞 → 插入新格
+        if empty is None and len(col_seps) > ce + 2:
+            next_equiv = None
+            for o in work:
+                if o is cell:
+                    continue
+                if int(o["row_start"]) > re_ or int(o["row_end"]) < rs:
+                    continue
+                if int(o["col_start"]) <= ce:
+                    continue
+                ot = re.sub(r"\s+", "", _full_text(o))
+                if _EQUIV_SIDE_RE.search(ot) and "双键" in ot:
+                    next_equiv = o
+                    break
+            if next_equiv is not None and int(next_equiv["col_start"]) >= ce + 2:
+                hole = ce + 1
+                # 洞列未被占用
+                occupied = any(
+                    int(o["col_start"]) <= hole <= int(o["col_end"])
+                    and not (int(o["row_start"]) > re_ or int(o["row_end"]) < rs)
+                    for o in work
+                    if o is not cell
+                )
+                if not occupied and hole + 1 < len(col_seps):
+                    x1 = float(col_seps[hole])
+                    x2 = float(col_seps[hole + 1])
+                    y1 = float(row_seps[rs]) if rs < len(row_seps) else 0.0
+                    y2 = (
+                        float(row_seps[re_ + 1])
+                        if re_ + 1 < len(row_seps)
+                        else y1 + 10.0
+                    )
+                    empty = _make_empty_cell(
+                        x1=x1,
+                        y1=y1,
+                        x2=x2,
+                        y2=y2,
+                        row_start=rs,
+                        row_end=re_,
+                        col_start=hole,
+                        col_end=hole,
+                    )
+                    work.append(empty)
+                    logger.info(
+                        "split_glued_side_headers: 插入占位洞 col %d", hole
+                    )
+        if empty is None:
+            continue
+        equiv_key = "双键当量" if "双键当量" in compact else "酸当量"
+        idx = raw.find(equiv_key)
+        if idx < 0:
+            idx = raw.find("酸当量")
+            if idx < 0:
+                idx = raw.find("双键当量")
+        if idx < 0:
+            m = _EQUIV_SIDE_RE.search(compact)
+            if not m:
+                continue
+            ratio_text = compact[: m.start()]
+            equiv_text = compact[m.start() :]
+        else:
+            ratio_text = raw[:idx].strip()
+            equiv_text = raw[idx:].strip()
+        if not ratio_text or not equiv_text:
+            continue
+        if "双键" in equiv_text:
+            empty["text"] = "双键当量[g/mol]"
+        else:
+            empty["text"] = "酸当量[g/mol]"
+        empty["texts"] = []
+        cell["text"] = ratio_text
+        cell["texts"] = []
+        changed += 1
+        logger.info("split_glued_side_headers: 拆出当量到 col %d", empty["col_start"])
+    if changed:
+        logger.info("split_glued_side_headers: 拆分 %d 处", changed)
+        work = dedupe_overlapping_cells(work)
+    return work
+
+
+def refill_short_side_headers_from_ocr(
+    cells: List[Dict[str, Any]],
+    boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """侧栏头过短时，用 cell polygon（略扩）内 OCR 碎片并集补全。"""
+    if not cells or not boxes:
+        return cells
+    work = [dict(c) for c in cells]
+    changed = 0
+    for cell in work:
+        t = re.sub(r"\s+", "", str(cell.get("text") or ""))
+        if not t or not _MONOMER_RIGHT_ANCHOR_RE.search(t):
+            continue
+        # 仅补「来源于/来自具有…」短比率头；勿动完整酸/双键当量列
+        if not _SHORT_SIDE_HEADER_RE.match(t):
+            continue
+        x1, y1, x2, y2 = _cell_bbox(cell)
+        # 短头往往 OCR 框偏出 cell，横向加宽、纵向略扩（勿过大以免吞邻列单位）
+        pad_x = max(24.0, 0.35 * max(x2 - x1, 20.0))
+        pad_y = max(10.0, 0.28 * max(y2 - y1, 20.0))
+        region = (x1 - pad_x, y1 - pad_y, x2 + pad_x, y2 + pad_y)
+        frags = []
+        for tb in boxes:
+            tx1, ty1, tx2, ty2 = _tb_bbox(tb)
+            cx = 0.5 * (tx1 + tx2)
+            cy = 0.5 * (ty1 + ty2)
+            if region[0] <= cx <= region[2] and region[1] <= cy <= region[3]:
+                frag = str(tb.get("text") or "").strip()
+                if not frag:
+                    continue
+                fc = re.sub(r"\s+", "", frag)
+                if _looks_like_body_value(fc) or re.fullmatch(r"\d+(?:\.\d+)?", fc):
+                    continue
+                # 裸单位 [g/mol] 属当量列，勿并进短比率头
+                if re.fullmatch(r"[\[［]?g\s*/\s*mo[l1][\]］]?", fc, re.I):
+                    continue
+                # 只收比率/来源类碎片，勿把邻列当量或表体拼进来
+                # OCR 常把 mol 识成 mo1；允许 [mo1%]/[mol%]
+                if not (
+                    _MONOMER_RIGHT_ANCHOR_RE.search(fc)
+                    or re.search(
+                        r"(结构单元|所占|含有|比率|比例|[\[［]mo[l1]\s*%|mo[l1]\s*%)",
+                        fc,
+                    )
+                ):
+                    continue
+                # 纯当量碎片留给邻列
+                if _EQUIV_SIDE_RE.search(fc) and not _RATIO_SIDE_RE.search(fc):
+                    continue
+                frags.append((ty1, tx1, frag))
+        if not frags:
+            continue
+        frags.sort()
+        # 丢掉纯数字/表体值碎片，避免把 350/330 吸进侧栏头
+        clean = []
+        for ty, tx, frag in frags:
+            fc = re.sub(r"\s+", "", frag)
+            if _looks_like_body_value(fc) or re.fullmatch(r"\d+(?:\.\d+)?", fc):
+                continue
+            if _SYNTHESIS_ROW_RE.search(fc):
+                continue
+            if re.fullmatch(r"[\[［]?g\s*/\s*mo[l1][\]］]?", fc, re.I):
+                continue
+            if _EQUIV_SIDE_RE.search(fc) and not _RATIO_SIDE_RE.search(fc):
+                continue
+            clean.append((ty, tx, frag))
+        if not clean:
+            continue
+        merged = re.sub(r"\s+", "", "".join(f for _, _, f in clean))
+        if len(merged) <= len(t):
+            continue
+        # 合并后若仍像「比率+数字」粘连，去掉尾部纯数字
+        merged2 = re.sub(r"\d+(?:\.\d+)?$", "", merged)
+        if len(merged2) >= 8:
+            merged = merged2
+            clean_text = "\n".join(f for _, _, f in clean)
+            clean_text = re.sub(r"\n?\d+(?:\.\d+)?\s*$", "", clean_text)
+        else:
+            clean_text = "\n".join(f for _, _, f in clean)
+        # 去掉误并的裸 [g/mol] 行
+        lines = [
+            ln
+            for ln in clean_text.split("\n")
+            if not re.fullmatch(
+                r"\s*[\[［]?g\s*/\s*mo[l1][\]］]?\s*", ln or "", re.I
+            )
+        ]
+        clean_text = "\n".join(lines).strip()
+        if not clean_text or len(re.sub(r"\s+", "", clean_text)) <= len(t):
+            continue
+        cell["text"] = clean_text
+        cell["texts"] = []
+        changed += 1
+        logger.info(
+            "refill_short_side_headers_from_ocr: %s → %s",
+            t[:20],
+            re.sub(r"\s+", "", clean_text)[:40],
+        )
+    if changed:
+        logger.info("refill_short_side_headers_from_ocr: 补全 %d 个侧栏头", changed)
+    return work
+
+
+def sanitize_side_header_body_leak(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """侧栏头尾部粘上的表体数字/短横杠去掉（酸当量[g/mol]350）。"""
+    if not cells:
+        return cells
+    work = [dict(c) for c in cells]
+    changed = 0
+    for cell in work:
+        raw = str(cell.get("text") or "")
+        if not raw:
+            continue
+        compact = re.sub(r"\s+", "", raw)
+        if not (
+            _SIDE_HEADER_FORCE_RE.search(compact)
+            or _MONOMER_RIGHT_ANCHOR_RE.search(compact)
+        ):
+            continue
+        # 去掉尾部纯数字 / 单独短横
+        cleaned = re.sub(r"(?:[\d.]+|[-—–−])+$", "", compact)
+        if cleaned == compact or len(cleaned) < 4:
+            continue
+        # 尽量保留换行结构：从 raw 末尾剥数字
+        new_raw = re.sub(r"(?:\s*[\d.]+|\s*[-—–−])+\s*$", "", raw).rstrip()
+        if not new_raw:
+            new_raw = cleaned
+        cell["text"] = new_raw
+        cell["texts"] = []
+        changed += 1
+    if changed:
+        logger.info("sanitize_side_header_body_leak: 清理 %d 处", changed)
+    return work
+
+
+def fill_empty_child_headers_from_ocr(
+    cells: List[Dict[str, Any]],
+    boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """单体带子表头行空格：用水平对齐且落在表头带附近的 OCR 补文案（脂环式等掉出格外）。"""
+    if not cells or not boxes:
+        return cells
+    work = [dict(c) for c in cells]
+    row_seps, col_seps = _derive_seps(work)
+    header_like = re.compile(
+        r"(具有.{2,40}(?:共聚成分|化合物|衍生物|基团)|"
+        r"四羧酸|二羧酸|二胺|封端剂|有机硅烷|烯键式|烯属)"
+    )
+    changed = 0
+    parents = [
+        c for c in work if _MONOMER_PARENT_RE.search(str(c.get("text") or ""))
+    ]
+    for parent in parents:
+        prs, pre = int(parent["row_start"]), int(parent["row_end"])
+        pcs, pce = int(parent["col_start"]), int(parent["col_end"])
+        child_row = pre + 1
+        y_lo = float(row_seps[prs]) if prs < len(row_seps) else 0.0
+        y_hi = (
+            float(row_seps[child_row + 1])
+            if child_row + 1 < len(row_seps)
+            else y_lo + 80.0
+        )
+        # 允许 OCR 略高出/低于子表头行
+        y_pad = max(20.0, 0.35 * (y_hi - y_lo))
+        for cell in work:
+            if int(cell["row_start"]) != child_row == int(cell["row_end"]):
+                continue
+            if int(cell["col_end"]) < pcs or int(cell["col_start"]) > pce:
+                continue
+            if str(cell.get("text") or "").strip():
+                continue
+            x1, _y1, x2, _y2 = _cell_bbox(cell)
+            pad_x = max(6.0, 0.15 * (x2 - x1))
+            frags = []
+            for tb in boxes:
+                tx1, ty1, tx2, ty2 = _tb_bbox(tb)
+                cx = 0.5 * (tx1 + tx2)
+                cy = 0.5 * (ty1 + ty2)
+                if not (x1 - pad_x <= cx <= x2 + pad_x):
+                    continue
+                if not (y_lo - y_pad <= cy <= y_hi + y_pad):
+                    continue
+                frag = str(tb.get("text") or "").strip()
+                if not frag or not header_like.search(re.sub(r"\s+", "", frag)):
+                    continue
+                # 已落入其它有字格的 OCR 跳过
+                taken = False
+                for o in work:
+                    if o is cell or not str(o.get("text") or "").strip():
+                        continue
+                    ox1, oy1, ox2, oy2 = _cell_bbox(o)
+                    if ox1 <= cx <= ox2 and oy1 <= cy <= oy2:
+                        taken = True
+                        break
+                if taken:
+                    continue
+                frags.append((ty1, tx1, frag))
+            if not frags:
+                continue
+            frags.sort()
+            cell["text"] = "\n".join(f for _, _, f in frags)
+            cell["texts"] = []
+            changed += 1
+            logger.info(
+                "fill_empty_child_headers_from_ocr: col %d ← %s",
+                cell["col_start"],
+                cell["text"][:30],
+            )
+    if changed:
+        logger.info("fill_empty_child_headers_from_ocr: 补全 %d 个空子头", changed)
+
+    # 子表头行在单体带内的空洞列：若有水平对齐的表头 OCR，则建格填入
+    for parent in parents:
+        prs, pre = int(parent["row_start"]), int(parent["row_end"])
+        pcs, pce = int(parent["col_start"]), int(parent["col_end"])
+        child_row = pre + 1
+        if child_row + 1 >= len(row_seps) or pce + 1 >= len(col_seps):
+            continue
+        y1 = float(row_seps[child_row])
+        y2 = float(row_seps[child_row + 1])
+        y_pad = max(20.0, 0.35 * (y2 - y1))
+        for col in range(pcs, pce + 1):
+            covered = any(
+                int(c["row_start"]) <= child_row <= int(c["row_end"])
+                and int(c["col_start"]) <= col <= int(c["col_end"])
+                and str(c.get("text") or "").strip()
+                for c in work
+            )
+            if covered:
+                continue
+            if col + 1 >= len(col_seps):
+                continue
+            x1 = float(col_seps[col])
+            x2 = float(col_seps[col + 1])
+            pad_x = max(6.0, 0.15 * (x2 - x1))
+            frags = []
+            for tb in boxes:
+                tx1, ty1, tx2, ty2 = _tb_bbox(tb)
+                cx = 0.5 * (tx1 + tx2)
+                cy = 0.5 * (ty1 + ty2)
+                if not (x1 - pad_x <= cx <= x2 + pad_x):
+                    continue
+                if not (y1 - y_pad <= cy <= y2 + y_pad):
+                    continue
+                frag = str(tb.get("text") or "").strip()
+                if not frag or not header_like.search(re.sub(r"\s+", "", frag)):
+                    continue
+                fc = re.sub(r"\s+", "", frag)
+                if _looks_like_body_value(fc) or re.fullmatch(r"\d+(?:\.\d+)?", fc):
+                    continue
+                if _ENE_HEADER_RE.search(fc):
+                    ene_exists = any(
+                        _ENE_HEADER_RE.search(
+                            re.sub(r"\s+", "", str(o.get("text") or ""))
+                        )
+                        for o in work
+                    )
+                    if ene_exists:
+                        continue
+                taken = False
+                for o in work:
+                    if not str(o.get("text") or "").strip():
+                        continue
+                    ox1, oy1, ox2, oy2 = _cell_bbox(o)
+                    if ox1 <= cx <= ox2 and oy1 <= cy <= oy2:
+                        taken = True
+                        break
+                if taken:
+                    continue
+                frags.append((ty1, tx1, frag))
+            if not frags:
+                continue
+            frags.sort()
+            slot = None
+            for c in work:
+                if (
+                    int(c["row_start"]) == child_row == int(c["row_end"])
+                    and int(c["col_start"]) == col == int(c["col_end"])
+                    and not str(c.get("text") or "").strip()
+                ):
+                    slot = c
+                    break
+            if slot is None:
+                slot = _make_empty_cell(
+                    x1=x1,
+                    y1=y1,
+                    x2=x2,
+                    y2=y2,
+                    row_start=child_row,
+                    row_end=child_row,
+                    col_start=col,
+                    col_end=col,
+                )
+                work.append(slot)
+            slot["text"] = "\n".join(f for _, _, f in frags)
+            slot["texts"] = []
+            slot["text"] = re.sub(
+                r"(的?共聚成分)(?:[\s　]*的?共聚成分)+",
+                r"\1",
+                slot["text"],
+            )
+            changed += 1
+            logger.info(
+                "fill_empty_child_headers_from_ocr: 建格 col %d ← %s",
+                col,
+                slot["text"][:30],
+            )
+    if changed:
+        work = dedupe_overlapping_cells(work)
+    return work
+
+
+def _copoly_child_cat_key(text: str) -> Optional[str]:
+    """共聚/烯键子头类别键，用于截断补全时防串列。"""
+    t = re.sub(r"\s+", "", text or "")
+    if not t:
+        return None
+    if _ENE_HEADER_RE.search(t):
+        return "ene"
+    if "脂环" in t:
+        return "ali"
+    if "芳香" in t:
+        return "aro"
+    if "酸性" in t:
+        return "acid"
+    return None
+
+
+def _monomer_child_header_incomplete(text: str) -> bool:
+    """子表头是否明显截断（缺共聚成分/化合物等）。"""
+    c = re.sub(r"\s+", "", text or "")
+    if not c:
+        return True
+    if _ENE_HEADER_RE.search(c):
+        return not re.search(r"(化合物|衍生物)", c)
+    if any(k in c for k in ("酸性", "芳香", "脂环")):
+        return "共聚成分" not in c
+    if c.startswith("具有") and len(c) < 16:
+        return True
+    # 专利表常见双段堆叠：缺第二段化学类名时仍收同列 OCR
+    if "二羧酸" in c and "二甲酰" not in c:
+        return True
+    if "双氨基酚" in c and "二羟基" not in c:
+        return True
+    if "有机硅烷" in c and "低聚" not in c and "三官能" not in c:
+        # 「四官能有机硅烷」常另有「…低聚物」行；三官能通常单段
+        return True
+    return False
+
+
+_CHILD_HEADER_FRAG_RE = re.compile(
+    r"(具有.{1,40}(?:共聚成分|化合物|衍生物|基团)|"
+    r"的?共聚成分|双键基团|的?不饱和化合物|"
+    r"四羧酸|二羧酸|二胺|封端剂|有机硅烷|烯键式|烯属|"
+    r"二甲酰|二羟基|低聚物|及其衍生物|衍生物)"
+)
+
+
+def refill_truncated_monomer_child_headers_from_ocr(
+    cells: List[Dict[str, Any]],
+    boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """过窄子头格：OCR 常落在格左侧。按邻列中点墙在表头带内收碎片补全。"""
+    if not cells or not boxes:
+        return cells
+    work = [dict(c) for c in cells]
+    row_seps, col_seps = _derive_seps(work)
+    if len(row_seps) < 3:
+        return work
+    changed = 0
+    parents = [
+        c for c in work if _MONOMER_PARENT_RE.search(str(c.get("text") or ""))
+    ]
+    for parent in parents:
+        prs, pre = int(parent["row_start"]), int(parent["row_end"])
+        pcs, pce = int(parent["col_start"]), int(parent["col_end"])
+        child_row = pre + 1
+        if child_row + 1 >= len(row_seps):
+            continue
+        px1, _py1, px2, _py2 = _cell_bbox(parent)
+        y_lo = float(row_seps[prs])
+        y_hi = float(row_seps[child_row + 1])
+        y_pad = max(16.0, 0.25 * (y_hi - y_lo))
+        kids = [
+            c
+            for c in work
+            if int(c["row_start"]) == child_row == int(c["row_end"])
+            and int(c["col_end"]) >= pcs
+            and int(c["col_start"]) <= pce
+            and str(c.get("text") or "").strip()
+            and not _looks_like_body_value(str(c.get("text") or ""))
+            and not _SIDE_HEADER_FORCE_RE.search(_compact_cell_text(c))
+            and not _MONOMER_RIGHT_ANCHOR_RE.search(_compact_cell_text(c))
+        ]
+        if len(kids) < 2:
+            continue
+        kids = sorted(kids, key=lambda c: (int(c["col_start"]), _cell_bbox(c)[0]))
+        for i, kid in enumerate(kids):
+            raw = str(kid.get("text") or "")
+            if not _monomer_child_header_incomplete(raw):
+                continue
+            kx1, _ky1, kx2, _ky2 = _cell_bbox(kid)
+            if i > 0:
+                prev_x2 = _cell_bbox(kids[i - 1])[2]
+                wall_lo = 0.5 * (prev_x2 + kx1)
+            else:
+                wall_lo = min(px1, kx1) - 20.0
+            if i + 1 < len(kids):
+                next_x1 = _cell_bbox(kids[i + 1])[0]
+                wall_hi = 0.5 * (kx2 + next_x1)
+            else:
+                wall_hi = max(px2, kx2) + 20.0
+            if wall_hi <= wall_lo + 4.0:
+                continue
+            kid_cat = _copoly_child_cat_key(raw)
+            frags: List[Tuple[float, float, str]] = []
+            for tb in boxes:
+                tx1, ty1, tx2, ty2 = _tb_bbox(tb)
+                cx = 0.5 * (tx1 + tx2)
+                cy = 0.5 * (ty1 + ty2)
+                if not (wall_lo <= cx <= wall_hi):
+                    continue
+                if not (y_lo - y_pad <= cy <= y_hi + y_pad):
+                    continue
+                frag = str(tb.get("text") or "").strip()
+                if not frag:
+                    continue
+                fc = re.sub(r"\s+", "", frag)
+                if _looks_like_body_value(fc) or re.fullmatch(r"\d+(?:\.\d+)?", fc):
+                    continue
+                if not _CHILD_HEADER_FRAG_RE.search(fc):
+                    continue
+                frag_cat = _copoly_child_cat_key(fc)
+                if kid_cat and frag_cat and frag_cat != kid_cat:
+                    continue
+                # 无类别碎片（如「的共聚成分」）仅在本墙内收
+                frags.append((ty1, tx1, frag))
+            if not frags:
+                continue
+            frags.sort()
+            merged = "\n".join(f for _, _, f in frags)
+            merged = re.sub(
+                r"(的?共聚成分)(?:[\s　]*的?共聚成分)+",
+                r"\1",
+                merged,
+            )
+            mc = re.sub(r"\s+", "", merged)
+            tc = re.sub(r"\s+", "", raw)
+            if len(mc) <= len(tc):
+                continue
+            # 补全后仍须属同类，避免串成烯键式
+            if kid_cat and _copoly_child_cat_key(merged) not in (None, kid_cat):
+                continue
+            kid["text"] = merged
+            kid["texts"] = []
+            changed += 1
+            logger.info(
+                "refill_truncated_monomer_child_headers_from_ocr: %s → %s",
+                tc[:18],
+                mc[:40],
+            )
+    if changed:
+        logger.info(
+            "refill_truncated_monomer_child_headers_from_ocr: 补全 %d 处",
+            changed,
+        )
+    return work
+
+
+def absorb_empty_child_header_gaps(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """单体带子表头行：有字子头向两侧吸收空槽，铺满父格列带。"""
+    if not cells:
+        return cells
+    work = [dict(c) for c in cells]
+    row_seps, col_seps = _derive_seps(work)
+    changed = 0
+    removed: set = set()
+    parents = [
+        c for c in work if _MONOMER_PARENT_RE.search(str(c.get("text") or ""))
+    ]
+    for parent in parents:
+        pre = int(parent["row_end"])
+        pcs, pce = int(parent["col_start"]), int(parent["col_end"])
+        child_row = pre + 1
+        kids = [
+            c
+            for c in work
+            if id(c) not in removed
+            and int(c["row_start"]) == child_row == int(c["row_end"])
+            and int(c["col_end"]) >= pcs
+            and int(c["col_start"]) <= pce
+            and str(c.get("text") or "").strip()
+            and not _looks_like_body_value(str(c.get("text") or ""))
+            and not _SIDE_HEADER_FORCE_RE.search(_compact_cell_text(c))
+        ]
+        if len(kids) < 2:
+            continue
+        kids = sorted(kids, key=lambda c: int(c["col_start"]))
+        # 夹在两有字子头之间的空格并入较近一侧
+        empties = [
+            c
+            for c in work
+            if id(c) not in removed
+            and int(c["row_start"]) == child_row == int(c["row_end"])
+            and pcs <= int(c["col_start"]) <= pce
+            and not str(c.get("text") or "").strip()
+        ]
+        for emp in empties:
+            ecs, ece = int(emp["col_start"]), int(emp["col_end"])
+            left = [k for k in kids if int(k["col_end"]) < ecs]
+            right = [k for k in kids if int(k["col_start"]) > ece]
+            target = None
+            if left and right:
+                # 较近的一侧
+                if ecs - int(left[-1]["col_end"]) <= int(right[0]["col_start"]) - ece:
+                    target = left[-1]
+                else:
+                    target = right[0]
+            elif left:
+                target = left[-1]
+            elif right:
+                target = right[0]
+            if target is None:
+                continue
+            ncs = min(int(target["col_start"]), ecs)
+            nce = max(int(target["col_end"]), ece)
+            _set_cell_cols(target, ncs, nce, col_seps)
+            removed.add(id(emp))
+            changed += 1
+    if removed:
+        work = [c for c in work if id(c) not in removed]
+    if changed:
+        logger.info("absorb_empty_child_header_gaps: 吸收 %d 处空槽", changed)
+        work = dedupe_overlapping_cells(work)
+    return work
+
+
+def sanitize_side_header_texts(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """侧栏头尾部粘上的表体数字/化学代号剥掉。"""
+    if not cells:
+        return cells
+    work = [dict(c) for c in cells]
+    changed = 0
+    for cell in work:
+        raw = str(cell.get("text") or "")
+        if not raw.strip():
+            continue
+        compact = re.sub(r"\s+", "", raw)
+        is_side = bool(
+            _SIDE_HEADER_FORCE_RE.search(compact)
+            or _MONOMER_RIGHT_ANCHOR_RE.search(compact)
+        )
+        is_copoly_child = bool(
+            re.search(r"(脂环式|芳香族|酸性基团|共聚成分)", compact)
+        )
+        if not is_side and not is_copoly_child:
+            continue
+        if is_side:
+            lines = [ln for ln in raw.split("\n") if ln.strip()]
+            while lines:
+                last = re.sub(r"\s+", "", lines[-1])
+                if _looks_like_body_value(last) or re.fullmatch(
+                    r"\d+(?:\.\d+)?", last
+                ):
+                    lines.pop()
+                    changed += 1
+                    continue
+                break
+            new_text = "\n".join(lines)
+            # 同行粘连：酸当量[g/mol]350
+            new_text2 = re.sub(
+                r"((?:酸当量|双键当量)\s*\[[^\]]+\])\s*(?:\d+(?:\.\d+)?|[-—–−])\s*$",
+                r"\1",
+                new_text,
+            )
+            if new_text2 != raw:
+                cell["text"] = new_text2
+                cell["texts"] = []
+                changed += 1
+            elif new_text != raw:
+                cell["text"] = new_text
+                cell["texts"] = []
+        # 脂环式格误吞烯键式后半段 → 只保留脂环式共聚成分
+        raw2 = str(cell.get("text") or "")
+        c2 = re.sub(r"\s+", "", raw2)
+        if "脂环式" in c2 and (
+            "烯键式" in c2
+            or "双键基团" in c2
+            or "不饱和双键" in c2
+            or "不饱和化合物" in c2
+        ):
+            cut = re.split(
+                r"(?=双键基团|烯键式|不饱和双键|不饱和化合物)",
+                raw2,
+                maxsplit=1,
+            )[0].strip()
+            if "脂环式" in cut and len(re.sub(r"\s+", "", cut)) >= 6:
+                cell["text"] = cut
+                cell["texts"] = []
+                changed += 1
+        # 重复「的共聚成分」
+        raw3 = str(cell.get("text") or "")
+        deduped = re.sub(
+            r"(的?共聚成分)(?:[\s　]*的?共聚成分)+",
+            r"\1",
+            raw3,
+        )
+        if deduped != raw3:
+            cell["text"] = deduped
+            cell["texts"] = []
+            changed += 1
+        # 来源于…粘酸当量且右侧已有独立酸当量 → 只剥当量
+        if not is_side:
+            continue
+        raw4 = str(cell.get("text") or "")
+        c4 = re.sub(r"\s+", "", raw4)
+        if _RATIO_SIDE_RE.search(c4) and _EQUIV_SIDE_RE.search(c4):
+            rs, re_ = int(cell["row_start"]), int(cell["row_end"])
+            ce = int(cell["col_end"])
+            has_pure_equiv = any(
+                _EQUIV_SIDE_RE.search(re.sub(r"\s+", "", str(o.get("text") or "")))
+                and not _RATIO_SIDE_RE.search(
+                    re.sub(r"\s+", "", str(o.get("text") or ""))
+                )
+                and int(o["col_start"]) > ce
+                and not (int(o["row_start"]) > re_ or int(o["row_end"]) < rs)
+                for o in work
+                if o is not cell
+            )
+            if has_pure_equiv:
+                stripped = re.split(r"酸当量|双键当量", raw4, maxsplit=1)[0].strip()
+                if stripped and stripped != raw4:
+                    cell["text"] = stripped
+                    cell["texts"] = []
+                    changed += 1
+    # 同子表头行：烯键式若列序在脂环式左侧，交换列范围（P47）
+    row_seps, col_seps = _derive_seps(work)
+    by_row: Dict[int, List[Dict[str, Any]]] = {}
+    for c in work:
+        if int(c["row_start"]) != int(c["row_end"]):
+            continue
+        by_row.setdefault(int(c["row_start"]), []).append(c)
+    for _r, row_cells in by_row.items():
+        ene = [
+            c
+            for c in row_cells
+            if _ENE_HEADER_RE.search(re.sub(r"\s+", "", str(c.get("text") or "")))
+        ]
+        ali = [
+            c
+            for c in row_cells
+            if "脂环式" in re.sub(r"\s+", "", str(c.get("text") or ""))
+        ]
+        if len(ene) == 1 and len(ali) == 1:
+            e, a = ene[0], ali[0]
+            if int(e["col_start"]) < int(a["col_start"]):
+                ecs, ece = int(e["col_start"]), int(e["col_end"])
+                acs, ace = int(a["col_start"]), int(a["col_end"])
+                _set_cell_cols(e, acs, ace, col_seps)
+                _set_cell_cols(a, ecs, ece, col_seps)
+                changed += 1
+                logger.info(
+                    "sanitize_side_header_texts: 交换脂环式/烯键式列 %d-%d ↔ %d-%d",
+                    ecs,
+                    ece,
+                    acs,
+                    ace,
+                )
+    if changed:
+        logger.info("sanitize_side_header_texts: 清理 %d 处", changed)
+    return work
+
+
+def split_left_anchor_subheader_leak(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """左锚(聚合物)文本吞入子头词 → 拆到右侧空/过窄子头槽。"""
+    if not cells:
+        return cells
+    work = [dict(c) for c in cells]
+    row_seps, col_seps = _derive_seps(work)
+    changed = 0
+    for cell in list(work):
+        raw = str(cell.get("text") or "")
+        if not _MONOMER_LEFT_ANCHOR_RE.search(raw):
+            continue
+        if not _SUBHEADER_LEAK_RE.search(raw):
+            continue
+        # 拆出泄漏子串（聚合物后紧跟的子头词）
+        m = _SUBHEADER_LEAK_RE.search(raw)
+        if not m:
+            continue
+        # 「聚合物」本身若被吃进，保留到泄漏起点
+        poly_m = re.search(r"聚合物", raw)
+        if poly_m and poly_m.end() <= m.start():
+            keep = raw[: m.start()].strip() or "聚合物"
+            leak = raw[m.start() :].strip()
+        else:
+            leak = raw[m.start() :].strip()
+            keep = "聚合物"
+        if not leak or leak == keep:
+            continue
+        rs, re_ = int(cell["row_start"]), int(cell["row_end"])
+        ce = int(cell["col_end"])
+        # 优先：子表头行上、紧邻右侧的空格
+        target = None
+        child_row = re_ if re_ == rs else (rs + 1 if re_ > rs else rs)
+        # 聚合物常 rowspan 盖父+子；泄漏应落到子表头行
+        for o in work:
+            if o is cell:
+                continue
+            if int(o["row_start"]) != child_row and not (
+                int(o["row_start"]) <= child_row <= int(o["row_end"])
+            ):
+                if int(o["row_start"]) != child_row == int(o["row_end"]):
+                    continue
+            if int(o["row_start"]) == child_row == int(o["row_end"]):
+                if int(o["col_start"]) <= ce:
+                    continue
+                if int(o["col_start"]) > ce + 3:
+                    continue
+                ot = str(o.get("text") or "").strip()
+                if ot and not _MONOMER_PARENT_RE.search(ot):
+                    # 已有子头则跳过，找空槽
+                    if _SUBHEADER_LEAK_RE.search(ot) or re.search(
+                        r"[\u4e00-\u9fff]", ot
+                    ):
+                        continue
+                target = o
+                break
+        if target is None:
+            for o in work:
+                if int(o["row_start"]) != child_row == int(o["row_end"]):
+                    continue
+                if int(o["col_start"]) <= ce:
+                    continue
+                if str(o.get("text") or "").strip():
+                    continue
+                target = o
+                break
+        if target is None:
+            continue
+        cell["text"] = keep
+        cell["texts"] = []
+        target["text"] = leak
+        target["texts"] = []
+        # 若聚合物 rowspan 盖住子行，把目标行钉在子表头行
+        if int(target["row_start"]) != child_row:
+            _set_cell_rows(target, child_row, child_row, row_seps)
+        changed += 1
+        logger.info(
+            "split_left_anchor_subheader_leak: 聚合物泄漏 → col %d (%s)",
+            target["col_start"],
+            leak[:20],
+        )
+    if changed:
+        logger.info("split_left_anchor_subheader_leak: 修复 %d 处", changed)
+    return work
+
+
+def split_undersplit_monomer_child_headers(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """子头格数 < 表体化学列数，且存在粘连中文 colspan>1 → 按表体列 x 切开。"""
+    if not cells:
+        return cells
+    work = [dict(c) for c in cells]
+    row_seps, col_seps = _derive_seps(work)
+    if len(col_seps) < 4:
+        return work
+
+    parents = [
+        c for c in work if _MONOMER_PARENT_RE.search(str(c.get("text") or ""))
+    ]
+    changed = 0
+    for parent in parents:
+        prs, pre = int(parent["row_start"]), int(parent["row_end"])
+        pcs, pce = int(parent["col_start"]), int(parent["col_end"])
+        child_row = pre + 1
+        kids = [
+            c
+            for c in work
+            if int(c["row_start"]) == child_row == int(c["row_end"])
+            and int(c["col_end"]) >= pcs
+            and int(c["col_start"]) <= pce
+            and str(c.get("text") or "").strip()
+            and not _looks_like_body_value(str(c.get("text") or ""))
+            and not _SIDE_HEADER_FORCE_RE.search(_compact_cell_text(c))
+        ]
+        body = [
+            c
+            for c in work
+            if int(c["row_start"]) > child_row
+            and pcs <= int(c["col_start"]) <= pce
+            and _looks_like_body_value(str(c.get("text") or ""))
+        ]
+        # 按原子列计数
+        body_cols = sorted(
+            {
+                col
+                for b in body
+                for col in range(int(b["col_start"]), int(b["col_end"]) + 1)
+                if pcs <= col <= pce
+            }
+        )
+        if len(kids) < 2 or len(body_cols) <= len(kids):
+            continue
+        glued = [k for k in kids if int(k["col_span"]) > 1]
+        if not glued:
+            continue
+        # 对每个粘连格：若文本含 ≥2 个类别词，按覆盖的 body 列均分/按 x 切
+        for gk in glued:
+            text = str(gk.get("text") or "")
+            cats = set()
+            for part in re.split(r"[\s/／]+", text):
+                cats.add(_child_header_category(part))
+            cats.discard("other")
+            if len(cats) < 2 and not re.search(
+                r"(共聚成分|衍生物|化合物).{0,6}(共聚成分|衍生物|化合物|不饱和)",
+                re.sub(r"\s+", "", text),
+            ):
+                # 粘连：两个「具有…」片段
+                if text.count("具有") < 2 and text.count("共聚") < 2:
+                    continue
+            gcs, gce = int(gk["col_start"]), int(gk["col_end"])
+            cover = [c for c in body_cols if gcs <= c <= gce]
+            if len(cover) < 2:
+                continue
+            # 仅当文本含 ≥2 个「具有…」独立片段才切开（勿按换行切开同一子头）
+            parts = [p.strip() for p in re.split(r"(?=具有)", text) if p.strip()]
+            if len(parts) < 2:
+                continue
+            # 各类别须能区分，避免把「具有A具有B」式合法单头误切
+            part_cats = {_child_header_category(p) for p in parts}
+            part_cats.discard("other")
+            if len(part_cats) < 2 and text.count("共聚成分") < 2:
+                continue
+            n = min(len(cover), len(parts))
+            _set_cell_cols(gk, cover[0], cover[0], col_seps)
+            gk["text"] = parts[0]
+            gk["texts"] = []
+            for i in range(1, n):
+                col = cover[i]
+                slot = None
+                for o in work:
+                    if int(o["row_start"]) == child_row == int(o["row_end"]) and int(
+                        o["col_start"]
+                    ) == col == int(o["col_end"]):
+                        slot = o
+                        break
+                if slot is None:
+                    x1 = float(col_seps[col]) if col < len(col_seps) else 0
+                    x2 = float(col_seps[col + 1]) if col + 1 < len(col_seps) else x1 + 10
+                    _, y1, _, y2 = _cell_bbox(gk)
+                    slot = _make_empty_cell(
+                        x1=x1,
+                        y1=y1,
+                        x2=x2,
+                        y2=y2,
+                        row_start=child_row,
+                        row_end=child_row,
+                        col_start=col,
+                        col_end=col,
+                    )
+                    work.append(slot)
+                if not str(slot.get("text") or "").strip():
+                    slot["text"] = parts[i] if i < len(parts) else parts[-1]
+                    slot["texts"] = []
+                    _set_cell_cols(slot, col, col, col_seps)
+            changed += 1
+            logger.info(
+                "split_undersplit_monomer_child_headers: 切开粘连子头 → %d 列",
+                n,
+            )
     if changed:
         work = dedupe_overlapping_cells(work)
     return work

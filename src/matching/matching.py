@@ -535,6 +535,64 @@ def _cell_bbox(cell: Dict[str, Any]) -> Tuple[float, float, float, float]:
     )
 
 
+def cells_union_bbox(
+    cells: Sequence[Dict[str, Any]],
+    *,
+    pad: float = 4.0,
+) -> Optional[Tuple[float, float, float, float]]:
+    """全部逻辑格外接矩形（略扩 pad），供表内未命中 OCR 就近吸附。"""
+    if not cells:
+        return None
+    xs1: List[float] = []
+    ys1: List[float] = []
+    xs2: List[float] = []
+    ys2: List[float] = []
+    for cell in cells:
+        if cell.get("polygon") is None:
+            continue
+        x1, y1, x2, y2 = _cell_bbox(cell)
+        xs1.append(x1)
+        ys1.append(y1)
+        xs2.append(x2)
+        ys2.append(y2)
+    if not xs1:
+        return None
+    return (
+        min(xs1) - pad,
+        min(ys1) - pad,
+        max(xs2) + pad,
+        max(ys2) + pad,
+    )
+
+
+def filter_absorbed_free_texts(
+    cells: Sequence[Dict[str, Any]],
+    free_texts: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """丢掉已写入单元格的游离碎片，保留表题等真正表外文本。"""
+    if not free_texts:
+        return []
+    cell_blobs = [
+        re.sub(r"\s+", "", str(c.get("text") or ""))
+        for c in cells
+        if str(c.get("text") or "").strip()
+    ]
+    kept: List[Dict[str, Any]] = []
+    for ft in free_texts:
+        raw = str(ft.get("text") or "").strip()
+        if not raw:
+            continue
+        compact = re.sub(r"\s+", "", raw)
+        # 表题始终保留
+        if _CAPTION_CHUNK_RE.fullmatch(raw) or _CAPTION_CHUNK_RE.fullmatch(compact):
+            kept.append(ft)
+            continue
+        if any(compact and compact in blob for blob in cell_blobs):
+            continue
+        kept.append(ft)
+    return kept
+
+
 def _x_overlap(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
     return max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
 
@@ -1810,7 +1868,7 @@ def assign_texts_to_cells(
                 cells[best_idx]["texts"].append(piece_tb)
                 continue
 
-            # ---- 游离文本：仅表外 ----
+            # ---- 游离文本：仅表外；表内未命中格 → 就近吸附（多行表头续行等）----
             if table_bboxes:
                 cx, cy = centroid.x, centroid.y
                 inside_any = False
@@ -1823,9 +1881,19 @@ def assign_texts_to_cells(
                         dists = []
                         for cell in cells:
                             x1, y1, x2, y2 = _cell_bbox(cell)
-                            dx = 0.0 if x1 <= cx <= x2 else min(abs(cx - x1), abs(cx - x2))
-                            dy = 0.0 if y1 <= cy <= y2 else min(abs(cy - y1), abs(cy - y2))
-                            dists.append(dx * dx + dy * dy)
+                            dx = 0.0 if x1 <= cx <= x2 else min(
+                                abs(cx - x1), abs(cx - x2)
+                            )
+                            dy = 0.0 if y1 <= cy <= y2 else min(
+                                abs(cy - y1), abs(cy - y2)
+                            )
+                            dist2 = dx * dx + dy * dy
+                            # 同列堆叠续行：优先落到 X 对齐且已有字的格，避免空幽灵列抢走
+                            if x1 <= cx <= x2 and cell.get("texts"):
+                                dist2 *= 0.25
+                            elif cell.get("texts"):
+                                dist2 *= 0.85
+                            dists.append(dist2)
                         cells[int(np.argmin(dists))]["texts"].append(piece_tb)
                     continue
 
@@ -2157,8 +2225,15 @@ def _column_should_coerce_dash_misreads(
     suspect_count: int,
     multi_char_count: int,
 ) -> bool:
-    """判断该列是否应以缺测横线 '-' 为主（允许少量真实多字符值如 100）。"""
+    """判断该列是否应以缺测横线 '-' 为主（允许少量真实多字符值如 100）。
+
+    必须先有真实 dash 证据。索引列（1,2,3…10）里孤立的「1」绝不能仅因存在
+    多字符「10/11」就被当成破折号误识，否则会误杀组合物编号并给空表头补 '-'。
+    """
     if suspect_count == 0:
+        return False
+    # 列内无任何 '-' 时，不把 1/l/I 当 dash 误识
+    if dash_count < 1:
         return False
     pair = dash_count + suspect_count
     if pair == 0:
@@ -2166,8 +2241,8 @@ def _column_should_coerce_dash_misreads(
     # dash 在 dash+suspect 中占多数
     if dash_count >= 2 and dash_count / pair >= 0.5:
         return True
-    # 多值列：multi 明显多于 suspect（原逻辑）
-    if dash_count + multi_char_count >= 2 and multi_char_count > suspect_count:
+    # 有 dash 的多值列：multi 明显多于 suspect（允许少量真实多字符如 100）
+    if dash_count >= 1 and dash_count + multi_char_count >= 2 and multi_char_count > suspect_count:
         return True
     # dash+suspect 占非空绝大多数，multi 只是少量例外（P40X268 二苯基醚二甲酰氯列）
     all_nonempty = pair + multi_char_count
@@ -2225,7 +2300,8 @@ def _fix_dash_column_consistency(
                 dash_count += 1
             elif txt in _DASH_MISREAD_CHARS:
                 suspect_cells.append(c)
-            elif len(txt) > 1:
+            elif len(txt) > 1 or txt.isdigit():
+                # 纯数字（含 2–9）视为真实数据，避免索引列被当成缺测横线列
                 multi_char_count += 1
         if not _column_should_coerce_dash_misreads(
             dash_count, len(suspect_cells), multi_char_count

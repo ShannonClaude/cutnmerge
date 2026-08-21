@@ -106,37 +106,119 @@ def test_lift_keeps_numeric_body():
     print("ok test_lift_keeps_numeric_body")
 
 
-def test_align_diamine_vs_endcap_prefers_covering():
-    """P96：二胺已覆盖 SiDA 列时，不得被物理中心对齐偷给封端剂。"""
+def test_align_diamine_vs_endcap_left_wall():
+    """左对齐跨列表头：下一标签左缘为墙；SiDA 归二胺，封端剂仅 MAP 一列。
+
+    模拟 TSR 误成二胺2+封端剂2；对齐后应纠正为二胺3+封端剂1。
+    """
     from src.structure.tsr_refine import _align_monomer_children_to_body
 
+    # col2-3 酸 | col4-6 胺 | col7 封端
+    col_seps = [0, 40, 80, 120, 200, 280, 360, 420, 480]
     kids = [
-        _cell(40, 20, 120, 40, 1, 1, 2, 3, "四羧酸及其衍生物"),
-        _cell(120, 20, 200, 40, 1, 1, 4, 6, "二胺及其衍生物"),  # 逻辑已盖住 SiDA 列
-        _cell(240, 20, 280, 40, 1, 1, 7, 7, "封端剂"),  # polygon 偏右
+        _cell(80, 20, 200, 40, 1, 1, 2, 3, "四羧酸及其衍生物"),
+        # 故意错误的初始 colspan（2+2），多边形仅盖住左对齐文案区
+        _cell(200, 20, 360, 40, 1, 1, 4, 5, "二胺及其衍生物"),
+        _cell(360, 20, 480, 40, 1, 1, 6, 7, "封端剂"),
     ]
-    # 故意把二胺 polygon 收窄到只盖 BAHF，模拟 TSR 物理框偏窄
-    kids[1]["polygon"] = _cell(120, 20, 160, 40, 1, 1, 4, 6)["polygon"]
+    kids[0]["polygon"] = _cell(80, 20, 140, 40, 1, 1, 2, 3)["polygon"]
+    kids[1]["polygon"] = _cell(200, 20, 280, 40, 1, 1, 4, 5)["polygon"]
+    kids[2]["polygon"] = _cell(420, 20, 460, 40, 1, 1, 7, 7)["polygon"]
     bodies = [
-        _cell(40, 40, 80, 60, 2, 2, 2, 2, "ODPA(100)"),
-        _cell(120, 40, 160, 60, 2, 2, 4, 4, "BAHF(85)"),
-        _cell(160, 40, 200, 60, 2, 2, 5, 5, "-"),
-        _cell(200, 40, 240, 60, 2, 2, 6, 6, "SiDA(5)"),
-        _cell(240, 40, 280, 60, 2, 2, 7, 7, "MAP(20)"),
+        _cell(80, 40, 120, 60, 2, 2, 2, 2, "ODPA(100)"),
+        _cell(120, 40, 200, 60, 2, 2, 3, 3, "-"),
+        _cell(200, 40, 280, 60, 2, 2, 4, 4, "BAHF(85)"),
+        _cell(280, 40, 360, 60, 2, 2, 5, 5, "-"),
+        _cell(360, 40, 420, 60, 2, 2, 6, 6, "SiDA(5)"),
+        _cell(420, 40, 480, 60, 2, 2, 7, 7, "MAP(20)"),
     ]
-    col_seps = [0, 40, 80, 120, 160, 200, 240, 280, 320]
     n = _align_monomer_children_to_body(
         kids, bodies, col_seps, band_lo=2, band_hi=7
     )
+    acid = next(c for c in kids if "四羧酸" in str(c.get("text") or ""))
     diam = next(c for c in kids if "二胺" in str(c.get("text") or ""))
     cap = next(c for c in kids if "封端剂" in str(c.get("text") or ""))
-    assert int(diam["col_start"]) == 4 and int(diam["col_end"]) == 6, diam
-    assert int(cap["col_start"]) == 7 and int(cap["col_end"]) == 7, cap
-    print("ok test_align_diamine_vs_endcap_prefers_covering", "changed=", n)
+    assert (int(acid["col_start"]), int(acid["col_end"])) == (2, 3), acid
+    assert (int(diam["col_start"]), int(diam["col_end"])) == (4, 6), diam
+    assert (int(cap["col_start"]), int(cap["col_end"])) == (7, 7), cap
+    assert n >= 1
+    print("ok test_align_diamine_vs_endcap_left_wall", "changed=", n)
+
+
+def test_align_trifunctional_silane_trim_dash():
+    """P93：左墙会把四官能前短横列划给三官能；收尾应让出 → 3+2+1。"""
+    from src.structure.tsr_refine import _align_monomer_children_to_body
+
+    # c2 MeTMS | c3 PhTMS | c4 cyEpo | c5 - | c6 TMOS | c7 -
+    col_seps = [0, 40, 80, 200, 320, 440, 520, 640, 760]
+    kids = [
+        # TSR 误把三官能扩到含短横列
+        _cell(80, 20, 520, 40, 1, 1, 2, 5, "三官能有机硅烷"),
+        _cell(520, 20, 640, 40, 1, 1, 6, 6, "四官能有机硅烷"),
+        _cell(640, 20, 760, 40, 1, 1, 7, 7, "二官能有机硅烷"),
+    ]
+    # 文案左对齐：三官能只印在前三列区域，四官能文案从 TMOS 列起
+    kids[0]["polygon"] = _cell(80, 20, 280, 40, 1, 1, 2, 4)["polygon"]
+    kids[1]["polygon"] = _cell(560, 20, 620, 40, 1, 1, 6, 6)["polygon"]
+    kids[2]["polygon"] = _cell(680, 20, 740, 40, 1, 1, 7, 7)["polygon"]
+    bodies = [
+        _cell(80, 40, 200, 60, 2, 2, 2, 2, "MeTMS(30)"),
+        _cell(200, 40, 320, 60, 2, 2, 3, 3, "PhTMS(50)"),
+        _cell(320, 40, 440, 60, 2, 2, 4, 4, "cyEpoTMS(10)"),
+        _cell(440, 40, 520, 60, 2, 2, 5, 5, "-"),
+        _cell(520, 40, 640, 60, 2, 2, 6, 6, "TMOS(10)"),
+        _cell(640, 40, 760, 60, 2, 2, 7, 7, "-"),
+    ]
+    n = _align_monomer_children_to_body(
+        kids, bodies, col_seps, band_lo=2, band_hi=7
+    )
+    tri = next(c for c in kids if "三官能" in str(c.get("text") or ""))
+    tetra = next(c for c in kids if "四官能" in str(c.get("text") or ""))
+    di = next(c for c in kids if "二官能" in str(c.get("text") or ""))
+    assert (int(tri["col_start"]), int(tri["col_end"])) == (2, 4), tri
+    assert (int(tetra["col_start"]), int(tetra["col_end"])) == (5, 6), tetra
+    assert (int(di["col_start"]), int(di["col_end"])) == (7, 7), di
+    assert n >= 1
+    print("ok test_align_trifunctional_silane_trim_dash", "changed=", n)
+
+
+def test_align_trifunctional_keeps_chem_fourth_col():
+    """P97：第四列有 AcrTMS 实质内容时，不得因空行短横被让给四官能。"""
+    from src.structure.tsr_refine import _align_monomer_children_to_body
+
+    col_seps = [0, 40, 80, 200, 320, 440, 560, 680, 800]
+    kids = [
+        _cell(80, 20, 560, 40, 1, 1, 2, 5, "三官能有机硅烷"),
+        _cell(560, 20, 680, 40, 1, 1, 6, 6, "四官能有机硅烷"),
+        _cell(680, 20, 800, 40, 1, 1, 7, 7, "二官能有机硅烷"),
+    ]
+    kids[0]["polygon"] = _cell(80, 20, 300, 40, 1, 1, 2, 4)["polygon"]
+    kids[1]["polygon"] = _cell(600, 20, 660, 40, 1, 1, 6, 6)["polygon"]
+    kids[2]["polygon"] = _cell(720, 20, 780, 40, 1, 1, 7, 7)["polygon"]
+    bodies = [
+        _cell(80, 40, 200, 60, 2, 2, 2, 2, "MeTMS(35)"),
+        _cell(200, 40, 320, 60, 2, 2, 3, 3, "PhTMS(50)"),
+        _cell(320, 40, 440, 60, 2, 2, 4, 4, "TMSSucA(10)"),
+        _cell(440, 40, 560, 60, 2, 2, 5, 5, "AcrTMS(20)"),
+        _cell(560, 40, 680, 60, 2, 2, 6, 6, "TMOS(5)"),
+        _cell(680, 40, 800, 60, 2, 2, 7, 7, "-"),
+        # 另一行同列为空，不得据此把 AcrTMS 列让走
+        _cell(440, 60, 560, 80, 3, 3, 5, 5, ""),
+    ]
+    _align_monomer_children_to_body(
+        kids, bodies, col_seps, band_lo=2, band_hi=7
+    )
+    tri = next(c for c in kids if "三官能" in str(c.get("text") or ""))
+    tetra = next(c for c in kids if "四官能" in str(c.get("text") or ""))
+    assert (int(tri["col_start"]), int(tri["col_end"])) == (2, 5), tri
+    assert (int(tetra["col_start"]), int(tetra["col_end"])) == (6, 6), tetra
+    print("ok test_align_trifunctional_keeps_chem_fourth_col")
 
 
 if __name__ == "__main__":
     test_no_cross_synth_peer_collapse()
     test_lift_keeps_numeric_body()
-    test_align_diamine_vs_endcap_prefers_covering()
+    test_align_diamine_vs_endcap_left_wall()
+    test_align_trifunctional_silane_trim_dash()
+    test_align_trifunctional_keeps_chem_fourth_col()
     print("ALL PASS")

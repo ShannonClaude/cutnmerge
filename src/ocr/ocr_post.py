@@ -33,9 +33,11 @@ _DASH_MAP = str.maketrans(
 _CM_TILDE_RE = re.compile(r"cm\s*[~～]\s*1", re.IGNORECASE)
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
-# 单字符且可能是横线的候选（含「一」等 OCR 常见误识）
+# 单字符且可能是横线的候选（含「一」等 OCR 常见误识）。
+# 不含 ASCII「1」：正常组合物编号/序号由 _maybe_tiny_one_to_dash 按极小扁框处理，
+# 避免有二值图时仅因横带墨迹把高置信「1」改成「-」。
 _DASH_CANDIDATE_RE = re.compile(
-    r"^[\-\u4e00\u4e28\u2014\u2013\u2212\u30fc\u2015\u2500\uff0d~～_—–−ー―─－|丨lI1／/]$"
+    r"^[\-\u4e00\u4e28\u2014\u2013\u2212\u30fc\u2015\u2500\uff0d~～_—–−ー―─－|丨／/]$"
 )
 
 
@@ -290,11 +292,12 @@ def _maybe_geometric_dash(
     if not is_candidate:
         return text
 
+    w, h = _tb_wh(tb)
+    if h <= 0:
+        return text
+    aspect = w / h
+
     if binary is None:
-        w, h = _tb_wh(tb)
-        if h <= 0:
-            return text
-        aspect = w / h
         if t == "一" and aspect >= 1.25:
             return "-"
         if aspect >= 2.0 and w >= 6:
@@ -303,6 +306,13 @@ def _maybe_geometric_dash(
             return "-"
         return text
 
+    # 有二值图时仍要求扁框：仅横带墨迹不足以把竖笔「丨/|」等收成 dash
+    if t == "一":
+        min_aspect = 1.25
+    else:
+        min_aspect = 1.6
+    if aspect < min_aspect:
+        return text
     if _has_horizontal_ink_band(binary, tb):
         return "-"
     return text
