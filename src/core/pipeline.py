@@ -46,9 +46,11 @@ from ..structure.tsr import (
 from ..structure.tsr_refine import (
     cell_grid_stats,
     coverage_score,
+    dedupe_overlapping_cells,
     logic_conflict_ratio,
     looks_oversegmented,
     merge_ghost_columns,
+    merge_ghost_rows,
     merge_stacked_chem_amount_cells,
     normalize_oversegmented_table_rows,
     reconstruct_header_cells,
@@ -405,6 +407,8 @@ def _extract_via_tsr(
         else:
             light_cells = refine_tsr_cells_light(cells)
             light_cells = merge_ghost_columns(light_cells, text_boxes)
+            light_cells = merge_ghost_rows(light_cells, text_boxes)
+            light_cells = dedupe_overlapping_cells(light_cells)
             light_cells = repair_monomer_parent_spans(light_cells, text_boxes)
             conflict_ratio = logic_conflict_ratio(light_cells)
             if conflict_ratio > _LIGHT_ESCALATE_CONFLICT_RATIO:

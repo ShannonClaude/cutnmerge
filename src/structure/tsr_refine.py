@@ -332,6 +332,34 @@ def _looks_like_ocr_fragment(text: str) -> bool:
     return False
 
 
+def _robust_main_size(sizes: Sequence[float]) -> float:
+    """
+    估计真实主列/主行尺寸。
+
+    双线框会产出大量 ~线宽缝隙（常约 8~20px）。若直接对全部宽度取中位数，
+    缝会主导 median，导致剩余缝再也判不成「窄」。只取明显大于缝阈的主尺寸。
+    """
+    vals = [float(s) for s in sizes if float(s) > 0]
+    if not vals:
+        return 1.0
+    vmax = max(vals)
+    # 缝阈：绝对下限 + 相对最大主尺寸的一小部分
+    seam_cap = max(20.0, 0.12 * vmax)
+    main = [v for v in vals if v >= seam_cap]
+    if len(main) >= 2:
+        return float(np.median(main))
+    if main:
+        return float(main[0])
+    return float(np.median(vals))
+
+
+def _is_double_line_seam(size: float, main_size: float) -> bool:
+    """双线框缝：远小于主尺寸（或绝对像素极窄）。"""
+    if main_size <= 1e-6:
+        return False
+    return float(size) < max(18.0, 0.10 * float(main_size))
+
+
 def merge_ghost_columns(
     cells: List[Dict[str, Any]],
     boxes: Sequence[Dict[str, Any]],
@@ -341,6 +369,7 @@ def merge_ghost_columns(
     """
     几乎无文本落入且物理宽度异常窄的逻辑列 → 合并到右侧邻列。
     窄列若仅有短碎片 OCR（而邻列有实质文本）也视为幽灵列。
+    双线框缝（极窄列）即使误落入 OCR 中心也并入邻列。
     """
     if not cells:
         return cells
@@ -350,7 +379,7 @@ def merge_ghost_columns(
 
     n_cols = len(col_seps) - 1
     widths = [col_seps[i + 1] - col_seps[i] for i in range(n_cols)]
-    median_w = float(np.median(widths)) if widths else 1.0
+    median_w = _robust_main_size(widths)
 
     # 每列文本命中数与样本文本
     hits = [0] * n_cols
@@ -374,21 +403,23 @@ def merge_ghost_columns(
                 return True
         return False
 
-    # 标记幽灵列：窄 + 无文本，或窄 + 仅碎片且邻列有实质文本
+    # 标记幽灵列：双线缝优先（避免缝内误落入的数字被当成序号列保留）
     ghost = []
     for c in range(n_cols):
-        # 【修正】若完全无文本命中，无视宽度直接判定为幽灵列
-        if hits[c] == 0:
+        # 双线框缝：无条件并入（OCR 中心落入缝隙属误命中）
+        if _is_double_line_seam(widths[c], median_w):
             ghost.append(True)
-            continue
-            
-        narrow = widths[c] < min_width_ratio * median_w
-        if not narrow:
-            ghost.append(False)
             continue
         # 整列多为行序号：保留（与 html drop_evidenceless 一致）
         if is_index_column(col_texts[c]):
             ghost.append(False)
+            continue
+        narrow = widths[c] < min_width_ratio * median_w
+        if not narrow:
+            ghost.append(False)
+            continue
+        if hits[c] == 0:
+            ghost.append(True)
             continue
         only_frag = bool(col_texts[c]) and all(
             _looks_like_ocr_fragment(t) for t in col_texts[c]
@@ -435,6 +466,23 @@ def merge_ghost_columns(
         # fallback nearest survivor
         return min(old_to_new.values())
 
+    def resolve_old(c: int) -> int:
+        """幽灵列跟随 remap 到最终非幽灵旧列号。"""
+        r = remap[c]
+        guard = 0
+        while ghost[r] and remap[r] != r and guard < n_cols + 2:
+            r = remap[r]
+            guard += 1
+        return r
+
+    # 每个幸存列吸收「remap 到它」的幽灵缝物理区间，避免缝内 OCR 落空
+    surv_left: Dict[int, float] = {}
+    surv_right: Dict[int, float] = {}
+    for s in survivors:
+        covered = [s] + [g for g in range(n_cols) if ghost[g] and resolve_old(g) == s]
+        surv_left[s] = float(col_seps[min(covered)])
+        surv_right[s] = float(col_seps[max(covered) + 1])
+
     out: List[Dict[str, Any]] = []
     for cell in cells:
         nc = dict(cell)
@@ -452,10 +500,10 @@ def merge_ghost_columns(
         nc["col_start"] = new_cs
         nc["col_end"] = new_ce
         _refresh_spans(nc)
-        # survivors[i] 是旧列号；左边界 = col_seps[survivors[new_cs]]
-        left = float(col_seps[survivors[new_cs]])
+        left_old = survivors[new_cs]
         right_old = survivors[new_ce]
-        right = float(col_seps[right_old + 1])
+        left = surv_left[left_old]
+        right = surv_right[right_old]
         x1, y1, x2, y2 = _cell_bbox(cell)
         nc["polygon"] = _rebuild_polygon(left, y1, right, y2)
         nc["x_key"] = left
@@ -465,6 +513,151 @@ def merge_ghost_columns(
     logger.info(
         "TSR 幽灵列合并: %d -> %d cols (ghost=%s)",
         n_cols,
+        len(survivors),
+        [i for i, g in enumerate(ghost) if g],
+    )
+    return out
+
+
+def merge_ghost_rows(
+    cells: List[Dict[str, Any]],
+    boxes: Sequence[Dict[str, Any]],
+    *,
+    min_height_ratio: float = 0.35,
+) -> List[Dict[str, Any]]:
+    """
+    与 merge_ghost_columns 对称：双线框产生的极矮缝行 / 无文本窄行并入邻行。
+
+    只改逻辑行号与多边形 y 范围，不改列。用于防止缝行把表体拉成 rowspan 碎格、
+    以及 split_subtables 因缝隙 Y 间距误拆成多张表。
+    """
+    if not cells:
+        return cells
+    row_seps, col_seps = _derive_seps(cells)
+    if len(row_seps) < 3:
+        return cells
+
+    n_rows = len(row_seps) - 1
+    heights = [row_seps[i + 1] - row_seps[i] for i in range(n_rows)]
+    median_h = _robust_main_size(heights)
+
+    hits = [0] * n_rows
+    row_texts: List[List[str]] = [[] for _ in range(n_rows)]
+    for tb in boxes:
+        x1, y1, x2, y2 = _tb_bbox(tb)
+        my = (y1 + y2) / 2.0
+        for r in range(n_rows):
+            if row_seps[r] <= my < row_seps[r + 1] or (
+                r == n_rows - 1 and row_seps[r] <= my <= row_seps[r + 1]
+            ):
+                hits[r] += 1
+                t = str(tb.get("text") or "").strip()
+                if t:
+                    row_texts[r].append(t)
+                break
+
+    def _neighbor_has_substance(r: int) -> bool:
+        for t in (r - 1, r + 1):
+            if 0 <= t < n_rows and any(
+                not _looks_like_ocr_fragment(x) for x in row_texts[t]
+            ):
+                return True
+        return False
+
+    ghost = []
+    for r in range(n_rows):
+        if _is_double_line_seam(heights[r], median_h):
+            ghost.append(True)
+            continue
+        short = heights[r] < min_height_ratio * median_h
+        if not short:
+            ghost.append(False)
+            continue
+        if hits[r] == 0:
+            ghost.append(True)
+            continue
+        only_frag = bool(row_texts[r]) and all(
+            _looks_like_ocr_fragment(t) for t in row_texts[r]
+        )
+        ghost.append(bool(only_frag and _neighbor_has_substance(r)))
+    if not any(ghost):
+        return cells
+
+    remap = list(range(n_rows))
+    for r in range(n_rows):
+        if not ghost[r]:
+            continue
+        target = None
+        # 优先并入下方非幽灵行（表体语义更稳）；否则向上
+        for t in range(r + 1, n_rows):
+            if not ghost[t]:
+                target = t
+                break
+        if target is None:
+            for t in range(r - 1, -1, -1):
+                if not ghost[t]:
+                    target = t
+                    break
+        if target is not None:
+            remap[r] = target
+
+    survivors = [r for r in range(n_rows) if not ghost[r]]
+    if not survivors:
+        return cells
+    old_to_new = {old: new for new, old in enumerate(survivors)}
+
+    def map_row(r: int) -> int:
+        cur = remap[r]
+        while ghost[cur] and remap[cur] != cur:
+            cur = remap[cur]
+            if cur == remap[cur]:
+                break
+        if cur in old_to_new:
+            return old_to_new[cur]
+        return min(old_to_new.values())
+
+    def resolve_old(r: int) -> int:
+        cur = remap[r]
+        guard = 0
+        while ghost[cur] and remap[cur] != cur and guard < n_rows + 2:
+            cur = remap[cur]
+            guard += 1
+        return cur
+
+    surv_top: Dict[int, float] = {}
+    surv_bot: Dict[int, float] = {}
+    for s in survivors:
+        covered = [s] + [g for g in range(n_rows) if ghost[g] and resolve_old(g) == s]
+        surv_top[s] = float(row_seps[min(covered)])
+        surv_bot[s] = float(row_seps[max(covered) + 1])
+
+    out: List[Dict[str, Any]] = []
+    for cell in cells:
+        nc = dict(cell)
+        rs, re = int(cell["row_start"]), int(cell["row_end"])
+        own_survivors = [i for i in range(rs, re + 1) if not ghost[i]]
+        if own_survivors:
+            new_rs = min(old_to_new[i] for i in own_survivors)
+            new_re = max(old_to_new[i] for i in own_survivors)
+        else:
+            new_rs = min(map_row(i) for i in range(rs, re + 1))
+            new_re = max(map_row(i) for i in range(rs, re + 1))
+        nc["row_start"] = new_rs
+        nc["row_end"] = new_re
+        _refresh_spans(nc)
+        top_old = survivors[new_rs]
+        bot_old = survivors[new_re]
+        top = surv_top[top_old]
+        bot = surv_bot[bot_old]
+        x1, y1, x2, y2 = _cell_bbox(cell)
+        nc["polygon"] = _rebuild_polygon(x1, top, x2, bot)
+        nc["x_key"] = x1
+        nc["y_key"] = top
+        out.append(nc)
+
+    logger.info(
+        "TSR 幽灵行合并: %d -> %d rows (ghost=%s)",
+        n_rows,
         len(survivors),
         [i for i, g in enumerate(ghost) if g],
     )
@@ -2645,6 +2838,8 @@ def refine_tsr_cells(
     cells = clip_narrow_label_colspans(cells)
     cells = dedupe_overlapping_cells(cells)
     cells = merge_ghost_columns(cells, boxes)
+    cells = dedupe_overlapping_cells(cells)
+    cells = merge_ghost_rows(cells, boxes)
     cells = dedupe_overlapping_cells(cells)
     cells = unmerge_bad_rowspans(cells, boxes)
     cells = split_underspanned_rows(cells, boxes)
