@@ -1720,10 +1720,10 @@ def _effective_header_end(cells: Sequence[Dict[str, Any]]) -> int:
         he = max(0, min(body_starts) - 1) if body_starts else 0
     first_body_stub: int | None = None
     for c in cell_list:
-        rs, re = int(c["row_start"]), int(c["row_end"])
-        cs = int(c["col_start"])
-        if re > rs and rs >= 2 and cs <= 1:
-            first_body_stub = rs if first_body_stub is None else min(first_body_stub, rs)
+        if not _is_body_left_rowspan_stub(cell_list, c):
+            continue
+        rs = int(c["row_start"])
+        first_body_stub = rs if first_body_stub is None else min(first_body_stub, rs)
     return _extend_header_end_for_unit_rows(
         cell_list, he, cap_row=first_body_stub
     )
@@ -1755,12 +1755,49 @@ def _repair_lone_example_number_headers(
     return cells
 
 
+def _covered_by_upper_colspan_parent(
+    cells: Sequence[Dict[str, Any]], cell: Dict[str, Any]
+) -> bool:
+    """是否被正上方 colspan>1 父格覆盖（嵌套中层表头，如「树脂」子列）。"""
+    rs = int(cell["row_start"])
+    cs, ce = int(cell["col_start"]), int(cell["col_end"])
+    for p in cells:
+        pre = int(p["row_end"])
+        if pre >= rs:
+            continue
+        pcs, pce = int(p["col_start"]), int(p["col_end"])
+        if pcs <= cs and pce >= ce and pce > pcs:
+            return True
+    return False
+
+
+def _is_body_left_rowspan_stub(
+    cells: Sequence[Dict[str, Any]], cell: Dict[str, Any]
+) -> bool:
+    """表体左侧大行头 stub（比较例/实施例 rowspan），排除嵌套中层表头。"""
+    rs, re = int(cell["row_start"]), int(cell["row_end"])
+    cs = int(cell["col_start"])
+    if not (re > rs and rs >= 2 and cs <= 1):
+        return False
+    # P33：中层「树脂」rowspan 落在父「树脂」colspan 下，不是表体 stub
+    if _covered_by_upper_colspan_parent(cells, cell):
+        return False
+    text = str(cell.get("text") or "").strip()
+    if not text:
+        return True
+    if _HEADER_HAS_EXAMPLE_RE.search(text):
+        return True
+    # 描述性中层表头（酸成分旁的「树脂」等）即使无父 colspan 也不截断表头带
+    return False
+
+
 def _top_header_band_end(cells: List[Dict[str, Any]]) -> int:
     """顶表头带最后一行（含）。表体左侧大行头的 rowspan 不计入。
 
     只有 ``row_start <= 1`` 的跨行格才能把表头带向下扩；若存在表体左侧
     大行头（``row_start >= 2`` 且偏左），表头带截止在其上一行，避免把
     ``比较例 1`` / 数据 ``100`` 错误向下合并进表体空格。
+    嵌套中层表头（被上方 colspan 父格覆盖）不算表体 stub。
     """
     header_end = -1
     for c in cells:
@@ -1770,10 +1807,10 @@ def _top_header_band_end(cells: List[Dict[str, Any]]) -> int:
 
     first_body_stub: int | None = None
     for c in cells:
-        rs, re = int(c["row_start"]), int(c["row_end"])
-        cs = int(c["col_start"])
-        if re > rs and rs >= 2 and cs <= 1:
-            first_body_stub = rs if first_body_stub is None else min(first_body_stub, rs)
+        if not _is_body_left_rowspan_stub(cells, c):
+            continue
+        rs = int(c["row_start"])
+        first_body_stub = rs if first_body_stub is None else min(first_body_stub, rs)
     if first_body_stub is not None:
         cap = first_body_stub - 1
         header_end = cap if header_end < 0 else min(header_end, cap)
