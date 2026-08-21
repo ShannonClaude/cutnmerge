@@ -1378,6 +1378,179 @@ def drop_evidenceless_rows(cells: List[Dict[str, Any]], *, short_ratio: float = 
     return out
 
 
+def _column_has_header_label(
+    cells: Sequence[Dict[str, Any]],
+    col: int,
+    header_end: int,
+) -> bool:
+    """该列在表头带是否有实质描述性标签（非单位、非碎片）。"""
+    for c in cells:
+        if int(c["row_start"]) > header_end:
+            continue
+        if int(c["col_start"]) != col:
+            continue
+        t = str(c.get("text") or "").strip()
+        if not t or _is_cell_frag(t) or _is_header_unit_line(t):
+            continue
+        return True
+    return False
+
+
+def _migrate_orphan_header_to_body_column(
+    cells: List[Dict[str, Any]],
+    col: int,
+    *,
+    header_end: int,
+    max_col: int,
+    col_to_cells: Dict[int, List[Dict[str, Any]]],
+    dropped: Set[int],
+    look_ahead: int = 2,
+) -> bool:
+    """把无表体列上的表头迁到右侧近邻「有表体、无表头」列。成功返回 True。
+
+    仅用于简单指标表（如 P29 曝光量/密合强度）。左侧有大 rowspan 行头的
+    项目表（P24/P25）一律不迁，避免拆坏 stub。
+    """
+    # 复杂左侧 stub：有偏左大 rowspan → 不做孤列迁移
+    if any(
+        int(c["row_span"] if c.get("row_span") is not None else int(c["row_end"]) - int(c["row_start"]) + 1) >= 3
+        and int(c["col_start"]) <= 1
+        for c in cells
+    ):
+        return False
+
+    # 仅迁移「指标类」表头，避免「项目」等 stub 角标被挪走
+    orphan_texts = [
+        str(c.get("text") or "").strip()
+        for c in col_to_cells.get(col, [])
+        if int(c["col_start"]) == col
+        and int(c["row_start"]) <= header_end
+        and str(c.get("text") or "").strip()
+    ]
+    if not orphan_texts or not any(_METRIC_ORPHAN_HEADER_RE.search(t) for t in orphan_texts):
+        return False
+
+    target: Optional[int] = None
+    for right in range(col + 1, min(col + 1 + look_ahead, max_col + 1)):
+        if right in dropped:
+            continue
+        if _column_has_header_label(cells, right, header_end):
+            break
+        if not (
+            _column_has_data_values(cells, right)
+            or _column_has_body_content(cells, right, header_end)
+        ):
+            continue
+        target = right
+        break
+    if target is None:
+        return False
+
+    moved = False
+    for c in list(col_to_cells.get(col, [])):
+        if int(c["col_start"]) != col:
+            continue
+        if int(c["row_start"]) > header_end:
+            continue
+        t = str(c.get("text") or "").strip()
+        if not t or _is_cell_frag(t):
+            continue
+        dest = None
+        for rc in col_to_cells.get(target, []):
+            if int(rc["col_start"]) != target:
+                continue
+            if int(rc["row_start"]) == int(c["row_start"]):
+                dest = rc
+                break
+        if dest is not None:
+            prev = str(dest.get("text") or "").strip()
+            dest["text"] = (prev + "\n" + t) if prev else t
+            c["text"] = ""
+        else:
+            c["col_start"] = target
+            c["col_end"] = target
+            c["col_span"] = 1
+            col_to_cells.setdefault(target, []).append(c)
+        moved = True
+    if moved:
+        logger.info("孤列表头迁入数据列: %d → %d", col, target)
+    return moved
+
+
+_METRIC_ORPHAN_HEADER_RE = re.compile(
+    r"(曝光|强度|温度|分子量|分辨率|应力|耐热|粘度|透过|折射|模量|硬度|密合|粘合|"
+    r"Eth|mJ|MPa|℃|°C)"
+)
+
+
+def _split_merged_example_body_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """拆开把多条比较例/实施例粘在同一逻辑行的情形（P29：比较例5\\n比较例6）。"""
+    if not cells:
+        return cells
+    work = [dict(c) for c in cells]
+    header_end = _effective_header_end(work)
+    max_row = max(int(c["row_end"]) for c in work)
+
+    for row in range(max_row, header_end, -1):
+        origins = [
+            c
+            for c in work
+            if int(c["row_start"]) == int(c["row_end"]) == row
+        ]
+        nonempty = [c for c in origins if str(c.get("text") or "").strip()]
+        if len(nonempty) < 2:
+            continue
+        part_lists = [
+            [p.strip() for p in str(c.get("text") or "").split("\n") if p.strip()]
+            for c in nonempty
+        ]
+        n = len(part_lists[0])
+        if n < 2 or any(len(p) != n for p in part_lists):
+            continue
+        leftmost = min(nonempty, key=lambda c: int(c["col_start"]))
+        labels = [
+            p.strip()
+            for p in str(leftmost.get("text") or "").split("\n")
+            if p.strip()
+        ]
+        if len(labels) != n:
+            continue
+        if not all(_HEADER_HAS_EXAMPLE_RE.search(p) for p in labels):
+            continue
+
+        for c in work:
+            rs, re = int(c["row_start"]), int(c["row_end"])
+            if rs > row:
+                c["row_start"] = rs + n - 1
+                c["row_end"] = re + n - 1
+                c["row_span"] = int(c["row_end"]) - int(c["row_start"]) + 1
+            elif rs <= row < re:
+                c["row_end"] = re + n - 1
+                c["row_span"] = int(c["row_end"]) - int(c["row_start"]) + 1
+
+        drop_ids = {id(c) for c in origins}
+        new_cells: List[Dict[str, Any]] = []
+        for i in range(n):
+            for c in origins:
+                parts = [
+                    p.strip()
+                    for p in str(c.get("text") or "").split("\n")
+                    if p.strip()
+                ]
+                text_i = parts[i] if i < len(parts) else ""
+                nc = dict(c)
+                nc["row_start"] = row + i
+                nc["row_end"] = row + i
+                nc["row_span"] = 1
+                nc["text"] = text_i
+                nc["texts"] = [text_i] if text_i else []
+                new_cells.append(nc)
+        work = [c for c in work if id(c) not in drop_ids] + new_cells
+        logger.info("拆分粘连实施例行: row=%d → %d 行", row, n)
+
+    return work
+
+
 def _drop_body_empty_columns(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     删除表体（表头以下）所有原子格均为空/碎片的列。
@@ -1414,6 +1587,21 @@ def _drop_body_empty_columns(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]
             for c in covered
         )
         if header_anchor and not _colspan_sibling_has_body_data(cells, col, header_end):
+            # P29：表头落在无表体列，右侧近邻有「有表体、无表头」列 → 把表头迁过去再删本列
+            if (
+                not _column_has_data_values(cells, col)
+                and not _column_has_body_content(cells, col, header_end)
+                and _migrate_orphan_header_to_body_column(
+                    cells,
+                    col,
+                    header_end=header_end,
+                    max_col=max_col,
+                    col_to_cells=col_to_cells,
+                    dropped=dropped,
+                )
+            ):
+                dropped.add(col)
+                continue
             continue
         # 子列表头（比较例 1 / 实施例 2 等）不是 colspan 幽灵列
         if header_anchor and any(
@@ -1704,6 +1892,25 @@ def _extend_header_end_for_unit_rows(
     return he
 
 
+_LONE_EXAMPLE_NUM_RE = re.compile(r"^\d+$")
+
+
+def _example_header_row_end(cells: Sequence[Dict[str, Any]]) -> int:
+    """含 ≥2 个实施例/比较例/参考例列头的最下行（无则 -1）。"""
+    by_row: Dict[int, int] = {}
+    for c in cells:
+        t = str(c.get("text") or "").strip()
+        if not t or not _HEADER_HAS_EXAMPLE_RE.search(t):
+            continue
+        # 纯数字「10」不算；「实施例 1」「比较例 2」算
+        if _LONE_EXAMPLE_NUM_RE.fullmatch(t):
+            continue
+        rs = int(c["row_start"])
+        by_row[rs] = by_row.get(rs, 0) + 1
+    hits = [r for r, n in by_row.items() if n >= 2]
+    return max(hits) if hits else -1
+
+
 def _effective_header_end(cells: Sequence[Dict[str, Any]]) -> int:
     """顶表头带末行；无 rowspan 线索时取首个有字身行之上。"""
     cell_list = list(cells)
@@ -1718,6 +1925,9 @@ def _effective_header_end(cells: Sequence[Dict[str, Any]]) -> int:
             and not _HEADER_HAS_EXAMPLE_RE.search(str(c.get("text") or ""))
         ]
         he = max(0, min(body_starts) - 1) if body_starts else 0
+    # P24/P25：空幽灵行把 he 压成 0 时，仍要把含多列实施例/比较例的行算进表头带，
+    # 否则「项目」colspan 会被身列拆格逻辑误拆。
+    he = max(he, _example_header_row_end(cell_list))
     first_body_stub: int | None = None
     for c in cell_list:
         if not _is_body_left_rowspan_stub(cell_list, c):
@@ -1727,9 +1937,6 @@ def _effective_header_end(cells: Sequence[Dict[str, Any]]) -> int:
     return _extend_header_end_for_unit_rows(
         cell_list, he, cap_row=first_body_stub
     )
-
-
-_LONE_EXAMPLE_NUM_RE = re.compile(r"^\d+$")
 
 
 def _repair_lone_example_number_headers(
@@ -2190,6 +2397,8 @@ def cells_to_html_table(
     work = [dict(c) for c in cells]
     work = _split_example_header_rowspans(work)
     work = _resolve_logic_overlaps(work)
+    # 先丢掉全空幽灵行（P24 顶上空行），再算表头带 / 拆身列 colspan
+    work = _drop_fully_empty_rows(work)
     work = _repair_lone_example_number_headers(work)
     work = _drop_leading_header_only_columns(work)
     work = _split_label_over_data_columns(work)
@@ -2202,6 +2411,7 @@ def cells_to_html_table(
     work = drop_evidenceless_rows(work)
     work = _drop_fully_empty_rows(work)
     work = drop_noise_rows(work)
+    work = _split_merged_example_body_rows(work)
     if compress_empty:
         work = compress_empty_logic_columns(work)
         work = compress_empty_logic_rows(work)
