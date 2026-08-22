@@ -111,12 +111,15 @@ def looks_sideways(text_boxes: list, *, score_thresh: float = 0.55) -> bool:
         return True
     aspect = _box_aspect_upright_ratio(text_boxes)
     score = _mean_ocr_score(text_boxes)
-    if aspect < 0.40:
+    
+    # 【核心修复】放宽侧躺检测的触发阈值。
+    # 原本的 0.40 太严苛，导致全是短字符（数字/单字母）的侧躺表被漏判。
+    # 提高到 0.75 后，短字符侧躺表会进入 try90 测试，由 q90 > q0 做最终正确裁决。
+    if aspect < 0.75:
         return True
-    if aspect < 0.55 and score < score_thresh:
+    if aspect < 0.85 and score < score_thresh:
         return True
     return False
-
 
 def ensure_upright_axis(
     image: np.ndarray,
@@ -130,12 +133,10 @@ def ensure_upright_axis(
 ) -> Tuple[np.ndarray, int, list]:
     """
     若当前 OCR 结果像侧躺，则试转 90° 并取质更好者。
-
-    Returns:
-        (image, axis_delta_0_or_90, text_boxes)
     """
     from ..core.models import predict_texts
 
+    # 恢复为纯 OCR 框特征门控，彻底抛弃会误杀无横线表格的 estimate_axis_rotation
     if not looks_sideways(text_boxes, score_thresh=score_thresh):
         return image, 0, text_boxes
 
@@ -150,6 +151,7 @@ def ensure_upright_axis(
     q0 = _orientation_quality(text_boxes)
     q90 = _orientation_quality(boxes90)
     logger.info("方向轴向 OCR 比对: q0=%.3f q90=%.3f", q0, q90)
+    
     if q90 > q0:
         return rotated, 90, boxes90
     return image, 0, text_boxes
